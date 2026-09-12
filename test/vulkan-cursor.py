@@ -74,11 +74,12 @@ class Renderer:
                luminance_scale=1, capture_matrix=(1, 0, 0, 0, 1, 0, 0, 0, 1),
                capture_phases=None, continuation=False, capture_sequence=False, copy_capture=False,
                timings=None, scene=None, damage=None, timing_repeats=1,
-               source_format=0, source_stride=None, raw_output=False, output_reference=80):
+               source_format=0, source_stride=None, raw_output=False, output_reference=80,
+               video_planes=None, representation=0):
         d = self.device
         sw, sh = source_size
         w, h = size
-        bpp = 16 if source_format == 12 else 8 if source_format in (2, 9, 10, 11) else 4
+        bpp = (1 if source_format in (13, 14, 18, 19) else 2) if source_format >= 13 else 16 if source_format == 12 else 8 if source_format in (2, 9, 10, 11) else 4
         source_stride = source_stride or sw * bpp
         source_vk_format = {0: v.VK_FORMAT_B8G8R8A8_UNORM,
                             2: v.VK_FORMAT_R16G16B16A16_UNORM,
@@ -90,7 +91,7 @@ class Renderer:
                             9: v.VK_FORMAT_R16G16B16A16_UNORM,
                             10: v.VK_FORMAT_R16G16B16A16_SFLOAT,
                             11: v.VK_FORMAT_R16G16B16A16_SFLOAT,
-                            12: v.VK_FORMAT_R32G32B32A32_SFLOAT}[source_format]
+                            12: v.VK_FORMAT_R32G32B32A32_SFLOAT}.get(source_format, v.VK_FORMAT_R8_UNORM)
         texture = mode != "buffer"
         damage = damage or [(0, 0, w, h)]
         assert timing_repeats >= 1 and (timings is not None or timing_repeats == 1)
@@ -154,7 +155,8 @@ class Renderer:
                 int(sx * 65536), int(sy * 65536), int(cw * 65536), int(ch * 65536),
                 0, 0, w, h, 0, 0, w, h, source_format or int(xrgb), flags, alpha, source_transfer,
                 xx, xy, x0, yx, yy, y0, alpha_mode, 0,
-                *color_matrix[:3], luminance_scale, *color_matrix[3:6], 0, *color_matrix[6:], 0)
+                *color_matrix[:3], luminance_scale, *color_matrix[3:6],
+                struct.unpack("<f", struct.pack("<I", representation))[0], *color_matrix[6:], 0)
             # Explicit scenes retain the recorded affine/crop instead of
             # deriving a new mapping from rounded destination dimensions.
             layers = scene if scene is not None else [(sample, pixels, source_size)]
@@ -183,6 +185,11 @@ class Renderer:
             source_images = [image(*dimensions, source_vk_format,
                 v.VK_IMAGE_USAGE_SAMPLED_BIT | v.VK_IMAGE_USAGE_TRANSFER_DST_BIT)
                 for _, _, dimensions in layers]
+            if video_planes:
+                assert mode == "texture" and scene is None
+                source_images = [image(*dimensions, fmt, v.VK_IMAGE_USAGE_SAMPLED_BIT | v.VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+                                 for data, dimensions, fmt, stride, texel_bytes in video_planes]
+                plane_uploads = [buffer(data, v.VK_BUFFER_USAGE_TRANSFER_SRC_BIT) for data, *_ in video_planes]
             linear, linear_view = image(w, h, v.VK_FORMAT_R16G16B16A16_SFLOAT, v.VK_IMAGE_USAGE_STORAGE_BIT)
             if copy_capture:
                 copied, _ = image(w, h, v.VK_FORMAT_B8G8R8A8_UNORM,
@@ -199,7 +206,7 @@ class Renderer:
                      10: (v.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1),
                      11: (v.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1)}
             if texture:
-                types.update({3: (v.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32),
+                types.update({3: (v.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 96),
                               5: (v.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1),
                               6: (v.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1)})
             else:
@@ -220,7 +227,11 @@ class Renderer:
                     args = dict(pBufferInfo=[v.VkDescriptorBufferInfo(buffer=buf[0], offset=0, range=buf[2])])
                 else:
                     views = ([target_view] if b == 0 else [linear_view] if b == 5 else
-                             [view for _, view in source_images] + [source_images[0][1]] * (32 - len(layers)))
+                             [view for _, view in source_images] + [source_images[0][1]] * (96 - len(layers)))
+                    if b == 3 and video_planes:
+                        views = [source_images[0][1]] * 96
+                        for plane, (_, view) in enumerate(source_images):
+                            views[32 * plane] = view
                     args = dict(pImageInfo=[v.VkDescriptorImageInfo(sampler=sampler, imageView=view,
                                                                   imageLayout=v.VK_IMAGE_LAYOUT_GENERAL) for view in views])
                 writes.append(v.VkWriteDescriptorSet(dstSet=ds, dstBinding=b, descriptorType=t,
@@ -234,8 +245,11 @@ class Renderer:
                     (shader_name + ("_10bit" if ten_bit else "") + ".spv")).read_bytes()
             module = own(v.vkCreateShaderModule, v.vkDestroyShaderModule,
                          v.VkShaderModuleCreateInfo(codeSize=len(code), pCode=code))
+            descriptor_data = struct.pack("<I", 96 if video_planes else 32)
             stage = v.VkPipelineShaderStageCreateInfo(stage=v.VK_SHADER_STAGE_COMPUTE_BIT,
-                                                    module=module, pName="main")
+                module=module, pName="main", pSpecializationInfo=v.VkSpecializationInfo(
+                    pMapEntries=[v.VkSpecializationMapEntry(constantID=0, offset=0, size=4)],
+                    dataSize=4, pData=v.ffi.from_buffer(descriptor_data)) if texture else None)
             pipeline = v.vkCreateComputePipelines(d, v.VK_NULL_HANDLE, 1,
                 [v.VkComputePipelineCreateInfo(stage=stage, layout=pl)], None)[0]
             cleanup.callback(v.vkDestroyPipeline, d, pipeline, None)
@@ -255,10 +269,16 @@ class Renderer:
                 return v.VkBufferImageCopy(bufferOffset=offset, imageSubresource=v.VkImageSubresourceLayers(
                     aspectMask=v.VK_IMAGE_ASPECT_COLOR_BIT, layerCount=1),
                     imageExtent=v.VkExtent3D(width=width, height=height, depth=1))
-            for (im, _), (packed, _, dimensions), offset in zip(source_images, layers, offsets):
-                copy = region(*dimensions, offset)
-                copy.bufferRowLength = struct.unpack_from("<I", packed, 12)[0] // bpp
-                v.vkCmdCopyBufferToImage(cmd, source[0], im, v.VK_IMAGE_LAYOUT_GENERAL, 1, [copy])
+            if video_planes:
+                for (im, _), (data, dimensions, fmt, stride, texel_bytes), upload in zip(source_images, video_planes, plane_uploads):
+                    copy = region(*dimensions)
+                    copy.bufferRowLength = stride // texel_bytes
+                    v.vkCmdCopyBufferToImage(cmd, upload[0], im, v.VK_IMAGE_LAYOUT_GENERAL, 1, [copy])
+            else:
+                for (im, _), (packed, _, dimensions), offset in zip(source_images, layers, offsets):
+                    copy = region(*dimensions, offset)
+                    copy.bufferRowLength = struct.unpack_from("<I", packed, 12)[0] // bpp
+                    v.vkCmdCopyBufferToImage(cmd, source[0], im, v.VK_IMAGE_LAYOUT_GENERAL, 1, [copy])
             def barrier(src, dst, src_access, dst_access):
                 v.vkCmdPipelineBarrier(cmd, src, dst, 0, 1, [v.VkMemoryBarrier(
                     srcAccessMask=src_access, dstAccessMask=dst_access)], 0, None, 0, None)
@@ -501,6 +521,90 @@ def test_desktop_color(renderer, capture_path):
     if capture_path:
         sheet.save(capture_path.with_stem(capture_path.stem + "-gamma22"))
     print(f"Desktop color: {renderer.draw_count - start} draws passed (gamma22, explicit sRGB, reference-independent PQ)")
+
+
+def test_video(renderer, capture_path):
+    start = renderer.draw_count
+    names = ("NV12", "NV21", "P010", "P012", "P016", "YUV420", "YVU420", "YUYV", "UYVY")
+    sheet = Image.new("RGB", (720, 240), "#202020")
+    draw = ImageDraw.Draw(sheet)
+
+    def planes_for(fmt, y, cb, cr):
+        wide = fmt in (15, 16, 17)
+        shift = 6 if fmt == 15 else 4 if fmt == 16 else 0
+        def words(values):
+            # Poison insignificant low bits: interpreting P010 as UNORM16
+            # without removing padding must not affect reconstruction.
+            return b"".join(struct.pack("<H", (n << shift) | ((1 << shift) - 1)) if wide else bytes([n]) for n in values)
+        cb = [cb] * 4 if isinstance(cb, int) else cb
+        cr = [cr] * 4 if isinstance(cr, int) else cr
+        if fmt >= 20:
+            row = bytes([y, cb[0], y + 13, cr[0]] if fmt == 20 else [cb[0], y, cr[0], y + 13]) * 2 + b"\xff" * 4
+            return [(row * 4, (2, 4), v.VK_FORMAT_R8G8B8A8_UNORM, 12, 4)]
+        bpp = 2 if wide else 1
+        row = words([y] * 4) + bytes([213]) * (2 * bpp)
+        result = [(row * 4, (4, 4), v.VK_FORMAT_R16_UNORM if wide else v.VK_FORMAT_R8_UNORM, 6 * bpp, bpp)]
+        if fmt in (14, 19):
+            cb, cr = cr, cb
+        channels = [list(sum(zip(cb, cr), ()))] if fmt < 18 else [cb, cr]
+        count = 2 if fmt < 18 else 1
+        for channel in channels:
+            data = b"".join(words(channel[row * 2 * count:(row + 1) * 2 * count]) + bytes([207]) * (2 * count * bpp) for row in range(2))
+            result.append((data, (2, 2), (v.VK_FORMAT_R16G16_UNORM if wide else v.VK_FORMAT_R8G8_UNORM) if count == 2 else v.VK_FORMAT_R8_UNORM, 4 * count * bpp, count * bpp))
+        return result
+
+    def expected(y, cb, cr, scale, full, kr, kb, alpha=255):
+        maximum = 256 * scale - 1
+        y = y / maximum if full else (y - 16 * scale) / (219 * scale)
+        cb = (cb - 128 * scale) / (maximum if full else 224 * scale)
+        cr = (cr - 128 * scale) / (maximum if full else 224 * scale)
+        # Independent H.273 expanded matrix, not a shader implementation call.
+        rgb = (y + (2 - 2 * kr) * cr,
+               y - (2 * kb - 2 * kb * kb) / (1 - kr - kb) * cb - (2 * kr - 2 * kr * kr) / (1 - kr - kb) * cr,
+               y + (2 - 2 * kb) * cb)
+        def encode(n):
+            n = max(0, n * alpha / 255)
+            return round(255 * min(1, 12.92 * n if n <= .0031308 else 1.055 * n ** (1 / 2.4) - .055))
+        return bytes([encode(n) for n in reversed(rgb)] + [255])
+
+    for fmt, name in enumerate(names, 13):
+        scale = {15: 4, 16: 16, 17: 256}.get(fmt, 1)
+        y, cb, cr = 117 * scale, 96 * scale, 171 * scale
+        planes = planes_for(fmt, y, cb, cr)
+        for coefficients, kr, kb in ((2, .2126, .0722), (3, .299, .114), (4, .2627, .0593)):
+            for full in (False, True):
+                result, capture, _ = renderer.render(planes[0][0], (4, 4), (4, 4), "texture",
+                    source_format=fmt, source_stride=planes[0][3], video_planes=planes,
+                    representation=coefficients | ((1 if full else 2) << 4), source_transfer=1,
+                    background=(0, 0, 0), capture_phases=1, alpha=128)
+                want = expected(y, cb, cr, scale, full, kr, kb, 128) * 16
+                if fmt >= 20:
+                    want = (expected(y, cb, cr, scale, full, kr, kb, 128) + expected(y + 13, cb, cr, scale, full, kr, kb, 128)) * 8
+                assert max(abs(a - b) for a, b in zip(capture, want)) <= 1, (name, coefficients, full, list(capture[:4]), list(want[:4]))
+                if coefficients == 2 and not full:
+                    x, top = ((fmt - 13) % 5) * 144, ((fmt - 13) // 5) * 120
+                    draw.text((x + 8, top + 8), name + " / 709 limited", fill="white")
+                    sheet.paste(Image.frombytes("RGBA", (4, 4), capture, "raw", "BGRA").resize((128, 80)), (x + 8, top + 28))
+    for location, (ox, oy) in enumerate(((0, .5), (.5, .5), (0, 0), (.5, 0), (0, 1), (.5, 1)), 1):
+        planes = planes_for(13, 117, [90, 110, 130, 150], 171)
+        _, capture, _ = renderer.render(planes[0][0], (4, 4), (4, 4), "texture",
+            source_format=13, source_stride=planes[0][3], video_planes=planes,
+            representation=2 | (2 << 4) | (location << 8), source_transfer=1, capture_phases=1,
+            damage=[(1, 1, 2, 2)])
+        want = expected(117, 90 + 20 * (1 - ox) / 2 + 40 * (1 - oy) / 2, 171, 1, False, .2126, .0722)
+        assert max(abs(a - b) for a, b in zip(capture[20:24], want)) <= 1, (location, capture[20:24], want)
+        assert capture[:20] == bytes([37]) * 20 and capture[-16:] == bytes([37]) * 16
+    for fmt, scale in ((15, 4), (16, 16), (17, 256)):
+        planes = planes_for(fmt, 16 * scale + 1, 128 * scale, 128 * scale)
+        # Exposure makes a single low linear-light step visible after export.
+        result = renderer.render(planes[0][0], (4, 4), (4, 4), "texture", source_format=fmt,
+            source_stride=planes[0][3], video_planes=planes, source_transfer=1, luminance_scale=64)
+        linear = 64 / (219 * scale)
+        code = round(255 * (12.92 * linear if linear <= .0031308 else 1.055 * linear ** (1 / 2.4) - .055))
+        assert abs(result[0] - code) <= 1 and result[0] > 0, (fmt, result[:4], code)
+    if capture_path:
+        sheet.save(capture_path)
+    print(f"Native video: {renderer.draw_count - start} draws passed (9 layouts, matrices/ranges, chroma siting, stride/damage, alpha, low light)")
 
 
 def test(renderer, compare_shader_dir):
@@ -897,6 +1001,7 @@ if __name__ == "__main__":
     parser.add_argument("--capture", type=Path)
     parser.add_argument("--capture-hdr", type=Path)
     parser.add_argument("--capture-shm", type=Path)
+    parser.add_argument("--capture-video", type=Path)
     parser.add_argument("--capture-surface", type=Path, nargs=2, metavar=("SOURCE_2X", "OUTPUT"))
     parser.add_argument("--compare-shader-dir", type=Path)
     parser.add_argument("--benchmark", action="store_true", help="time UHD sampled-composition filter variants offscreen")
@@ -912,6 +1017,7 @@ if __name__ == "__main__":
         test_shm(renderer, args.capture_shm)
         test_modern_rgb(renderer, args.capture_shm)
         test_desktop_color(renderer, args.capture_shm)
+        test_video(renderer, args.capture_video)
         if args.benchmark_stall:
             benchmark_stall(renderer)
         if args.capture:

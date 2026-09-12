@@ -216,6 +216,9 @@ pub const Buffer = struct {
     width: u32,
     height: u32,
     explicit_sync_supported: bool = false,
+    /// Used only for color-representation commit compatibility.
+    video: bool = false,
+    subsampled420: bool = false,
 };
 
 pub const PresentationHint = enum {

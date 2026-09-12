@@ -209,6 +209,7 @@ const device_extensions = [_][*:0]const u8{
 } ++ if (trace_gpu) [_][*:0]const u8{c.VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME} else [_][*:0]const u8{};
 
 const sampled_image_capacity = 32;
+const sampled_descriptor_capacity = sampled_image_capacity * 3;
 pub const direct_color_bit: u32 = 1 << 31;
 pub const direct_content_bit: u32 = 1 << 30;
 pub const bilinear_bit: u32 = 1 << 29;
@@ -259,6 +260,8 @@ const ImportedImage = struct {
     memory: c.VkDeviceMemory = undefined,
     plane_memories: [3]c.VkDeviceMemory = @splat(null),
     view: c.VkImageView = undefined,
+    // Color-plane views do not correspond to modifier memory planes.
+    chroma_views: [2]c.VkImageView = @splat(null),
 };
 
 const PendingAcquire = struct {
@@ -327,6 +330,7 @@ const RealRenderer = struct {
     cache: []CacheEntry,
     prepared: []PreparedTexture,
     sampled_enabled: bool,
+    sampled_descriptors: u32 = sampled_image_capacity,
     get_memory_fd_properties: c.PFN_vkGetMemoryFdPropertiesKHR,
     get_semaphore_fd: c.PFN_vkGetSemaphoreFdKHR,
     import_semaphore_fd: c.PFN_vkImportSemaphoreFdKHR,
@@ -1179,6 +1183,7 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     c.vkGetPhysicalDeviceFeatures(self.physical_device, &physical_features);
     var sampled_formats_supported = true;
     for (std.enums.values(render.PixelFormat)) |format| {
+        if (format.isVideo()) continue; // Optional, queried per format/modifier.
         var properties: c.VkFormatProperties = undefined;
         c.vkGetPhysicalDeviceFormatProperties(self.physical_device, sourceVkFormat(format), &properties);
         const required = c.VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | c.VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
@@ -1195,10 +1200,19 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         return error.InvalidConfig;
     const lut_buffer_size = std.math.mul(usize, lut_texels, @sizeOf([4]f32)) catch
         return error.InvalidConfig;
+    // Video is optional. Do not remove RGB sampling on devices with smaller
+    // descriptor limits merely because video needs two more color-plane banks.
+    self.sampled_descriptors = if (physical_properties.limits.maxPerStageDescriptorSampledImages >= sampled_descriptor_capacity + 2 and
+        physical_properties.limits.maxDescriptorSetSampledImages >= sampled_descriptor_capacity + 2 and
+        physical_properties.limits.maxPerStageDescriptorSamplers >= sampled_descriptor_capacity + 2 and
+        physical_properties.limits.maxDescriptorSetSamplers >= sampled_descriptor_capacity + 2)
+        sampled_descriptor_capacity
+    else
+        sampled_image_capacity;
     const sampled_descriptor_count = std.math.mul(
         usize,
         config.max_targets,
-        sampled_image_capacity + 2,
+        self.sampled_descriptors + 2,
     ) catch return error.InvalidConfig;
     if (physical_properties.apiVersion < c.VK_API_VERSION_1_2 or
         sample_size == 0 or sample_size > physical_properties.limits.maxStorageBufferRange or
@@ -1219,10 +1233,10 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     self.sampled_enabled = config.max_samples <= sampled_image_capacity and
         sampled_descriptor_count <= std.math.maxInt(u32) and
         physical_features.shaderSampledImageArrayDynamicIndexing == c.VK_TRUE and
-        physical_properties.limits.maxPerStageDescriptorSampledImages >= sampled_image_capacity + 2 and
-        physical_properties.limits.maxDescriptorSetSampledImages >= sampled_image_capacity + 2 and
-        physical_properties.limits.maxPerStageDescriptorSamplers >= sampled_image_capacity + 2 and
-        physical_properties.limits.maxDescriptorSetSamplers >= sampled_image_capacity + 2 and
+        physical_properties.limits.maxPerStageDescriptorSampledImages >= self.sampled_descriptors + 2 and
+        physical_properties.limits.maxDescriptorSetSampledImages >= self.sampled_descriptors + 2 and
+        physical_properties.limits.maxPerStageDescriptorSamplers >= self.sampled_descriptors + 2 and
+        physical_properties.limits.maxDescriptorSetSamplers >= self.sampled_descriptors + 2 and
         sampled_formats_supported;
     if (config.require_color_management and !self.sampled_enabled)
         return error.ColorManagementUnavailable;
@@ -1276,7 +1290,7 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         .{
             .binding = 3,
             .descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .descriptorCount = sampled_image_capacity,
+            .descriptorCount = self.sampled_descriptors,
             .stageFlags = c.VK_SHADER_STAGE_COMPUTE_BIT,
             .pImmutableSamplers = null,
         },
@@ -1336,6 +1350,13 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         c.vkDestroyPipeline(self.device, pipeline, null);
     errdefer if (self.blur_pipeline) |pipeline|
         c.vkDestroyPipeline(self.device, pipeline, null);
+    const descriptor_constant = c.VkSpecializationMapEntry{ .constantID = 0, .offset = 0, .size = @sizeOf(u32) };
+    const specialization = c.VkSpecializationInfo{
+        .mapEntryCount = 1,
+        .pMapEntries = &descriptor_constant,
+        .dataSize = @sizeOf(u32),
+        .pData = &self.sampled_descriptors,
+    };
     if (self.sampled_enabled) {
         const sampled_shader_bytes align(@alignOf(u32)) = @embedFile("vulkan_texture_composite.spv").*;
         var sampled_shader_info = shader_info;
@@ -1349,6 +1370,7 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         defer c.vkDestroyShaderModule(self.device, sampled_shader, null);
         var sampled_pipeline_info = pipeline_info;
         sampled_pipeline_info.stage.module = sampled_shader;
+        sampled_pipeline_info.stage.pSpecializationInfo = &specialization;
         var sampled_pipeline: c.VkPipeline = undefined;
         try vk(
             c.vkCreateComputePipelines(
@@ -1432,6 +1454,7 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
             defer c.vkDestroyShaderModule(self.device, sampled_10bit, null);
             var sampled_pipeline_10bit_info = pipeline_info;
             sampled_pipeline_10bit_info.stage.module = sampled_10bit;
+            sampled_pipeline_10bit_info.stage.pSpecializationInfo = &specialization;
             var sampled_pipeline_10bit: c.VkPipeline = undefined;
             try vk(c.vkCreateComputePipelines(
                 self.device,
@@ -1876,6 +1899,7 @@ fn realSampledDmabufFormats(
         const modifiers = try formatModifierProperties(self.physical_device, sourceVkFormat(format));
         defer std.heap.page_allocator.free(modifiers);
         for (modifiers) |modifier| {
+            if (format.isVideo() and format.colorPlanes() == 1 and modifier.drmFormatModifier != 0) continue;
             if (modifier.drmFormatModifierPlaneCount == 0 or modifier.drmFormatModifierPlaneCount > 4 or
                 modifier.drmFormatModifierTilingFeatures & c.VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT == 0)
                 continue;
@@ -1890,7 +1914,7 @@ fn realSampledDmabufFormats(
                 .strides = @splat(format.bytesPerPixel()),
                 .offsets = .{ 0, 0, 0, 0 },
             };
-            requireExternalSampling(self, source, .{ .width = 1, .height = 1 }, format, 0) catch
+            requireExternalSampling(self, source, .{ .width = 2, .height = 2 }, format, 0) catch
                 continue;
             if (count == output.len) return error.OutputTooSmall;
             output[count] = .{ .fourcc = fourcc, .modifier = modifier.drmFormatModifier };
@@ -2036,6 +2060,13 @@ fn requireExternalSampling(
 ) !void {
     if (source.plane_count == 0 or source.plane_count > 4)
         return error.UnsupportedExternalSource;
+    if (format.isVideo()) {
+        if (!self.sampled_enabled or self.sampled_descriptors < sampled_descriptor_capacity or size.width % 2 != 0 or
+            (format.colorPlanes() > 1 and size.height % 2 != 0))
+            return error.UnsupportedExternalSource;
+        if (format.colorPlanes() == 1 and source.modifier != 0)
+            return error.ExternalSamplingUnsupported;
+    }
     for (0..source.plane_count) |plane| {
         if (source.fds[plane] < 0 or source.strides[plane] == 0) return error.UnsupportedExternalSource;
     }
@@ -2044,9 +2075,15 @@ fn requireExternalSampling(
     const modifier_properties = try externalModifierProperties(self.physical_device, vk_format, source.modifier);
     if (modifier_properties.drmFormatModifierPlaneCount != source.plane_count)
         return error.UnsupportedExternalSource;
+    const view_formats = [_]c.VkFormat{ videoPlaneVkFormat(format, 0), videoPlaneVkFormat(format, 1) };
+    const view_list = c.VkImageFormatListCreateInfo{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+        .viewFormatCount = if (format.colorPlanes() == 2) 2 else 1,
+        .pViewFormats = &view_formats,
+    };
     var modifier_query: c.VkPhysicalDeviceImageDrmFormatModifierInfoEXT = .{
         .sType = c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
-        .pNext = null,
+        .pNext = if (format.colorPlanes() > 1) &view_list else null,
         .drmFormatModifier = source.modifier,
         .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
@@ -2064,7 +2101,7 @@ fn requireExternalSampling(
         .type = c.VK_IMAGE_TYPE_2D,
         .tiling = c.VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
         .usage = c.VK_IMAGE_USAGE_TRANSFER_SRC_BIT | c.VK_IMAGE_USAGE_SAMPLED_BIT,
-        .flags = flags,
+        .flags = flags | (if (format.colorPlanes() > 1) @as(u32, c.VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) else 0),
     };
     var external_properties: c.VkExternalImageFormatProperties = .{
         .sType = c.VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
@@ -2091,6 +2128,13 @@ fn requireExternalSampling(
     if (external_memory.externalMemoryFeatures & c.VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT == 0 or
         external_memory.compatibleHandleTypes & c.VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT == 0)
         return error.ExternalSamplingUnsupported;
+    // A plane-only view uses ordinary UNORM sampling, not a YCbCr sampler.
+    // Check each view's modifier features as well as the parent image.
+    if (format.colorPlanes() > 1) for (0..format.colorPlanes()) |plane| {
+        const properties = try externalModifierProperties(self.physical_device, videoPlaneVkFormat(format, plane), source.modifier);
+        if (properties.drmFormatModifierTilingFeatures & c.VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT == 0)
+            return error.ExternalSamplingUnsupported;
+    };
 }
 
 /// A successful import already proved device support for this immutable
@@ -2146,9 +2190,15 @@ fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: rende
         .arrayPitch = 0,
         .depthPitch = 0,
     };
+    const view_formats = [_]c.VkFormat{ videoPlaneVkFormat(format, 0), videoPlaneVkFormat(format, 1) };
+    const view_list = c.VkImageFormatListCreateInfo{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+        .viewFormatCount = if (format.colorPlanes() == 2) 2 else 1,
+        .pViewFormats = &view_formats,
+    };
     var modifier: c.VkImageDrmFormatModifierExplicitCreateInfoEXT = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
-        .pNext = null,
+        .pNext = if (format.colorPlanes() > 1) &view_list else null,
         .drmFormatModifier = source.modifier,
         .drmFormatModifierPlaneCount = source.plane_count,
         .pPlaneLayouts = &layouts,
@@ -2161,10 +2211,12 @@ fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: rende
     var info: c.VkImageCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = &external,
-        .flags = if (backing.disjoint) c.VK_IMAGE_CREATE_DISJOINT_BIT else 0,
+        .flags = @as(u32, if (backing.disjoint) c.VK_IMAGE_CREATE_DISJOINT_BIT else 0) |
+            (if (format.colorPlanes() > 1) @as(u32, c.VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) else 0),
         .imageType = c.VK_IMAGE_TYPE_2D,
         .format = vk_format,
-        .extent = .{ .width = size.width, .height = size.height, .depth = 1 },
+        // Linear packed 4:2:2 is viewed as four UNORM8 bytes per pixel pair.
+        .extent = .{ .width = if (format.isVideo() and format.colorPlanes() == 1) size.width / 2 else size.width, .height = size.height, .depth = 1 },
         .mipLevels = 1,
         .arrayLayers = 1,
         .samples = c.VK_SAMPLE_COUNT_1_BIT,
@@ -2200,7 +2252,7 @@ fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: rende
         .flags = 0,
         .image = image,
         .viewType = c.VK_IMAGE_VIEW_TYPE_2D,
-        .format = vk_format,
+        .format = if (format.colorPlanes() > 1) videoPlaneVkFormat(format, 0) else vk_format,
         .components = .{
             .r = c.VK_COMPONENT_SWIZZLE_IDENTITY,
             .g = c.VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -2209,9 +2261,17 @@ fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: rende
         },
         .subresourceRange = colorRange(),
     };
+    if (format.colorPlanes() > 1) view_info.subresourceRange.aspectMask = c.VK_IMAGE_ASPECT_PLANE_0_BIT;
     var view: c.VkImageView = undefined;
     try vk(c.vkCreateImageView(self.device, &view_info, null, &view), error.CreateExternalImageViewFailed);
     errdefer c.vkDestroyImageView(self.device, view, null);
+    var chroma_views: [2]c.VkImageView = @splat(null);
+    errdefer for (chroma_views) |chroma| if (chroma != null) c.vkDestroyImageView(self.device, chroma, null);
+    for (1..format.colorPlanes()) |plane| {
+        view_info.format = videoPlaneVkFormat(format, plane);
+        view_info.subresourceRange.aspectMask = @as(u32, c.VK_IMAGE_ASPECT_PLANE_0_BIT) << @as(u5, @intCast(plane));
+        try vk(c.vkCreateImageView(self.device, &view_info, null, &chroma_views[plane - 1]), error.CreateExternalImageViewFailed);
+    }
     entry.generation +%= 1;
     if (entry.generation == 0) entry.generation = 1;
     entry.* = .{
@@ -2225,6 +2285,7 @@ fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: rende
         .memory = memories[0],
         .plane_memories = memories[1..4].*,
         .view = view,
+        .chroma_views = chroma_views,
     };
     return importedToken(entry, index);
 }
@@ -2385,6 +2446,7 @@ fn destroyImportedImage(self: *RealRenderer, entry: *ImportedImage) void {
     if (!entry.occupied) return;
     std.debug.assert(entry.references == 1);
     c.vkDestroyImageView(self.device, entry.view, null);
+    for (entry.chroma_views) |view| if (view != null) c.vkDestroyImageView(self.device, view, null);
     c.vkDestroyImage(self.device, entry.image, null);
     c.vkFreeMemory(self.device, entry.memory, null);
     for (entry.plane_memories) |memory| if (memory != null) c.vkFreeMemory(self.device, memory, null);
@@ -2928,7 +2990,7 @@ fn growTargetBatches(self: *RealRenderer, target: *RealTarget, count: usize) !vo
     const layouts = try allocator.alloc(c.VkDescriptorSetLayout, count);
     defer allocator.free(layouts);
     @memset(layouts, self.descriptor_layout);
-    const combined_count = std.math.mul(usize, count, sampled_image_capacity + 2) catch return error.CapacityExceeded;
+    const combined_count = std.math.mul(usize, count, self.sampled_descriptors + 2) catch return error.CapacityExceeded;
     const pool_sizes = [_]c.VkDescriptorPoolSize{
         .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = @intCast(count * 3) },
         .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = @intCast(count * 6) },
@@ -4564,19 +4626,27 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     if (!replay) {
         for (0..batch_count) |batch_index| {
             const partition = batchAt(frame.samples.len, self.max_samples, batch_index);
-            var image_descriptors: [sampled_image_capacity]c.VkDescriptorImageInfo = undefined;
+            var image_descriptors: [sampled_descriptor_capacity]c.VkDescriptorImageInfo = undefined;
             for (frame.sources[partition.first..][0..partition.count], 0..) |surface, source_index| {
                 const prepared = self.prepared[preparedIndex(prepared_batch, surface.sample.surface) orelse unreachable];
                 image_descriptors[source_index] = .{ .sampler = self.sampler.?, .imageView = prepared.texture.view, .imageLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
             }
-            for (partition.count..sampled_image_capacity) |index| image_descriptors[index] = image_descriptors[0];
+            for (partition.count..sampled_descriptor_capacity) |index| image_descriptors[index] = image_descriptors[0];
+            for (frame.sources[partition.first..][0..partition.count], 0..) |surface, source_index| {
+                if (!surface.source.format.isVideo()) continue;
+                const prepared = self.prepared[preparedIndex(prepared_batch, surface.sample.surface) orelse unreachable];
+                const imported = importedFromToken(self, prepared.imported_token.?) orelse unreachable;
+                for (imported.chroma_views, 1..) |view, plane| if (view != null) {
+                    image_descriptors[source_index + sampled_image_capacity * plane] = .{ .sampler = self.sampler.?, .imageView = view, .imageLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                };
+            }
             var descriptor_write: c.VkWriteDescriptorSet = .{
                 .sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                 .pNext = null,
                 .dstSet = target.descriptor_sets[batch_index],
                 .dstBinding = 3,
                 .dstArrayElement = 0,
-                .descriptorCount = sampled_image_capacity,
+                .descriptorCount = self.sampled_descriptors,
                 .descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                 .pImageInfo = &image_descriptors,
                 .pBufferInfo = null,
@@ -5653,10 +5723,25 @@ fn sourceVkFormat(format: render.PixelFormat) c.VkFormat {
         .rgba32f => c.VK_FORMAT_R32G32B32A32_SFLOAT,
         .argb2101010, .xrgb2101010 => c.VK_FORMAT_A2R10G10B10_UNORM_PACK32,
         .abgr2101010, .xbgr2101010 => c.VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+        .nv12, .nv21 => c.VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
+        .p010 => c.VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+        .p012 => c.VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16,
+        .p016 => c.VK_FORMAT_G16_B16R16_2PLANE_420_UNORM,
+        .yuv420, .yvu420 => c.VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM,
+        .yuyv, .uyvy => c.VK_FORMAT_R8G8B8A8_UNORM,
     };
 }
 
+fn videoPlaneVkFormat(format: render.PixelFormat, plane: usize) c.VkFormat {
+    const paired = plane != 0 and format.colorPlanes() == 2;
+    return if (format.bytesPerPixel() == 1)
+        (if (paired) c.VK_FORMAT_R8G8_UNORM else c.VK_FORMAT_R8_UNORM)
+    else
+        (if (paired) c.VK_FORMAT_R16G16_UNORM else c.VK_FORMAT_R16_UNORM);
+}
+
 fn createTexture(self: *RealRenderer, size: render.Size, format: render.PixelFormat) !Texture {
+    if (format.isVideo()) return error.UnsupportedExternalFormat;
     var image_info: c.VkImageCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = null,

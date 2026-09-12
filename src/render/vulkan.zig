@@ -587,7 +587,7 @@ fn packSample(
             color_transform.matrix[1][0],
             color_transform.matrix[1][1],
             color_transform.matrix[1][2],
-            0,
+            @bitCast(sample.color_representation.pack()),
         },
         .color_matrix_2 = .{
             color_transform.matrix[2][0],

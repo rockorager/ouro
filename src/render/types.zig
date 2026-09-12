@@ -27,16 +27,51 @@ pub const PixelFormat = enum {
     xbgr16161616f,
     /// Internal single-pixel source; not a wl_shm wire format.
     rgba32f,
+    // Native video is DMA-BUF-only. These are color planes, not modifier
+    // memory planes: a modifier may require additional auxiliary storage.
+    nv12,
+    nv21,
+    p010,
+    p012,
+    p016,
+    yuv420,
+    yvu420,
+    yuyv,
+    uyvy,
+
+    pub fn isVideo(format: PixelFormat) bool {
+        return @intFromEnum(format) >= @intFromEnum(PixelFormat.nv12);
+    }
+
+    pub fn colorPlanes(format: PixelFormat) u8 {
+        return switch (format) {
+            .nv12, .nv21, .p010, .p012, .p016 => 2,
+            .yuv420, .yvu420 => 3,
+            else => 1,
+        };
+    }
+
+    pub fn planeLayout(format: PixelFormat, size: Size, plane: usize) struct { size: Size, bytes: u32 } {
+        std.debug.assert(plane < format.colorPlanes());
+        if (plane == 0) return .{ .size = size, .bytes = format.bytesPerPixel() };
+        return .{
+            .size = .{ .width = (size.width + 1) / 2, .height = (size.height + 1) / 2 },
+            .bytes = format.bytesPerPixel() * @as(u32, if (format.colorPlanes() == 2) 2 else 1),
+        };
+    }
 
     pub fn bytesPerPixel(format: PixelFormat) u32 {
         return switch (format) {
             .abgr16161616, .xbgr16161616, .abgr16161616f, .xbgr16161616f => 8,
             .rgba32f => 16,
+            .nv12, .nv21, .yuv420, .yvu420 => 1,
+            .p010, .p012, .p016, .yuyv, .uyvy => 2,
             else => 4,
         };
     }
 
     pub fn isOpaque(format: PixelFormat) bool {
+        if (format.isVideo()) return true;
         return switch (format) {
             .xrgb8888, .xbgr8888, .xrgb2101010, .xbgr2101010, .xbgr16161616, .xbgr16161616f => true,
             else => false,
@@ -58,6 +93,15 @@ pub const PixelFormat = enum {
             .abgr16161616f => 0x48344241,
             .xbgr16161616f => 0x48344258,
             .rgba32f => null,
+            .nv12 => 0x3231564e,
+            .nv21 => 0x3132564e,
+            .p010 => 0x30313050,
+            .p012 => 0x32313050,
+            .p016 => 0x36313050,
+            .yuv420 => 0x32315559,
+            .yvu420 => 0x32315659,
+            .yuyv => 0x56595559,
+            .uyvy => 0x59565955,
         };
     }
 
@@ -311,6 +355,9 @@ pub fn validateOutput(output: Size) ValidationError!void {
 
 pub fn validateSample(sample: SurfaceSample) ValidationError!usize {
     sample.color_description.validate() catch return error.InvalidSource;
+    if (sample.source.format.isVideo() and sample.source.external == null) return error.InvalidSource;
+    if (!sample.color_representation.compatible(sample.source.format.isVideo(), sample.source.format.colorPlanes() > 1))
+        return error.InvalidSource;
     if (sample.sample.surface == 0 or sample.sample.commit_sequence == 0 or
         sample.presentation.generation == 0)
         return error.InvalidIdentity;

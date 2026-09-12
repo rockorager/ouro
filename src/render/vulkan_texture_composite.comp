@@ -27,7 +27,8 @@ struct Sample {
 };
 
 layout(std430, set = 0, binding = 1) readonly buffer Samples { Sample items[]; };
-layout(set = 0, binding = 3) uniform sampler2D source_images[32];
+layout(constant_id = 0) const uint source_descriptor_count = 32u;
+layout(set = 0, binding = 3) uniform sampler2D source_images[source_descriptor_count];
 layout(std430, set = 0, binding = 4) readonly buffer ColorLuts { vec4 lut_texels[]; };
 layout(std430, set = 0, binding = 6) readonly buffer Contents { uint content_words[]; };
 
@@ -112,8 +113,10 @@ vec3 sample_lut(vec3 value, int packed_slot) {
 }
 
 #include "vulkan_shm.glsl"
+#include "vulkan_video.glsl"
 
 vec4 raw_pixel(Sample item, uint index, ivec2 coordinate) {
+    if (item.attributes.x >= 13u) return video_pixel(item, index, coordinate);
     if ((item.attributes.y & 0x40000000u) == 0u)
         return texelFetch(source_images[index], coordinate, 0);
     uint byte_offset = item.source.x + uint(coordinate.y) * item.source.w +

@@ -219,18 +219,21 @@ pub const Store = struct {
         // layouts are admitted to the renderer validator, which queries the
         // exact Vulkan import contract before the wl_buffer becomes usable.
         if (plane.modifier == modifier_linear or plane.modifier == modifier_invalid) {
-            if (plane_count != 1) return error.Incomplete;
-            const row_bytes = std.math.mul(u32, @intCast(width), pixel_format.bytesPerPixel()) catch
-                return error.OutOfBounds;
-            if (plane.stride < row_bytes) return error.OutOfBounds;
-            const plane_bytes = std.math.mul(u64, plane.stride, @as(u32, @intCast(height))) catch
-                return error.OutOfBounds;
-            const required_bytes = std.math.add(u64, plane.offset, plane_bytes) catch
-                return error.OutOfBounds;
-            var descriptor = std.mem.zeroes(linux.Statx);
-            const status = linux.statx(plane.fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &descriptor);
-            if (linux.errno(status) != .SUCCESS or !descriptor.mask.SIZE or required_bytes > descriptor.size)
-                return error.OutOfBounds;
+            if (plane_count != pixel_format.colorPlanes()) return error.Incomplete;
+            for (params.planes[0..plane_count], 0..) |item, index| {
+                const layout = pixel_format.planeLayout(.{ .width = @intCast(width), .height = @intCast(height) }, index);
+                const row_bytes = std.math.mul(u32, layout.size.width, layout.bytes) catch
+                    return error.OutOfBounds;
+                if (item.?.stride < row_bytes) return error.OutOfBounds;
+                const plane_bytes = std.math.mul(u64, item.?.stride, layout.size.height) catch
+                    return error.OutOfBounds;
+                const required_bytes = std.math.add(u64, item.?.offset, plane_bytes) catch
+                    return error.OutOfBounds;
+                var descriptor = std.mem.zeroes(linux.Statx);
+                const status = linux.statx(item.?.fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &descriptor);
+                if (linux.errno(status) != .SUCCESS or !descriptor.mask.SIZE or required_bytes > descriptor.size)
+                    return error.OutOfBounds;
+            }
         }
         const slot = try acquireStoreSlot(BufferSlot, store.allocator, &store.buffers, &store.buffers_free);
         const index = slot.index;
@@ -1164,6 +1167,7 @@ test "linux-dmabuf: modern RGB bounds and modifier memory planes" {
     var store = try Store.init(std.testing.allocator, .{});
     defer store.deinit();
     for (std.enums.values(@import("../render/types.zig").PixelFormat)) |format| {
+        if (format.isVideo()) continue;
         const fourcc_value = format.drmFormat() orelse continue;
         const bpp = format.bytesPerPixel();
         const params = try store.createParams();
@@ -1191,6 +1195,52 @@ test "linux-dmabuf: modern RGB bounds and modifier memory planes" {
     try store.addPlane(mismatch, try sizedFd(4096), 0, 0, 256, 7);
     try store.addPlane(mismatch, try sizedFd(4096), 1, 0, 64, 8);
     try std.testing.expectError(error.InvalidFormat, store.createBuffer(mismatch, 32, 16, drm_format_xrgb8888, 0));
+}
+
+test "linux-dmabuf: video bounds distinguish subsampled color planes and shared allocations" {
+    const PixelFormat = @import("../render/types.zig").PixelFormat;
+    const Case = struct { format: PixelFormat, strides: [3]u32, offsets: [3]u32, size: usize, planes: u8 };
+    const cases = [_]Case{
+        .{ .format = .nv12, .strides = .{ 8, 8, 0 }, .offsets = .{ 7, 43, 0 }, .size = 59, .planes = 2 },
+        .{ .format = .nv21, .strides = .{ 8, 8, 0 }, .offsets = .{ 7, 43, 0 }, .size = 59, .planes = 2 },
+        .{ .format = .p010, .strides = .{ 16, 16, 0 }, .offsets = .{ 8, 80, 0 }, .size = 112, .planes = 2 },
+        .{ .format = .p012, .strides = .{ 16, 16, 0 }, .offsets = .{ 8, 80, 0 }, .size = 112, .planes = 2 },
+        .{ .format = .p016, .strides = .{ 16, 16, 0 }, .offsets = .{ 8, 80, 0 }, .size = 112, .planes = 2 },
+        .{ .format = .yuv420, .strides = .{ 8, 5, 7 }, .offsets = .{ 3, 40, 54 }, .size = 68, .planes = 3 },
+        .{ .format = .yvu420, .strides = .{ 8, 5, 7 }, .offsets = .{ 3, 40, 54 }, .size = 68, .planes = 3 },
+        .{ .format = .yuyv, .strides = .{ 16, 0, 0 }, .offsets = .{ 7, 0, 0 }, .size = 71, .planes = 1 },
+        .{ .format = .uyvy, .strides = .{ 16, 0, 0 }, .offsets = .{ 7, 0, 0 }, .size = 71, .planes = 1 },
+    };
+    for (cases) |case| for ([_]bool{ false, true }) |shared| {
+        var store = try Store.init(std.testing.allocator, .{});
+        defer store.deinit();
+        // Bounds include the final row's stride; chroma height is two, not four.
+        for ([_]usize{ case.size, case.size - 1 }) |size| {
+            const backing = try sizedFd(size);
+            defer _ = linux.close(backing);
+            const params = try store.createParams();
+            for (0..case.planes) |plane| {
+                const fd: linux.fd_t = if (shared) duplicate: {
+                    const raw = linux.fcntl(backing, linux.F.DUPFD_CLOEXEC, 0);
+                    if (linux.errno(raw) != .SUCCESS) return error.SystemCallFailed;
+                    break :duplicate @intCast(raw);
+                } else try sizedFd(size);
+                try store.addPlane(params, fd, @intCast(plane), case.offsets[plane], case.strides[plane], modifier_linear);
+            }
+            if (size == case.size) {
+                const id = try store.createBuffer(params, 6, 4, case.format.drmFormat().?, 0);
+                const value = try store.buffer(id);
+                try std.testing.expectEqual(case.planes, value.plane_count);
+                for (0..case.planes) |plane| {
+                    try std.testing.expectEqual(case.strides[plane], value.planes[plane].?.stride);
+                    try std.testing.expectEqual(case.offsets[plane], value.planes[plane].?.offset);
+                }
+            } else try std.testing.expectError(error.OutOfBounds, store.createBuffer(params, 6, 4, case.format.drmFormat().?, 0));
+        }
+        const missing = try store.createParams();
+        try store.addPlane(missing, try sizedFd(case.size), 0, 0, case.strides[0], 0);
+        if (case.planes > 1) try std.testing.expectError(error.Incomplete, store.createBuffer(missing, 6, 4, case.format.drmFormat().?, 0));
+    };
 }
 
 test "linux-dmabuf: generated wire adapter is complete" {

@@ -1,4 +1,4 @@
-//! color-representation-v1 adapter for Ouro's RGB surface buffers.
+//! Double-buffered RGB and YCbCr color representation metadata.
 
 const std = @import("std");
 const wayring = @import("wayring");
@@ -106,14 +106,37 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                             .straight
                         else
                             return try self.surfaceError(actor, decoded.handle.id, Surface.@"error".alpha_mode.value, "unsupported alpha mode");
-                        destination.setColorRepresentation(.{ .alpha_mode = mode });
+                        var representation = destination.pending_color_representation;
+                        representation.alpha_mode = mode;
+                        destination.setColorRepresentation(representation);
                     },
                     .set_coefficients_and_range => |value| {
-                        if (core_surface == null) return try self.surfaceError(actor, decoded.handle.id, Surface.@"error".inert.value, "inert surface");
-                        if (value.coefficients.value != Surface.coefficients.identity.value or value.range.value != Surface.range.full.value)
+                        const destination = core_surface orelse return try self.surfaceError(actor, decoded.handle.id, Surface.@"error".inert.value, "inert surface");
+                        var representation = destination.pending_color_representation;
+                        representation.coefficients = switch (value.coefficients.value) {
+                            Surface.coefficients.identity.value => .identity,
+                            Surface.coefficients.bt709.value => .bt709,
+                            Surface.coefficients.bt601.value => .bt601,
+                            Surface.coefficients.bt2020.value => .bt2020,
+                            else => return try self.surfaceError(actor, decoded.handle.id, Surface.@"error".coefficients.value, "unsupported coefficients"),
+                        };
+                        representation.range = switch (value.range.value) {
+                            Surface.range.full.value => .full,
+                            Surface.range.limited.value => .limited,
+                            else => return try self.surfaceError(actor, decoded.handle.id, Surface.@"error".coefficients.value, "unsupported range"),
+                        };
+                        if (representation.coefficients == .identity and representation.range != .full)
                             return try self.surfaceError(actor, decoded.handle.id, Surface.@"error".coefficients.value, "unsupported coefficients or range");
+                        destination.setColorRepresentation(representation);
                     },
-                    .set_chroma_location => return try self.surfaceError(actor, decoded.handle.id, Surface.@"error".chroma_location.value, "chroma location is unsupported for RGB"),
+                    .set_chroma_location => |value| {
+                        const destination = core_surface orelse return try self.surfaceError(actor, decoded.handle.id, Surface.@"error".inert.value, "inert surface");
+                        if (value.chroma_location.value < 1 or value.chroma_location.value > 6)
+                            return try self.surfaceError(actor, decoded.handle.id, Surface.@"error".chroma_location.value, "invalid chroma location");
+                        var representation = destination.pending_color_representation;
+                        representation.chroma_location = @intCast(value.chroma_location.value);
+                        destination.setColorRepresentation(representation);
+                    },
                 }
                 try decoded.finish(protocol, server_objects, &actor.transmit);
                 return .continue_dispatch;
@@ -124,13 +147,17 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         pub fn flushOn(self: *Self, peer: wayring.io_uring.Peer, server_objects: anytype, queue: *wayring.tx.Queue) !usize {
             var count: usize = 0;
             for (self.resources.items) |resource| {
-                if (resource.kind != .manager or !samePeer(resource.peer, peer) or resource.pending >= 5 or server_objects.namespace.resolve(resource.handle) == null) continue;
-                while (resource.pending < 5) {
+                if (resource.kind != .manager or !samePeer(resource.peer, peer) or resource.pending >= 11 or server_objects.namespace.resolve(resource.handle) == null) continue;
+                while (resource.pending < 11) {
                     const event: Manager.Event = switch (resource.pending) {
                         0 => .{ .supported_alpha_mode = .{ .alpha_mode = Surface.alpha_mode.premultiplied_electrical } },
                         1 => .{ .supported_alpha_mode = .{ .alpha_mode = Surface.alpha_mode.straight } },
                         2 => .{ .supported_alpha_mode = .{ .alpha_mode = Surface.alpha_mode.premultiplied_optical } },
                         3 => .{ .supported_coefficients_and_ranges = .{ .coefficients = Surface.coefficients.identity, .range = Surface.range.full } },
+                        4...9 => .{ .supported_coefficients_and_ranges = .{
+                            .coefficients = ([_]Surface.coefficients{ Surface.coefficients.bt709, Surface.coefficients.bt601, Surface.coefficients.bt2020 })[(resource.pending - 4) / 2],
+                            .range = if (resource.pending % 2 == 0) Surface.range.full else Surface.range.limited,
+                        } },
                         else => .{ .done = .{} },
                     };
                     Manager.encodeEvent(queue, resource.handle.id, event) catch |err| switch (err) {
@@ -145,8 +172,23 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
-            for (self.resources.items) |r| if (r.kind == .manager and r.pending < 5 and samePeer(r.peer, peer)) return true;
+            for (self.resources.items) |r| if (r.kind == .manager and r.pending < 11 and samePeer(r.peer, peer)) return true;
             return false;
+        }
+
+        pub fn validateSurfaceCommit(self: *Self, id: CoreSurface.SurfaceId) !void {
+            const state = try self.core.getSurfaceById(id);
+            const buffer = (if (state.attach_changed) state.pending_buffer else state.current_buffer) orelse return;
+            if (!state.pending_color_representation.compatible(buffer.video, buffer.subsampled420))
+                return error.IncompatibleColorRepresentation;
+        }
+
+        pub fn reportSurfaceCommitFailure(self: *Self, actor: *wayring.connection.Actor, id: CoreSurface.SurfaceId, cause: anyerror) !?wayring.dispatch.Control {
+            if (cause != error.IncompatibleColorRepresentation) return null;
+            for (self.resources.items) |resource| if (resource.kind == .surface and resource.surface != null and std.meta.eql(resource.surface.?, id)) {
+                return try self.surfaceError(actor, resource.handle.id, Surface.@"error".pixel_format.value, "incompatible pixel format and color representation");
+            };
+            return null;
         }
 
         pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {

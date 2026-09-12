@@ -2645,6 +2645,8 @@ pub fn Adapter(comptime protocol: type) type {
                 .width = external.width,
                 .height = external.height,
                 .explicit_sync_supported = true,
+                .video = if (@import("../render/types.zig").PixelFormat.fromDrm(external.format)) |format| format.isVideo() else false,
+                .subsampled420 = if (@import("../render/types.zig").PixelFormat.fromDrm(external.format)) |format| format.colorPlanes() > 1 else false,
             }, x, y);
             slot.attachment.attach(lease);
         }

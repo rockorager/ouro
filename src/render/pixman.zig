@@ -324,6 +324,7 @@ pub const Renderer = struct {
 
             var scratch: ?[]u32 = null;
             defer if (scratch) |pixels| self.allocator.free(pixels);
+            if (sample.source.format.isVideo()) return error.InvalidSource;
             var source_bytes = sample.source.bytes;
             var source_stride = sample.source.stride;
             const float_source = sample.source.format.bytesPerPixel() >= 8;
@@ -889,6 +890,7 @@ fn pixmanFormat(format: render.PixelFormat) c.pixman_format_code_t {
         .abgr2101010 => c.PIXMAN_a2b10g10r10,
         .xrgb2101010 => c.PIXMAN_x2r10g10b10,
         .xbgr2101010 => c.PIXMAN_x2b10g10r10,
+        else => unreachable, // Native video never traverses Pixman.
     };
 }
 

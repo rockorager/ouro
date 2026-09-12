@@ -3371,6 +3371,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 else => return err,
             };
             try self.session_lock_adapter.validateSurfaceCommit(id);
+            try self.color_representation_adapter.validateSurfaceCommit(id);
             if (self.layer_shell_adapter.ownsSurface(id)) {
                 const work_area = try self.layerWorkArea(id);
                 const output_areas = try self.desktopOutputAreas(id);
@@ -3401,6 +3402,8 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try self.shell_adapter.reportSurfaceCommitFailure(actor, id, cause)) |control|
                 return control;
             if (try self.layer_shell_adapter.reportSurfaceCommitFailure(actor, id, cause)) |control|
+                return control;
+            if (try self.color_representation_adapter.reportSurfaceCommitFailure(actor, id, cause)) |control|
                 return control;
             return self.session_lock_adapter.reportSurfaceCommitFailure(actor, id, cause);
         }

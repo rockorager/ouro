@@ -2289,6 +2289,7 @@ fn directScanoutSource(
     const sample = list.samples[list.samples.len - 1];
     const external = sample.source.external orelse return null;
     if (sample.source.native != null or sample.source.upload != null or
+        sample.source.format.isVideo() or
         list.output_format != .xrgb8888 or
         formatFromDrm(external.drm_format) != sample.source.format or
         !std.meta.eql(sample.source.size, list.output) or sample.transform != .normal or

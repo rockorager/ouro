@@ -112,9 +112,49 @@ pub const AlphaMode = enum(u8) {
 
 pub const Representation = struct {
     alpha_mode: AlphaMode = .premultiplied_electrical,
+    /// Unset metadata: RGB identity/full, video BT.709/limited. This is the
+    /// compositor-defined reconstruction permitted by color-representation-v1.
+    coefficients: enum(u3) { unset, identity, bt709, bt601, bt2020 } = .unset,
+    range: enum(u2) { unset, full, limited } = .unset,
+    /// H.273 Chroma420SampleLocType + 1. Zero defaults to type 0 (left).
+    chroma_location: u3 = 0,
+
+    pub fn pack(value: Representation) u32 {
+        return @as(u32, @intFromEnum(value.coefficients)) |
+            (@as(u32, @intFromEnum(value.range)) << 4) |
+            (@as(u32, value.chroma_location) << 8);
+    }
+
+    pub fn compatible(value: Representation, video: bool, subsampled420: bool) bool {
+        if (value.chroma_location != 0 and !subsampled420) return false;
+        return if (video) value.coefficients != .identity else (value.coefficients == .unset or value.coefficients == .identity) and value.range != .limited;
+    }
 };
 
 pub const Matrix3 = [3][3]f32;
+
+test "color: representation compatibility distinguishes RGB, 420 and 422" {
+    for ([_]Representation{
+        .{ .coefficients = .bt709, .range = .limited },
+        .{ .coefficients = .bt601, .range = .full },
+        .{ .coefficients = .bt2020, .range = .limited },
+    }) |representation| {
+        try std.testing.expect(!representation.compatible(false, false));
+        try std.testing.expect(representation.compatible(true, true));
+        try std.testing.expect(representation.compatible(true, false));
+        var located = representation;
+        located.chroma_location = 6;
+        try std.testing.expect(!located.compatible(true, false));
+        try std.testing.expect(located.compatible(true, true));
+    }
+    const rgb = Representation{ .coefficients = .identity, .range = .full };
+    try std.testing.expect(rgb.compatible(false, false));
+    try std.testing.expect(!rgb.compatible(true, true));
+    const unset = Representation{};
+    try std.testing.expect(unset.compatible(false, false));
+    try std.testing.expect(unset.compatible(true, true));
+    try std.testing.expectEqual(@as(u32, 0x624), (Representation{ .coefficients = .bt2020, .range = .limited, .chroma_location = 6 }).pack());
+}
 
 pub const Transform = struct {
     matrix: Matrix3,

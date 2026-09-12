@@ -1002,6 +1002,7 @@ test "render-content: large packed full copy preserves every byte" {
 
 test "render-content: high precision SHM keeps odd-stride rows and complete damaged pixels" {
     for (std.enums.values(render.PixelFormat)) |format| {
+        if (format.isVideo()) continue; // Native video is retained, not copied SHM.
         const bpp = format.bytesPerPixel();
         var store = try Store.init(std.testing.allocator, .{ .version_capacity = 3, .byte_capacity = 128 });
         defer store.deinit();
