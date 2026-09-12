@@ -1516,7 +1516,7 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     self.max_source_bytes = config.max_source_bytes;
     self.copy_offset_alignment = @max(
         @as(usize, @intCast(physical_properties.limits.optimalBufferCopyOffsetAlignment)),
-        8, // VkBufferImageCopy offsets must align to the largest SHM texel.
+        16, // Includes the internal RGBA32F single-pixel source.
     );
     self.staging_buffer_size = std.math.add(
         usize,
@@ -2235,7 +2235,7 @@ fn externalVkFormat(drm_format: u32, format: render.PixelFormat) ?c.VkFormat {
             c.VK_FORMAT_R8G8B8A8_UNORM
         else
             null,
-        .abgr16161616, .argb2101010, .abgr2101010 => null,
+        else => null,
     };
 }
 
@@ -5558,9 +5558,12 @@ fn destroyBlurImage(self: *RealRenderer, target: *RealTarget) void {
 fn sourceVkFormat(format: render.PixelFormat) c.VkFormat {
     return switch (format) {
         .argb8888_premultiplied, .xrgb8888 => c.VK_FORMAT_B8G8R8A8_UNORM,
-        .abgr16161616 => c.VK_FORMAT_R16G16B16A16_UNORM,
-        .argb2101010 => c.VK_FORMAT_A2R10G10B10_UNORM_PACK32,
-        .abgr2101010 => c.VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+        .abgr8888, .xbgr8888 => c.VK_FORMAT_R8G8B8A8_UNORM,
+        .abgr16161616, .xbgr16161616 => c.VK_FORMAT_R16G16B16A16_UNORM,
+        .abgr16161616f, .xbgr16161616f => c.VK_FORMAT_R16G16B16A16_SFLOAT,
+        .rgba32f => c.VK_FORMAT_R32G32B32A32_SFLOAT,
+        .argb2101010, .xrgb2101010 => c.VK_FORMAT_A2R10G10B10_UNORM_PACK32,
+        .abgr2101010, .xbgr2101010 => c.VK_FORMAT_A2B10G10R10_UNORM_PACK32,
     };
 }
 

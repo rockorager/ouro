@@ -1001,11 +1001,12 @@ test "render-content: large packed full copy preserves every byte" {
 }
 
 test "render-content: high precision SHM keeps odd-stride rows and complete damaged pixels" {
-    for ([_]render.PixelFormat{ .abgr16161616, .argb2101010, .abgr2101010 }, [_]u32{ 8, 4, 4 }) |format, bpp| {
+    for (std.enums.values(render.PixelFormat)) |format| {
+        const bpp = format.bytesPerPixel();
         var store = try Store.init(std.testing.allocator, .{ .version_capacity = 3, .byte_capacity = 128 });
         defer store.deinit();
         const stride = 2 * bpp + 1;
-        var bytes: [35]u8 = @splat(0xee);
+        var bytes: [67]u8 = @splat(0xee);
         for (0..2) |y| for (0..2 * bpp) |x| {
             bytes[1 + y * stride + x] = @intCast(y * 2 * bpp + x);
         };
@@ -1013,7 +1014,7 @@ test "render-content: high precision SHM keeps odd-stride rows and complete dama
         source.format = format;
         const identity: render.SampleIdentity = .{ .surface = 1, .commit_sequence = 1 };
         const first = store.publish(try store.prepare(identity, source, .{}));
-        var expected: [32]u8 = undefined;
+        var expected: [64]u8 = undefined;
         for (&expected, 0..) |*byte, index| byte.* = @intCast(index);
         try std.testing.expectEqual(2 * bpp, (try store.resolve(first)).stride);
         try std.testing.expectEqualSlices(u8, expected[0 .. 4 * bpp], (try store.resolve(first)).bytes);

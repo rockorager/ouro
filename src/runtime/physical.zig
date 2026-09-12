@@ -9227,8 +9227,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 },
                 .single_pixel => |pixel| .{
                     .size = .{ .width = 1, .height = 1 },
-                    .stride = 4,
-                    .format = .argb8888_premultiplied,
+                    .stride = 16,
+                    .format = .rgba32f,
                     .bytes = pixel.bytes,
                 },
                 .external => |external| external_source: {

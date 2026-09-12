@@ -18,9 +18,29 @@ pub const PixelFormat = enum {
     abgr16161616,
     argb2101010,
     abgr2101010,
+    abgr8888,
+    xbgr8888,
+    xrgb2101010,
+    xbgr2101010,
+    xbgr16161616,
+    abgr16161616f,
+    xbgr16161616f,
+    /// Internal single-pixel source; not a wl_shm wire format.
+    rgba32f,
 
     pub fn bytesPerPixel(format: PixelFormat) u32 {
-        return if (format == .abgr16161616) 8 else 4;
+        return switch (format) {
+            .abgr16161616, .xbgr16161616, .abgr16161616f, .xbgr16161616f => 8,
+            .rgba32f => 16,
+            else => 4,
+        };
+    }
+
+    pub fn isOpaque(format: PixelFormat) bool {
+        return switch (format) {
+            .xrgb8888, .xbgr8888, .xrgb2101010, .xbgr2101010, .xbgr16161616, .xbgr16161616f => true,
+            else => false,
+        };
     }
 };
 

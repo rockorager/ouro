@@ -579,10 +579,12 @@ calibration is included when present. Auto and Pixman modes reject configured
 output profiles and do not advertise color-management behavior they cannot
 guarantee.
 
-SHM clients can use ARGB8888, XRGB8888, ABGR16161616 (unsigned 16-bit
-channels, not half-float), ARGB2101010, and ABGR2101010. Vulkan retains the
-integer precision in uploads and decodes into its linear-light composition;
-Pixman uses native 10-bit sources and a float wrapper for UNORM16 sources,
+SHM clients can use ARGB/XRGB/ABGR/XBGR8888, all four 2101010 variants,
+ABGR/XBGR16161616 (unsigned normalized integer), and ABGR/XBGR16161616F
+(half-float). X channels are opaque. Vulkan retains source precision in uploads
+and extended-range floating-point RGB through linear-light composition.
+Single-pixel u32 colors normalize directly to float, without an 8-bit step.
+Pixman uses native 10-bit sources and a float wrapper for 16-bit sources,
 without changing its non-color-managed policy. These are client SHM layouts:
 DMA-BUF import remains limited to the existing 8-bit formats, and the existing
 XRGB2101010 scanout support is independent. Capture destinations remain 8-bit

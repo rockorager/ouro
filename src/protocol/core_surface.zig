@@ -15,11 +15,13 @@ const none = std.math.maxInt(u32);
 
 /// One table owns advertisement, Wayring's layout validation, and ingestion.
 const shm_pixel_formats = [_]@import("../render/types.zig").PixelFormat{
-    .argb8888_premultiplied, .xrgb8888, .abgr16161616, .argb2101010, .abgr2101010,
+    .argb8888_premultiplied, .xrgb8888,      .abgr16161616, .argb2101010, .abgr2101010,
+    .abgr8888,               .xbgr8888,      .xrgb2101010,  .xbgr2101010, .xbgr16161616,
+    .abgr16161616f,          .xbgr16161616f,
 };
 pub const shm_formats: [shm_pixel_formats.len]wayring.shm.Format = blk: {
     const formats = @import("core_protocol").wl_shm.format;
-    const values = [_]u32{ formats.argb8888.value, formats.xrgb8888.value, formats.abgr16161616.value, formats.argb2101010.value, formats.abgr2101010.value };
+    const values = [_]u32{ formats.argb8888.value, formats.xrgb8888.value, formats.abgr16161616.value, formats.argb2101010.value, formats.abgr2101010.value, formats.abgr8888.value, formats.xbgr8888.value, formats.xrgb2101010.value, formats.xbgr2101010.value, formats.xbgr16161616.value, formats.abgr16161616f.value, formats.xbgr16161616f.value };
     var result: [values.len]wayring.shm.Format = undefined;
     for (values, shm_pixel_formats, 0..) |value, format, index|
         result[index] = .{ .value = value, .bytes_per_pixel = format.bytesPerPixel() };
@@ -196,7 +198,7 @@ pub fn Adapter(comptime protocol: type) type {
             info: wayring.shm.Buffer,
             storage: ShmStorage,
         };
-        const SinglePixelBacking = [4]u8;
+        const SinglePixelBacking = [16]u8;
         pub const ExternalBuffer = struct {
             context: *anyopaque,
             token: u64,
@@ -278,7 +280,7 @@ pub fn Adapter(comptime protocol: type) type {
             active: bool = false,
             next_free: u32 = none,
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
-            bytes: SinglePixelBacking = .{ 0, 0, 0, 0 },
+            bytes: SinglePixelBacking = @splat(0),
         };
 
         const ContentTypeSlot = struct {
@@ -2114,12 +2116,10 @@ pub fn Adapter(comptime protocol: type) type {
                         return try adapter.failure(actor, decoded.handle.id, cause);
                     };
                     slot.resource = admitted.id;
-                    slot.bytes = .{
-                        normalizedComponent(value.b),
-                        normalizedComponent(value.g),
-                        normalizedComponent(value.r),
-                        normalizedComponent(value.a),
-                    };
+                    for ([_]u32{ value.r, value.g, value.b, value.a }, 0..) |component, i| {
+                        const normalized: f32 = @floatCast(@as(f64, @floatFromInt(component)) / 4294967295.0);
+                        std.mem.writeInt(u32, slot.bytes[i * 4 ..][0..4], @bitCast(normalized), .little);
+                    }
                 },
             }
             try decoded.finish(protocol, server_objects, &actor.transmit);
@@ -3615,11 +3615,6 @@ pub fn Adapter(comptime protocol: type) type {
     };
 }
 
-fn normalizedComponent(value: u32) u8 {
-    const maximum = std.math.maxInt(u32);
-    return @intCast((@as(u64, value) * std.math.maxInt(u8) + maximum / 2) / maximum);
-}
-
 fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
     return a.slot == b.slot and a.generation == b.generation;
 }
@@ -3633,9 +3628,9 @@ const linux = std.os.linux;
 const test_formats = shm_formats;
 
 test "SHM high precision formats validate full rows and pool bounds" {
-    const values = [_]u32{ 0x38344241, 0x30335241, 0x30334241 };
-    const pixels = [_]@import("../render/types.zig").PixelFormat{ .abgr16161616, .argb2101010, .abgr2101010 };
-    for (values, pixels, [_]u32{ 8, 4, 4 }) |value, pixel, bpp| {
+    const values = [_]u32{ 0, 1, 0x38344241, 0x30335241, 0x30334241, 0x34324241, 0x34324258, 0x30335258, 0x30334258, 0x38344258, 0x48344241, 0x48344258 };
+    const pixels = shm_pixel_formats;
+    for (values, pixels, [_]u32{ 4, 4, 8, 4, 4, 4, 4, 4, 4, 8, 8, 8 }) |value, pixel, bpp| {
         try std.testing.expectEqual(pixel, shmPixelFormat(value).?);
         const wire = for (shm_formats) |format| {
             if (format.value == value) break format;
@@ -3649,9 +3644,9 @@ test "SHM high precision formats validate full rows and pool bounds" {
         try std.testing.expectError(error.InvalidStride, wayring.shm.createBuffer(100, wire, 0, 3, 2, row - 1));
         try std.testing.expectError(error.OutOfBounds, wayring.shm.createBuffer(extent, wire, 1, 3, 2, stride));
     }
-    // ABGR16161616F and the X variants are not part of this advertisement.
-    try std.testing.expectEqual(null, shmPixelFormat(0x48344241));
-    try std.testing.expectEqual(null, shmPixelFormat(0x30335258));
+    // Older packed formats remain deliberately unsupported.
+    try std.testing.expectEqual(null, shmPixelFormat(0x36314752));
+    try std.testing.expectEqual(null, shmPixelFormat(0x34324752));
 }
 
 const TestContext = struct {
@@ -4656,7 +4651,7 @@ test "single pixel buffers retain normalized color after resource destruction" {
             .id = 11,
             .r = std.math.maxInt(u32),
             .g = 0x8080_8080,
-            .b = 0,
+            .b = 1,
             .a = 0x0101_0101,
         } },
     );
@@ -4688,7 +4683,10 @@ test "single pixel buffers retain normalized color after resource destruction" {
 
     const source = try context.adapter.bufferSource(content.attachment_lease.?);
     try std.testing.expectEqual(TestAdapter.BufferSource.single_pixel, std.meta.activeTag(source));
-    try std.testing.expectEqualSlices(u8, &.{ 0, 128, 255, 1 }, source.single_pixel.bytes);
+    for ([_]f32{ 1, 128.0 / 255.0, 1.0 / 4294967295.0, 1.0 / 255.0 }, 0..) |expected, i| {
+        const actual: f32 = @bitCast(std.mem.readInt(u32, source.single_pixel.bytes[i * 4 ..][0..4], .little));
+        try std.testing.expectEqual(expected, actual);
+    }
     try std.testing.expectEqual(@as(u32, 1), content.surface.size.width);
     try std.testing.expectEqual(@as(u32, 1), content.surface.size.height);
 

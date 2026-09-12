@@ -78,12 +78,19 @@ class Renderer:
         d = self.device
         sw, sh = source_size
         w, h = size
-        bpp = 8 if source_format == 2 else 4
+        bpp = 16 if source_format == 12 else 8 if source_format in (2, 9, 10, 11) else 4
         source_stride = source_stride or sw * bpp
         source_vk_format = {0: v.VK_FORMAT_B8G8R8A8_UNORM,
                             2: v.VK_FORMAT_R16G16B16A16_UNORM,
                             3: v.VK_FORMAT_A2R10G10B10_UNORM_PACK32,
-                            4: v.VK_FORMAT_A2B10G10R10_UNORM_PACK32}[source_format]
+                            4: v.VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+                            5: v.VK_FORMAT_R8G8B8A8_UNORM, 6: v.VK_FORMAT_R8G8B8A8_UNORM,
+                            7: v.VK_FORMAT_A2R10G10B10_UNORM_PACK32,
+                            8: v.VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+                            9: v.VK_FORMAT_R16G16B16A16_UNORM,
+                            10: v.VK_FORMAT_R16G16B16A16_SFLOAT,
+                            11: v.VK_FORMAT_R16G16B16A16_SFLOAT,
+                            12: v.VK_FORMAT_R32G32B32A32_SFLOAT}[source_format]
         texture = mode != "buffer"
         damage = damage or [(0, 0, w, h)]
         assert timing_repeats >= 1 and (timings is not None or timing_repeats == 1)
@@ -418,6 +425,46 @@ def test_shm(renderer, capture_path):
     if capture_path:
         preview.save(capture_path)
     print(f"SHM precision: {renderer.draw_count - start_count} draws passed (3 layouts, 3 paths, 8/10-bit output, alpha and capture)")
+
+
+def test_modern_rgb(renderer, capture_path):
+    start = renderer.draw_count
+    preview = Image.new("RGB", (1024, 170), "#202020")
+    draw = ImageDraw.Draw(preview)
+    # The unused alpha bits deliberately contain zero. Each expected RGB is
+    # independent of the shader and differs under a red/blue swap.
+    cases = [(5, struct.pack("<4B", 12, 63, 115, 128), (12 / 255, 63 / 255, 115 / 255), 128 / 255),
+             (6, struct.pack("<4B", 12, 63, 115, 0), (12 / 255, 63 / 255, 115 / 255), 1),
+             (7, struct.pack("<I", (23 << 20) | (127 << 10) | 503), (23 / 1023, 127 / 1023, 503 / 1023), 1),
+             (8, struct.pack("<I", (503 << 20) | (127 << 10) | 23), (23 / 1023, 127 / 1023, 503 / 1023), 1),
+             (9, struct.pack("<4H", 129, 8001, 31003, 0), (129 / 65535, 8001 / 65535, 31003 / 65535), 1)]
+    # A transform brings extended-range RGB into the output gamut. Clamping
+    # either the negative green or >1 red before the transform changes output.
+    matrix = (0.25, 0.25, 0, 0, -0.5, 0, 0, 0, 0.5)
+    for fmt, alpha in ((10, 0.5), (11, 1), (12, 0.5)):
+        bits = struct.pack("<4f" if fmt == 12 else "<4e", 2, -0.25, 0.125, 0 if fmt == 11 else alpha)
+        cases.append((fmt, bits, (0.4375, 0.125, 0.0625), alpha))
+    for column, (fmt, pixel, rgb, alpha) in enumerate(cases):
+        for mode in ("buffer", "texture", "texture-buffer"):
+            for filtering in ("nearest", "bilinear", "reconstruction", "area"):
+                # Padding must survive the source upload without becoming a texel.
+                data = (pixel * 2 + b"\xee" * len(pixel)) * 2
+                result, before, after = renderer.render(data, (2, 2), (2, 2), mode,
+                    source_format=fmt, source_stride=3 * len(pixel), source_transfer=1,
+                    alpha_mode=1, output_transfer=1, background=(17, 41, 73), filtering=filtering,
+                    color_matrix=matrix if fmt >= 10 else (1, 0, 0, 0, 1, 0, 0, 0, 1),
+                    capture_phases=3, copy_capture=True, raw_output=True)
+                expected = [round(x * 255 + bg * (1 - alpha)) for x, bg in zip(rgb[::-1], (73, 41, 17))] + [255]
+                assert max(abs(a - b) for a, b in zip(result, expected * 4)) <= 1, (fmt, mode, filtering, list(result), expected)
+                assert before == after
+                if mode == "texture" and filtering == "nearest":
+                    image = Image.frombytes("RGBA", (2, 2), before, "raw", "BGRA")
+                    preview.paste(image.convert("RGB").resize((112, 112)), (column * 128 + 8, 40))
+                    label = {5: "ABGR8", 6: "XBGR8", 7: "XRGB10", 8: "XBGR10", 9: "XBGR16", 10: "ABGR16F", 11: "XBGR16F", 12: "single pixel"}[fmt]
+                    draw.text((column * 128 + 8, 16), label, fill="white")
+    if capture_path:
+        preview.save(capture_path.with_stem(capture_path.stem + "-extended"))
+    print(f"Modern RGB: {renderer.draw_count - start} draws passed (X bits, float range, all filters and capture)")
 
 
 def test(renderer, compare_shader_dir):
@@ -827,6 +874,7 @@ if __name__ == "__main__":
         test_scene(renderer)
         test_hdr_capture(renderer, args.capture_hdr)
         test_shm(renderer, args.capture_shm)
+        test_modern_rgb(renderer, args.capture_shm)
         if args.benchmark_stall:
             benchmark_stall(renderer)
         if args.capture:

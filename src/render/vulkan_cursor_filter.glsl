@@ -4,7 +4,7 @@
 
 vec4 cursor_texel(Sample item, uint index, ivec2 coordinate) {
     vec4 value = raw_pixel(item, index, coordinate);
-    if (item.attributes.x == 1u) value.a = 1.0;
+    if (shm_opaque(item.attributes.x)) value.a = 1.0;
     // Optical premultiplication must be decoded before interpolation. Other
     // surfaces reconstruct encoded premultiplied values, as authored by clients
     // and Xcursor themes, then decode once for linear-light compositing.
@@ -74,13 +74,15 @@ vec4 filtered_pixel(Sample item, uint index, ivec2 fixed_coordinate) {
         // Already in output linear light (possibly HDR): do not clamp RGB to
         // encoded alpha. Keep global opacity when removing cubic overshoot.
         float alpha = clamp(value.a, 0.0, float(item.attributes.z) / 255.0);
-        value.rgb = value.a > 0.0 ? max(value.rgb, vec3(0.0)) * (alpha / value.a) : vec3(0.0);
+        vec3 rgb = item.attributes.x >= 10u ? value.rgb : max(value.rgb, vec3(0.0));
+        value.rgb = value.a > 0.0 ? rgb * (alpha / value.a) : vec3(0.0);
         value.a = alpha;
         return value;
     }
     // Cubic negative lobes must not generate dark or colored alpha fringes.
     value.a = clamp(value.a, 0.0, 1.0);
-    value.rgb = clamp(value.rgb, vec3(0.0), vec3(value.a));
+    // Floating-point sources may intentionally carry negative or HDR RGB.
+    if (item.attributes.x < 10u) value.rgb = clamp(value.rgb, vec3(0.0), vec3(value.a));
     if (item.affine_tail.z == 2) value.rgb = value.a > 0.0 ? value.rgb / value.a : vec3(0.0);
     return decode_pixel(item, value);
 }

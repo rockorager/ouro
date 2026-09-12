@@ -633,7 +633,7 @@ pub fn build(b: *std.Build) void {
 
     const shm_tests = b.addTest(.{
         .root_module = ouro,
-        .filters = &.{ "high precision", "UNORM16", "capture normalizes", "mixed SHM widths" },
+        .filters = &.{ "high precision", "UNORM16", "capture normalizes", "mixed SHM widths", "single pixel buffers", "modern RGB" },
     });
     const shm_runtime_tests = b.addTest(.{
         .root_module = drm_presentation_tests.root_module,

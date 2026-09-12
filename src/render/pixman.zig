@@ -324,7 +324,7 @@ pub const Renderer = struct {
             defer if (scratch) |pixels| self.allocator.free(pixels);
             var source_bytes = sample.source.bytes;
             var source_stride = sample.source.stride;
-            const float_source = sample.source.format == .abgr16161616;
+            const float_source = sample.source.format.bytesPerPixel() >= 8;
             const source_bpp: u32 = if (float_source) 16 else sample.source.format.bytesPerPixel();
             if (float_source or @intFromPtr(source_bytes.ptr) % @alignOf(u32) != 0 or source_stride % 4 != 0) {
                 const pixel_count = std.math.mul(
@@ -824,10 +824,18 @@ fn copySource(destination: []u8, destination_stride: u32, source: render.Source)
 fn unpackAbgr16(destination: []f32, source: render.Source) void {
     for (0..source.size.height) |y| {
         for (0..source.size.width) |x| {
-            const offset = y * source.stride + x * 8;
+            const offset = y * source.stride + x * source.format.bytesPerPixel();
             for (0..4) |channel| {
-                const value = std.mem.readInt(u16, source.bytes[offset + channel * 2 ..][0..2], .little);
-                destination[(y * source.size.width + x) * 4 + channel] = @as(f32, @floatFromInt(value)) / 65535.0;
+                const value: f32 = if (channel == 3 and source.format.isOpaque()) 1 else if (source.format == .rgba32f)
+                    @bitCast(std.mem.readInt(u32, source.bytes[offset + channel * 4 ..][0..4], .little))
+                else value: {
+                    const bits = std.mem.readInt(u16, source.bytes[offset + channel * 2 ..][0..2], .little);
+                    break :value if (source.format == .abgr16161616f or source.format == .xbgr16161616f)
+                        @as(f32, @as(f16, @bitCast(bits)))
+                    else
+                        @as(f32, @floatFromInt(bits)) / 65535.0;
+                };
+                destination[(y * source.size.width + x) * 4 + channel] = value;
             }
         }
     }
@@ -853,10 +861,23 @@ fn pixmanFormat(format: render.PixelFormat) c.pixman_format_code_t {
     return switch (format) {
         .argb8888_premultiplied => c.PIXMAN_a8r8g8b8,
         .xrgb8888 => c.PIXMAN_x8r8g8b8,
-        .abgr16161616 => c.PIXMAN_rgba_float,
+        .abgr8888 => c.PIXMAN_a8b8g8r8,
+        .xbgr8888 => c.PIXMAN_x8b8g8r8,
+        .abgr16161616, .xbgr16161616, .abgr16161616f, .xbgr16161616f, .rgba32f => c.PIXMAN_rgba_float,
         .argb2101010 => c.PIXMAN_a2r10g10b10,
         .abgr2101010 => c.PIXMAN_a2b10g10r10,
+        .xrgb2101010 => c.PIXMAN_x2r10g10b10,
+        .xbgr2101010 => c.PIXMAN_x2b10g10r10,
     };
+}
+
+test "render: modern RGB float wrapper preserves signed extended values and ignores X bits" {
+    const bytes = [_]u8{ 0, 0x40, 0, 0xb4, 0, 0x30, 0, 0 };
+    var rgba: [4]f32 = undefined;
+    for ([_]render.PixelFormat{ .abgr16161616f, .xbgr16161616f }) |format| {
+        unpackAbgr16(&rgba, .{ .size = .{ .width = 1, .height = 1 }, .stride = 8, .format = format, .bytes = &bytes });
+        try std.testing.expectEqualSlices(f32, &.{ 2, -0.25, 0.125, if (format.isOpaque()) 1 else 0 }, &rgba);
+    }
 }
 
 fn premultiply(channel: u8, alpha: u8) u8 {
