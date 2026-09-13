@@ -263,6 +263,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         pressed_buttons: [state_words]u64 = [_]u64{0} ** state_words,
         pointer_focus: ?FocusTarget = null,
         pointer_delivery: ?FocusTarget = null,
+        // Leaving a delivery surface revokes its cursor, including on removal.
+        // Keep this outside the bounded queue so destruction cannot lose it.
+        cursor_reset_pending: bool = false,
         pointer_point: Point = .{ .x = 0, .y = 0 },
         keyboard_focus: ?FocusTarget = null,
         modifiers: ModifierState = .{},
@@ -1959,6 +1962,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     } }) catch unreachable;
                 };
                 adapter.setPointerEnterSerial(value.client, 0);
+                adapter.cursor_reset_pending = true;
             }
             adapter.pointer_delivery = target;
             if (target) |value| {
@@ -1987,7 +1991,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 if (std.meta.eql(v.surface, id)) adapter.pointer_focus = null;
             }
             if (adapter.pointer_delivery) |v| {
-                if (std.meta.eql(v.surface, id)) adapter.pointer_delivery = null;
+                if (std.meta.eql(v.surface, id)) {
+                    adapter.pointer_delivery = null;
+                    adapter.cursor_reset_pending = true;
+                }
             }
             if (adapter.keyboard_focus) |v| {
                 if (std.meta.eql(v.surface, id)) adapter.keyboard_focus = null;
@@ -2631,11 +2638,15 @@ test "seat: pointer focus transitions complete frames atomically" {
     pointer_b.client = clientId(peer_b);
 
     try adapter.setPointerFocus(target_a, .{ .x = 1, .y = 2 });
+    try adapter.setPointerFocus(target_a, .{ .x = 2, .y = 3 });
+    try std.testing.expect(!adapter.cursor_reset_pending);
     try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_enter));
     try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_frame));
     clearTestOutbound(&adapter);
 
     try adapter.setPointerFocus(target_b, .{ .x = 3, .y = 4 });
+    try std.testing.expect(adapter.cursor_reset_pending);
+    adapter.cursor_reset_pending = false;
     try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_leave));
     try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_enter));
     try std.testing.expectEqual(@as(usize, 2), countTestOutbound(&adapter, .pointer_frame));
@@ -2652,6 +2663,8 @@ test "seat: pointer focus transitions complete frames atomically" {
     clearTestOutbound(&adapter);
 
     try adapter.setPointerFocus(null, .{ .x = 5, .y = 6 });
+    try std.testing.expect(adapter.cursor_reset_pending);
+    adapter.cursor_reset_pending = false;
     try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_leave));
     try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_frame));
 
@@ -2661,6 +2674,7 @@ test "seat: pointer focus transitions complete frames atomically" {
     try adapter.enqueue(clientId(peer_a), .{ .seat_name = .{ .index = 0, .generation = 1 } });
     const old_point = adapter.pointer_point;
     try std.testing.expectError(error.Exhausted, adapter.setPointerFocus(target_b, .{ .x = 9, .y = 10 }));
+    try std.testing.expect(!adapter.cursor_reset_pending);
     try std.testing.expectEqual(target_a, adapter.pointerState().focus.?);
     try std.testing.expectEqual(target_a, adapter.pointerDeliveryTarget().?);
     try std.testing.expectEqual(old_point, adapter.pointer_point);
@@ -3206,8 +3220,10 @@ test "seat: pointer grab retains focus and device removal cancels it" {
     try adapter.setPointerFocus(null, .{ .x = 0, .y = 0 });
     try std.testing.expect(adapter.pointerState().focus == null);
     try std.testing.expectEqual(target, adapter.pointerDeliveryTarget().?);
+    try std.testing.expect(!adapter.cursor_reset_pending);
 
     try adapter.consume(.{ .device_removed = device });
+    try std.testing.expect(adapter.cursor_reset_pending);
     try std.testing.expectEqual(TestAdapter.GrabState.idle, std.meta.activeTag(adapter.grabState()));
     const event = adapter.popEvent() orelse return error.MissingCancellation;
     try std.testing.expectEqual(TestAdapter.Event.pointer_grab_cancelled, std.meta.activeTag(event));
@@ -3932,6 +3948,7 @@ test "seat: removed grab surface completes cancellation once" {
     adapter.surfaceRemoved(target.surface);
     try std.testing.expect(adapter.pointer_focus == null);
     try std.testing.expect(adapter.pointer_delivery == null);
+    try std.testing.expect(adapter.cursor_reset_pending);
     try std.testing.expectEqual(TestAdapter.GrabState.cancelled, std.meta.activeTag(adapter.grabState()));
     const event = adapter.popEvent() orelse return error.MissingCancellation;
     try std.testing.expectEqual(TestAdapter.Event.pointer_grab_cancelled, std.meta.activeTag(event));

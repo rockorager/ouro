@@ -6903,6 +6903,8 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn processCursorShapeEvents(self: *Self) !void {
+            // Apply any leave before accepting the new surface's cursor.
+            try self.processSeatEvents();
             while (self.cursor_shape_adapter.peekEvent()) |event| {
                 var shape = event.shape;
                 const image = self.cursorImage(shape.name(), self.cursor_size) orelse blk: {
@@ -7019,6 +7021,12 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn processSeatEvents(self: *Self) !void {
+            if (self.seat_adapter.cursor_reset_pending) {
+                self.interaction.cursorRequest(null, .{ .x = 0, .y = 0 });
+                self.themed_cursor_shape = .default;
+                try self.requestCursorRedraw();
+                self.seat_adapter.cursor_reset_pending = false;
+            }
             while (self.seat_adapter.peekEvent()) |event| {
                 switch (event) {
                     .cursor_requested => |request_value| {

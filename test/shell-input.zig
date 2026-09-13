@@ -5263,6 +5263,39 @@ test "shell-input: synchronized cursor subsurface batch renders root and child" 
     try std.testing.expectEqual(@as(usize, 2), coordinator.cursor_cache.retainedFiles());
     coordinator.themed_cursor_shape = null;
 
+    // Every leave revokes the old cursor, even between surfaces of one client.
+    // A surface that does not set a cursor must get the default, not inherit it.
+    const focus_a = try coordinator.seat_adapter.makeTarget(coordinator.peer.?, root_id);
+    const focus_b = try coordinator.seat_adapter.makeTarget(coordinator.peer.?, child_id);
+    for (0..4) |mode| {
+        try coordinator.seat_adapter.setPointerFocus(focus_a, .{ .x = 0, .y = 0 });
+        try coordinator.prepare();
+        coordinator.themed_cursor_shape = switch (mode) {
+            0 => .pointer,
+            1 => .ew_resize,
+            else => null,
+        };
+        coordinator.interaction.cursorRequest(if (mode == 2) root_id else null, .{ .x = 1, .y = 2 });
+        const requested_shape = coordinator.themed_cursor_shape;
+        const requested_surface = coordinator.interaction.cursor.surface;
+        try coordinator.seat_adapter.setPointerFocus(focus_a, .{ .x = 256, .y = 512 });
+        try coordinator.prepare();
+        try std.testing.expectEqual(requested_shape, coordinator.themed_cursor_shape);
+        try std.testing.expectEqual(requested_surface, coordinator.interaction.cursor.surface);
+
+        try coordinator.seat_adapter.setPointerFocus(if (mode % 2 == 0) focus_b else null, .{ .x = 0, .y = 0 });
+        try coordinator.prepare();
+        try std.testing.expectEqual(.default, coordinator.themed_cursor_shape.?);
+        try std.testing.expect(coordinator.interaction.cursor.surface == null);
+        try std.testing.expect(!coordinator.seat_adapter.cursor_reset_pending);
+        const capture = coordinator.cursorCaptureInfo(.{ .cursor = .{
+            .source = .{ .output = physical.kms_output.?.outputId() },
+            .cursor = .{ .index = 0, .generation = 1 },
+        } });
+        try std.testing.expect(capture != null);
+        try std.testing.expect(physical.themed_cursor.image != null);
+    }
+
     coordinator.disconnected(coordinator.peer.?);
     _ = try client.prepareClose();
     try submitMultiClient(&client_reactor, &driver, &handler);
