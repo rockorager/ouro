@@ -66,6 +66,7 @@ pub const OutputMode = struct {
 pub const OutputPosition = struct { x: i32 = 0, y: i32 = 0 };
 pub const OutputSettings = struct {
     enabled: ?bool = null,
+    hdr: ?bool = null,
     mode: ?OutputMode = null,
     position: ?OutputPosition = null,
     scale_120: ?u32 = null,

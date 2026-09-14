@@ -482,11 +482,18 @@ settings.
 
 Output rules match the stable `DRM-<connector-id>` name, connector ID/type/type
 ID, or physical dimensions. They use the same priority and merge semantics.
-Mode, position, scale, enablement, and ICC profile changes run through Ouro's
+Mode, position, scale, enablement, HDR, and ICC profile changes run through Ouro's
 atomic KMS reconfiguration path and retain the previous configuration if
 activation or rollback validation fails. `icc_profile` must be an absolute
 path to an ICC v2/v4 RGB Display or ColorSpace profile and requires strict
 Vulkan mode.
+
+Set `"hdr": false` in an output's `settings` to force SDR, or `"hdr": true`
+to prefer HDR when the display and renderer support it. Omitting `hdr` inherits
+the global HDR preference; `--disable-hdr` overrides every output rule. Live
+changes recreate the output so transfer encoding and KMS HDR metadata,
+colorspace, and bit depth change together. A monitor's Standard preset may
+still advertise HDR; use `"hdr": false` to request SDR explicitly.
 
 ```json
 {
@@ -650,6 +657,15 @@ following current
 Explicit compound_power_2_4 remains piecewise sRGB; linear, PQ, HLG and ICC
 transforms retain distinct behavior. HLG currently applies its inverse OETF,
 not a complete display OOTF. Input format acceptance is not full HDR support.
+
+On PQ outputs, encoded SDR and ICC content map white to the output's graphics
+white (203 cd/m² by default), rather than fixing desktop white at 80 cd/m².
+Explicit linear/scRGB keeps its reference-luminance units and native PQ keeps
+absolute ST 2084 luminance. SDR capture maps the HDR working-space graphics
+white back to SDR white before applying any HDR-source highlight shoulder;
+it does not reinterpret PQ output bytes as SDR. This policy leaves SDR output
+and HLG conversion unchanged. Physical HDR appearance still requires display
+validation; correct PQ encoding alone does not establish panel calibration.
 
 | Conformance area | Executable coverage | Still requires hardware |
 | --- | --- | --- |

@@ -1397,6 +1397,129 @@ test "physical coordinator replaces the last disconnected output exactly" {
     try root.deinit();
 }
 
+test "settings HDR-only changes recreate one output and restore inherited preference" {
+    try settingsHdrReconfigure(true, null, false);
+}
+
+test "settings HDR preference cannot override global disable" {
+    try settingsHdrReconfigure(false, true, false);
+}
+
+test "settings HDR activation failure restores the previous preference and output state" {
+    try settingsHdrReconfigure(true, false, true);
+    try settingsHdrReconfigure(true, true, true);
+}
+
+fn settingsHdrReconfigure(global_hdr: bool, initial_hdr: ?bool, fail_activation: bool) !void {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    fixture.second_desktop = true;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-settings-hdr-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+    var config = coordinatorConfig();
+    config.output.enable_hdr = global_hdr;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    var reference = try ouro.config.defaultSnapshot(allocator);
+    defer reference.deinit();
+    var rules = [_]ouro.config.OutputRule{.{
+        .name = "primary",
+        .match = .{ .connector_id = 10 },
+        .settings = .{ .hdr = initial_hdr, .scale_120 = 180 },
+    }};
+    const input_rules = [_]ouro.config.InputRule{.{
+        .name = "pointer",
+        .settings = .{ .scroll_factor = .{ .value = 1.75 } },
+    }};
+    var initial = try Coordinator.EngineSettings.init(allocator, &input_rules, &rules);
+    var initial_bindings = try Coordinator.Bindings.snapshotFromReferenceConfig(allocator, &reference);
+    var initial_policy: Coordinator.PolicySnapshot = .{ .inner_gap = 0, .outer_gap = 0 };
+    try coordinator.installConfig(&initial, &initial_bindings, &initial_policy);
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.physical_output_count == 2 and physicalOutputsSettled(coordinator)) break;
+        if (root.ring.cq_ready() == 0) try pauseReady(&root.ring);
+    }
+    const primary = &coordinator.physical_outputs[0];
+    const secondary = coordinator.physical_outputs[1].kms_output.?;
+    const head = try coordinator.output_management_adapter.lifecycle.currentHead(primary.management_head);
+    try std.testing.expectEqual(@as(u32, 180), head.scale_120);
+    try std.testing.expectEqual(global_hdr and (initial_hdr orelse true), primary.hdr_preference);
+    try std.testing.expectEqual(global_hdr, coordinator.physical_outputs[1].hdr_preference);
+    // The fixture cannot create real HDR scanout. Model its negotiated color
+    // description from the activated preference to exercise runtime output
+    // notifications without an ICC profile or a physical HDR display.
+    const Resolver = struct {
+        fn resolve(context: ?*anyopaque, _: wayring.io_uring.Peer, _: ?wayring.objects.Handle, _: ?wayring.objects.Handle) ?ouro.color_management.ResolvedOutput {
+            const owner: *Coordinator = @ptrCast(@alignCast(context.?));
+            var description = ouro.render.color.Description.desktop;
+            if (owner.physical_outputs[0].hdr_preference) description.transfer = .st2084_pq;
+            return .{ .description = description };
+        }
+    };
+    const colors = &coordinator.color_management_adapter;
+    colors.setOutputResolver(.{ .context = coordinator, .resolve = Resolver.resolve });
+    const resource = try allocator.create(std.meta.Child(@TypeOf(colors.resources.items[0])));
+    resource.* = .{
+        .kind = .output,
+        .handle = .{ .id = 100, .generation = 1 },
+        .peer = .{ .slot = 0, .generation = 1 },
+        .output = .{ .id = 101, .generation = 1 },
+    };
+    try colors.resources.append(allocator, resource);
+    try std.testing.expect(colors.refreshOutputs());
+    resource.output_pending = false;
+    const transitions = [_]?bool{ false, true, false, null };
+    const failure_transition = [_]?bool{!(initial_hdr orelse true)};
+    for (if (fail_activation) &failure_transition else &transitions) |hdr| {
+        const previous_id = primary.kms_output.?.outputId();
+        const previous_preference = primary.hdr_preference;
+        const previous_hdr = coordinator.settings.output_rules[0].settings.hdr;
+        const expected_preference = global_hdr and (hdr orelse true);
+        const recreate = previous_preference != expected_preference;
+        rules[0].settings.hdr = hdr;
+        var engine = try Coordinator.EngineSettings.init(allocator, &input_rules, &rules);
+        var bindings = try Coordinator.Bindings.snapshotFromReferenceConfig(allocator, &reference);
+        var policy: Coordinator.PolicySnapshot = .{ .inner_gap = 0, .outer_gap = 0 };
+        if (fail_activation) fixture.fail_create_bo_at = fixture.bo_count;
+        try coordinator.installConfig(&engine, &bindings, &policy);
+        try std.testing.expectEqual(recreate, coordinator.output_reconfigure != null);
+        try std.testing.expectEqual(!recreate, coordinator.configInstallReady());
+        for (0..256) |_| {
+            _ = try loop.turn(coordinator);
+            if (coordinator.output_reconfigure == null and physicalOutputsSettled(coordinator)) break;
+            if (root.ring.cq_ready() == 0) try pauseReady(&root.ring);
+        }
+        try std.testing.expect(coordinator.configInstallReady());
+        try std.testing.expect(physicalOutputsSettled(coordinator));
+        try std.testing.expectEqual(recreate, !std.meta.eql(previous_id, primary.kms_output.?.outputId()));
+        try std.testing.expectEqual(if (fail_activation) previous_preference else expected_preference, primary.hdr_preference);
+        try std.testing.expectEqual(if (fail_activation) previous_hdr else hdr, coordinator.settings.output_rules[0].settings.hdr);
+        try std.testing.expectEqual(recreate and !fail_activation, resource.output_pending);
+        resource.output_pending = false;
+        try std.testing.expectEqual(head, try coordinator.output_management_adapter.lifecycle.currentHead(primary.management_head));
+        try std.testing.expectEqual(secondary, coordinator.physical_outputs[1].kms_output.?);
+        try std.testing.expectEqual(global_hdr, coordinator.physical_outputs[1].hdr_preference);
+        try std.testing.expectEqual(@as(f64, 1.75), coordinator.settings.input_rules[0].settings.scroll_factor.?.value);
+        // This fixture lacks HDR capabilities and uses Pixman: preferring HDR
+        // must still leave its negotiated output encoding in SDR.
+        try std.testing.expectEqual(ouro.render.color.Description.desktop.transfer, primary.kms_output.?.output_color_description.transfer);
+        if (fail_activation) try std.testing.expect(fixture.fail_create_bo_at == null);
+    }
+    try coordinator.requestStop();
+    try drainServer(root, coordinator, &loop);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "primary scale reconfiguration preserves a single shared DRM reader" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -4731,16 +4854,16 @@ pub const Fixture = struct {
     fail_dispatch: bool = false,
     fail_disable: bool = false,
     disable_attempts: usize = 0,
-    bo_bytes: [12][32]u8 align(4) = .{[_]u8{0} ** 32} ** 12,
-    dumb_bytes: [12][std.heap.page_size_min]u8 align(std.heap.page_size_min) =
-        .{[_]u8{0} ** std.heap.page_size_min} ** 12,
+    bo_bytes: [32][32]u8 align(4) = .{[_]u8{0} ** 32} ** 32,
+    dumb_bytes: [32][std.heap.page_size_min]u8 align(std.heap.page_size_min) =
+        .{[_]u8{0} ** std.heap.page_size_min} ** 32,
     dumb_count: usize = 0,
     bo_count: usize = 0,
     bo_destroyed: usize = 0,
     output_bo_destroyed: usize = 0,
     framebuffer_removed: usize = 0,
     framebuffer_removal_before_bo: bool = false,
-    requests: [12]AtomicRequest = .{AtomicRequest{}} ** 12,
+    requests: [32]AtomicRequest = .{AtomicRequest{}} ** 32,
     request_count: usize = 0,
     pending_flips: [4]PendingFlip = .{PendingFlip{}} ** 4,
     flip_head: usize = 0,

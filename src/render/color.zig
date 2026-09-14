@@ -188,12 +188,22 @@ pub fn compile(source: Description, output: Description) !Transform {
     const output_xyz = try rgbToXyz(destination_primaries);
     const output_inverse = inverse(output_xyz) orelse return error.InvalidColorDescription;
     const adaptation = try chromaticAdaptation(working.primaries.white, destination_primaries.white);
+    // Encoded SDR and ICC colors are relative to graphics white. On PQ
+    // outputs, one linear unit is the chosen output graphics white (203 nits
+    // by default), not the source's nominal 80-nit reference. Explicit linear
+    // and PQ content keep their absolute luminance units, including scRGB.
+    const relative_sdr = source.lut != null or switch (source.transfer) {
+        .srgb, .gamma22, .gamma28 => true,
+        .linear, .st2084_pq, .hlg => false,
+    };
     return .{
         .matrix = multiply(output_inverse, multiply(adaptation, source_xyz)),
         .source_transfer = working.transfer,
         .output_transfer = output.transfer,
         .luminance_scale = if (working.transfer == .st2084_pq)
             10_000 / source_to_output_reference
+        else if (relative_sdr and output.transfer == .st2084_pq and output.lut == null)
+            1
         else
             source.reference_luminance / source_to_output_reference,
     };
@@ -309,6 +319,34 @@ test "color: rejects degenerate descriptions" {
     try std.testing.expectError(error.InvalidColorDescription, compile(malformed, .srgb));
 }
 
+test "color: PQ output maps encoded SDR white relatively but retains absolute HDR units" {
+    var output = Description.desktop;
+    output.transfer = .st2084_pq;
+    output.max_luminance = 1000;
+    for ([_]f32{ 80, 203, 400 }) |reference| {
+        output.reference_luminance = reference;
+        for ([_]TransferFunction{ .srgb, .gamma22, .gamma28 }) |transfer| {
+            var source = Description.desktop;
+            source.transfer = transfer;
+            const transform = try compile(source, output);
+            // A decoded SDR white of 1 must be the output graphics white,
+            // not an absolute 80-nit light regardless of the output policy.
+            try std.testing.expectEqual(@as(f32, 1), transform.luminance_scale);
+        }
+        var absolute = Description.desktop;
+        absolute.transfer = .linear; // scRGB retains its 80-nit unit.
+        try std.testing.expectApproxEqAbs(80 / reference, (try compile(absolute, output)).luminance_scale, 0.00001);
+        absolute.transfer = .st2084_pq;
+        try std.testing.expectApproxEqAbs(10_000 / reference, (try compile(absolute, output)).luminance_scale, 0.00001);
+    }
+    // This policy does not alter ordinary SDR output or the HLG path.
+    output.reference_luminance = 160;
+    for ([_]TransferFunction{ .gamma22, .hlg }) |transfer| {
+        output.transfer = transfer;
+        try std.testing.expectEqual(@as(f32, 0.5), (try compile(.desktop, output)).luminance_scale);
+    }
+}
+
 test "color: ICC selects linear sRGB working-space transform" {
     var texel = [_][4]f16{.{ 0, 0, 0, 1 }};
     var lut: icc.Lut = .{
@@ -327,4 +365,9 @@ test "color: ICC selects linear sRGB working-space transform" {
             transform.matrix[row][column],
             0.0001,
         );
+    var hdr = Description.desktop;
+    hdr.transfer = .st2084_pq;
+    hdr.reference_luminance = 203;
+    hdr.max_luminance = 1000;
+    try std.testing.expectEqual(@as(f32, 1), (try compile(source, hdr)).luminance_scale);
 }

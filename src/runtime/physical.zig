@@ -535,6 +535,8 @@ pub fn Coordinator(comptime protocol: type) type {
             management_head: protocol_output_management.HeadId,
             kms_output: ?*output_api.Output = null,
             output_profile: ?*engine_settings.OutputProfile = null,
+            // Effective preference used at activation, not the negotiated transfer.
+            hdr_preference: bool = true,
             gamma_owner: ?drm_gamma.Owner = null,
             gamma_ramps: []u16 = &.{},
             session_lock_frame: ?output_scheduler.FrameId = null,
@@ -5117,14 +5119,14 @@ pub fn Coordinator(comptime protocol: type) type {
             }
         }
 
-        fn configuredOutputProfile(
+        fn configuredOutputSettings(
             settings: *const engine_settings.Snapshot,
             snapshot: drm.Snapshot,
-        ) !?*engine_settings.OutputProfile {
+        ) !engine_settings.OutputSettings {
             const connector = snapshot.selectedConnector();
             var name_buffer: [64]u8 = undefined;
             const name = try drmConnectorName(&name_buffer, connector);
-            const configured = engine_settings.resolveOutput(settings.output_rules, .{
+            return engine_settings.resolveOutput(settings.output_rules, .{
                 .name = name,
                 .connector_id = connector.id,
                 .connector_type = connector.connector_type,
@@ -5132,7 +5134,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 .width_mm = connector.width_mm,
                 .height_mm = connector.height_mm,
             });
-            return settings.outputProfile(configured.icc_profile);
         }
 
         fn sameOutputProfile(
@@ -5167,16 +5168,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 const claim = physical.claim orelse return error.StaleClaim;
                 const snapshot = try self.manager.claimSnapshot(claim);
                 const connector = snapshot.selectedConnector();
-                var name_buffer: [64]u8 = undefined;
-                const name = try drmConnectorName(&name_buffer, connector);
-                const settings = engine_settings.resolveOutput(candidate.output_rules, .{
-                    .name = name,
-                    .connector_id = connector.id,
-                    .connector_type = connector.connector_type,
-                    .connector_type_id = connector.connector_type_id,
-                    .width_mm = connector.width_mm,
-                    .height_mm = connector.height_mm,
-                });
+                const settings = try configuredOutputSettings(candidate, snapshot);
+                const hdr_changed = physical.hdr_preference !=
+                    (self.output_config.enable_hdr and (settings.hdr orelse true));
                 const profile_changed = !sameOutputProfile(
                     physical.output_profile,
                     candidate.outputProfile(settings.icc_profile),
@@ -5202,7 +5196,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 desired[index] = .{ .id = physical.management_head, .state = state };
                 index += 1;
                 changed = changed or !std.meta.eql(current, state) or
-                    (current.enabled and profile_changed);
+                    (current.enabled and (profile_changed or hdr_changed));
             }
             if (!self.outputManagementCommandSupported(desired)) return error.UnsupportedOutputConfiguration;
             if (!changed) {
@@ -5236,13 +5230,16 @@ pub fn Coordinator(comptime protocol: type) type {
                 const current = try self.output_management_adapter.lifecycle.currentHead(head.id);
                 const claim = physical.claim orelse return error.StaleClaim;
                 const snapshot = try self.manager.claimSnapshot(claim);
-                const desired_profile = try configuredOutputProfile(self.outputSettingsForActivation(), snapshot);
+                const settings = try configuredOutputSettings(self.outputSettingsForActivation(), snapshot);
+                const hdr_changed = physical.hdr_preference !=
+                    (self.output_config.enable_hdr and (settings.hdr orelse true));
+                const desired_profile = self.outputSettingsForActivation().outputProfile(settings.icc_profile);
                 const profile_changed = !sameOutputProfile(
                     physical.output_profile,
                     desired_profile,
                 );
                 if (!std.meta.eql(current, head.state) or
-                    (current.enabled and profile_changed)) physical.reconfigure = .{
+                    (current.enabled and (profile_changed or hdr_changed))) physical.reconfigure = .{
                     .previous = current,
                     .desired = head.state,
                 };
@@ -8572,10 +8569,12 @@ pub fn Coordinator(comptime protocol: type) type {
             output_config.output_id.generation = generation;
             output_config.output_transform = @enumFromInt(transform);
             output_config.kms.adaptive_sync = adaptive_sync;
-            const selected_profile = try configuredOutputProfile(
+            const settings = try configuredOutputSettings(
                 self.outputSettingsForActivation(),
                 snapshot,
             );
+            output_config.enable_hdr = output_config.enable_hdr and (settings.hdr orelse true);
+            const selected_profile = self.outputSettingsForActivation().outputProfile(settings.icc_profile);
             if (selected_profile) |profile|
                 output_config.output_color_description.lut = &profile.output_lut;
             var output_committed = false;
@@ -8692,6 +8691,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     ProtocolReady.color_management | ProtocolReady.output,
                 );
             }
+            physical.hdr_preference = output_config.enable_hdr;
             output_committed = true;
             _ = retained_visibility_changed;
             // Commits can be applied while their outputs are powered off.
@@ -13852,6 +13852,11 @@ pub fn Coordinator(comptime protocol: type) type {
             transaction: OutputReconfigureTransaction,
             result: protocol_output_management.Completion,
         ) anyerror!void {
+            // HDR-only switches change the description without changing the
+            // ICC profile. Notify against the final activated or rolled-back
+            // outputs, never an intermediate configuration.
+            if (self.color_management_adapter.refreshOutputs())
+                self.markProtocolAll(ProtocolReady.color_management);
             try self.publishOutputLayout();
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
                 physical.reconfigure = null;

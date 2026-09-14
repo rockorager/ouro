@@ -3614,6 +3614,10 @@ fn captureFrame(input: Frame, full_damage: []const render.Rect) !Frame {
     else
         input.output_color_description;
     working.transfer = .linear;
+    // PQ composition is normalized to the display's graphics white. Export
+    // that white as SDR white, not display nits / the nominal SDR 80 nits.
+    if (input.output_color_description.transfer == .st2084_pq)
+        working.reference_luminance = render.color.Description.srgb.reference_luminance;
     const transform = try render.color.compile(working, .srgb);
     for (0..3) |row| {
         for (0..3) |column|
@@ -6184,7 +6188,14 @@ test "render-vulkan: capture converts the HDR working space without changing sca
 
     // SDR primaries and white must survive source -> HDR working -> capture.
     const forward = try render.color.compile(.srgb, hdr);
+    // Independent BT.2020 -> sRGB D65 matrix: no 203/80 gain on capture.
+    const expected: [3][3]f32 = .{
+        .{ 1.660491, -0.587641, -0.072850 },
+        .{ -0.124550, 1.132900, -0.008349 },
+        .{ -0.018151, -0.100579, 1.118730 },
+    };
     for (0..3) |row| for (0..3) |column| {
+        try std.testing.expectApproxEqAbs(expected[row][column], frame.capture_color[row][column], 0.00001);
         var result: f32 = 0;
         for (0..3) |i|
             result += frame.capture_color[row][i] * forward.matrix[i][column] * forward.luminance_scale;

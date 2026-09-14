@@ -866,6 +866,44 @@ test "machine policy rules repeat sorting matching and defaults" {
     try std.testing.expect(resolved.tap.? == .value);
 }
 
+test "output HDR settings parse overlay and merge removal" {
+    var snapshot = try parseSource(std.testing.allocator,
+        \\{"output_rules":{
+        \\"all":{"settings":{"hdr":true,"scale":1.5}},
+        \\"external":{"priority":1,"match":{"connector_id":42},"settings":{"hdr":false}},
+        \\"position":{"priority":2,"settings":{"position":{"x":-7,"y":11}}}}}
+    );
+    defer snapshot.deinit();
+    var info: OutputInfo = .{
+        .name = "DRM-42",
+        .connector_id = 42,
+        .connector_type = 1,
+        .connector_type_id = 1,
+        .width_mm = 600,
+        .height_mm = 340,
+    };
+    const external = resolveOutput(snapshot.output_rules, info);
+    try std.testing.expectEqual(@as(?bool, false), external.hdr);
+    try std.testing.expectEqual(@as(?u32, 180), external.scale_120);
+    try std.testing.expectEqual(OutputPosition{ .x = -7, .y = 11 }, external.position.?);
+    info.connector_id = 43;
+    try std.testing.expectEqual(@as(?bool, true), resolveOutput(snapshot.output_rules, info).hdr);
+    try std.testing.expectEqual(@as(?bool, null), resolveOutput(&.{}, info).hdr);
+
+    var removed = try mergeSources(std.testing.allocator, &.{
+        \\{"output_rules":{"external":{"settings":{"hdr":false,"scale":1.5}}}}
+        ,
+        \\{"output_rules":{"external":{"settings":{"hdr":null}}}}
+        ,
+    });
+    defer removed.deinit();
+    try std.testing.expectEqual(@as(?bool, null), removed.output_rules[0].settings.hdr);
+    try std.testing.expectEqual(@as(?u32, 180), removed.output_rules[0].settings.scale_120);
+    try std.testing.expectError(error.InvalidType, parseSource(std.testing.allocator,
+        \\{"output_rules":{"external":{"settings":{"hdr":"false"}}}}
+    ));
+}
+
 test "rule ranges strict fields and partial merge removals" {
     try std.testing.expectError(error.InvalidRange, parseSource(std.testing.allocator, "{\"input_rules\":{\"x\":{\"settings\":{\"rotation\":360}}}}"));
     try std.testing.expectError(error.UnknownField, parseSource(std.testing.allocator, "{\"output_rules\":{\"x\":{\"match\":{\"icc\":\"x\"}}}}"));

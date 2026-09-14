@@ -1102,7 +1102,7 @@ def test_hdr_capture(renderer, capture_path):
     to_srgb = (1.660491, -0.587641, -0.072850,
                -0.124550, 1.132900, -0.008349,
                -0.018151, -0.100579, 1.118730)
-    capture_matrix = tuple(x * 203 / 80 for x in to_srgb)
+    capture_matrix = to_srgb
     # Neutral ramp, primaries, mixed colors and transparent edges.
     pixels = bytes(c for x in range(256) for c in (x, x, x, 255))
     pixels += bytes((0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255,
@@ -1110,11 +1110,39 @@ def test_hdr_capture(renderer, capture_path):
     size = (len(pixels) // 4, 1)
     start = renderer.draw_count
     for mode in ("buffer", "texture", "texture-buffer"):
+        # Check the actual 10-bit scanout, not just a round-trip whose two
+        # transforms could hide the same brightness error. Decode known SDR
+        # patches, convert primaries, then apply the independent ST 2084 EOTF
+        # inverse at the selected graphics-white luminance.
+        patches = ((0, 0, 0), (255, 255, 255), (128, 128, 128),
+                   (255, 0, 0), (0, 255, 0), (0, 0, 255), (96, 173, 41))
+        patch_pixels = bytes(c for r, g, b in patches for c in (b, g, r, 255))
+        for source_transfer in (0, 2):  # sRGB and untagged desktop gamma22
+            for reference in (203, 400):
+                raw, captured, _ = renderer.render(patch_pixels, (len(patches), 1),
+                    (len(patches), 1), mode, ten_bit=True, raw_output=True,
+                    source_transfer=source_transfer, output_transfer=4, output_reference=reference,
+                    color_matrix=to_2020, luminance_scale=1, capture_matrix=to_srgb,
+                    capture_phases=1, capture_transfer=source_transfer, copy_capture=True)
+                for rgb, (packed,) in zip(patches, struct.iter_unpack("<I", raw)):
+                    linear = [((c / 255) ** 2.2 if source_transfer == 2 else
+                               c / 255 / 12.92 if c / 255 <= 0.04045 else
+                               ((c / 255 + 0.055) / 1.055) ** 2.4) for c in rgb]
+                    expected = []
+                    for row in range(3):
+                        nits = sum(to_2020[row * 3 + col] * linear[col] for col in range(3)) * reference
+                        p = (max(0, nits) / 10000) ** (2610 / 16384)
+                        pq = ((3424 / 4096 + 2413 / 128 * p) / (1 + 2392 / 128 * p)) ** (2523 / 32)
+                        expected.append(round(pq * 1023))
+                    actual = tuple((packed >> shift) & 1023 for shift in (20, 10, 0))
+                    assert all(abs(a - b) <= 1 for a, b in zip(actual, expected)), (mode, source_transfer, reference, rgb, actual, expected)
+                assert all(abs(a - b) <= 1 for a, b in zip(captured, patch_pixels)), "HDR graphics-white capture"
         for ten_bit in (False, True):
             for transfer in (4, 5):  # PQ and HLG output
                 options = dict(ten_bit=ten_bit, output_transfer=transfer, output_reference=203,
-                               color_matrix=to_2020, luminance_scale=80 / 203,
-                               capture_matrix=capture_matrix, background=(0, 0, 0), background_alpha=0)
+                               color_matrix=to_2020, luminance_scale=1 if transfer == 4 else 80 / 203,
+                               capture_matrix=capture_matrix if transfer == 4 else tuple(x * 203 / 80 for x in to_srgb),
+                               background=(0, 0, 0), background_alpha=0)
                 scanout = renderer.render(pixels, size, size, mode, **options)
                 for phases in (0, 1, 2, 3):
                     actual, before, after = renderer.render(pixels, size, size, mode,
@@ -1146,14 +1174,15 @@ def test_hdr_capture(renderer, capture_path):
         pq_size = (len(levels), 1)
         for ten_bit in (False, True):
             options = dict(xrgb=True, ten_bit=ten_bit, source_transfer=4, output_transfer=4,
-                           luminance_scale=10000 / 203, capture_matrix=capture_matrix)
+                           output_reference=203, luminance_scale=10000 / 203, capture_matrix=capture_matrix)
             scanout = renderer.render(pq_pixels, pq_size, pq_size, mode, **options)
             actual, captured, _ = renderer.render(pq_pixels, pq_size, pq_size, mode,
                                                  capture_phases=1, **options)
             assert actual == scanout, "capture changed native HDR passthrough"
+            assert all(abs(a - b) <= 1 for a, b in zip(scanout, pq_pixels)), "native PQ luminance changed"
             for i, level in enumerate(levels):
                 p = (level / 255) ** (32 / 2523)
-                linear = (max(p - 3424 / 4096, 0) / (2413 / 128 - 2392 / 128 * p)) ** (16384 / 2610) * 10000 / 80
+                linear = (max(p - 3424 / 4096, 0) / (2413 / 128 - 2392 / 128 * p)) ** (16384 / 2610) * 10000 / 203
                 srgb = 12.92 * linear if linear <= 0.0031308 else 1.055 * linear ** (1 / 2.4) - 0.055
                 expected = round(min(1, max(0, srgb)) * 255)
                 assert all(abs(v - expected) <= 1 for v in captured[i * 4:i * 4 + 3]), (level, captured, expected)
@@ -1168,10 +1197,10 @@ def test_hdr_capture(renderer, capture_path):
             draw.rectangle((i * 64, 80, (i + 1) * 64 - 1, 159), fill=rgb)
         data = chart.convert("RGBA").tobytes("raw", "BGRA")
         old, corrected, _ = renderer.render(data, chart.size, chart.size, "texture", ten_bit=True,
-            output_transfer=4, color_matrix=to_2020, luminance_scale=80 / 203,
+            output_transfer=4, output_reference=203, color_matrix=to_2020, luminance_scale=1,
             capture_matrix=capture_matrix, capture_phases=1)
         sheet = Image.new("RGB", (800, 200), "#202020")
-        labels = ("Source (sRGB)", "Before: HDR bytes as sRGB", "After: sRGB capture")
+        labels = ("Source (sRGB)", "PQ bytes misread as sRGB", "Converted sRGB capture")
         for i, (label, image) in enumerate(zip(labels, (chart,
                 Image.frombytes("RGBA", chart.size, old, "raw", "BGRA"),
                 Image.frombytes("RGBA", chart.size, corrected, "raw", "BGRA")))):
