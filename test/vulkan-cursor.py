@@ -76,7 +76,7 @@ class Renderer:
                timings=None, scene=None, damage=None, timing_repeats=1,
                source_format=0, source_stride=None, raw_output=False, output_reference=80,
                video_planes=None, representation=0, capture_transfer=0, capture_shoulder=False, rgb_output=False,
-               capture16=False, blur=False):
+               capture16=False, blur=False, blur_scale=1, blur_steps=None, legacy_blur=False):
         d = self.device
         sw, sh = source_size
         w, h = size
@@ -194,11 +194,15 @@ class Renderer:
                                  for data, dimensions, fmt, stride, texel_bytes in video_planes]
                 plane_uploads = [buffer(data, v.VK_BUFFER_USAGE_TRANSFER_SRC_BIT) for data, *_ in video_planes]
             linear, linear_view = image(w, h, v.VK_FORMAT_R32G32B32A32_SFLOAT,
-                v.VK_IMAGE_USAGE_STORAGE_BIT | v.VK_IMAGE_USAGE_SAMPLED_BIT)
+                v.VK_IMAGE_USAGE_STORAGE_BIT | v.VK_IMAGE_USAGE_SAMPLED_BIT | v.VK_IMAGE_USAGE_TRANSFER_DST_BIT)
             if blur:
                 assert texture and continuation
-                blurred, blurred_view = image(w, h, v.VK_FORMAT_R32G32B32A32_SFLOAT,
-                    v.VK_IMAGE_USAGE_STORAGE_BIT | v.VK_IMAGE_USAGE_SAMPLED_BIT)
+                bw, bh = (w, h) if legacy_blur else ((w + 1) // 2, (h + 1) // 2)
+                blurred, blurred_view = image(bw, bh, v.VK_FORMAT_R32G32B32A32_SFLOAT,
+                    v.VK_IMAGE_USAGE_STORAGE_BIT | v.VK_IMAGE_USAGE_SAMPLED_BIT | v.VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+                if not legacy_blur:
+                    small, small_view = image((w + 3) // 4, (h + 3) // 4, v.VK_FORMAT_R32G32B32A32_SFLOAT,
+                        v.VK_IMAGE_USAGE_STORAGE_BIT | v.VK_IMAGE_USAGE_SAMPLED_BIT | v.VK_IMAGE_USAGE_TRANSFER_DST_BIT)
             if copy_capture:
                 copied, _ = image(w, h, v.VK_FORMAT_B8G8R8A8_UNORM,
                                   v.VK_IMAGE_USAGE_TRANSFER_DST_BIT | v.VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
@@ -227,8 +231,9 @@ class Renderer:
                 v.VkDescriptorSetLayoutCreateInfo(pBindings=[v.VkDescriptorSetLayoutBinding(
                     binding=b, descriptorType=t, descriptorCount=n, stageFlags=v.VK_SHADER_STAGE_COMPUTE_BIT)
                     for b, (t, n) in types.items()]))
+            set_count = 5 if blur and not legacy_blur else 1
             pool = own(v.vkCreateDescriptorPool, v.vkDestroyDescriptorPool, v.VkDescriptorPoolCreateInfo(
-                maxSets=1, pPoolSizes=[v.VkDescriptorPoolSize(type=t, descriptorCount=n)
+                maxSets=set_count, pPoolSizes=[v.VkDescriptorPoolSize(type=t, descriptorCount=n * set_count)
                                      for t, n in types.values()]))
             ds = v.vkAllocateDescriptorSets(d, v.VkDescriptorSetAllocateInfo(
                 descriptorPool=pool, pSetLayouts=[layout]))[0]
@@ -249,6 +254,17 @@ class Renderer:
                 writes.append(v.VkWriteDescriptorSet(dstSet=ds, dstBinding=b, descriptorType=t,
                                                     descriptorCount=n, **args))
             v.vkUpdateDescriptorSets(d, len(writes), writes, 0, None)
+            if blur and not legacy_blur:
+                blur_sets = v.vkAllocateDescriptorSets(d, v.VkDescriptorSetAllocateInfo(
+                    descriptorPool=pool, pSetLayouts=[layout] * 4))
+                for blur_set, src, dst in zip(blur_sets,
+                        (linear_view, blurred_view, small_view, blurred_view),
+                        (blurred_view, small_view, blurred_view, linear_view)):
+                    updates = [v.VkWriteDescriptorSet(dstSet=blur_set, dstBinding=b, descriptorCount=1,
+                        descriptorType=types[b][0], pImageInfo=[v.VkDescriptorImageInfo(
+                            sampler=sampler, imageView=view, imageLayout=v.VK_IMAGE_LAYOUT_GENERAL)])
+                        for b, view in ((5, dst), (8, src))]
+                    v.vkUpdateDescriptorSets(d, len(updates), updates, 0, None)
             pl = own(v.vkCreatePipelineLayout, v.vkDestroyPipelineLayout, v.VkPipelineLayoutCreateInfo(
                 pSetLayouts=[layout], pPushConstantRanges=[v.VkPushConstantRange(
                     stageFlags=v.VK_SHADER_STAGE_COMPUTE_BIT, size=112)]))
@@ -266,7 +282,7 @@ class Renderer:
                 [v.VkComputePipelineCreateInfo(stage=stage, layout=pl)], None)[0]
             cleanup.callback(v.vkDestroyPipeline, d, pipeline, None)
             if blur:
-                code = (ROOT / "src/render/vulkan_backdrop_blur.spv").read_bytes()
+                code = ((shader_dir or ROOT / "src/render") / "vulkan_backdrop_blur.spv").read_bytes()
                 module = own(v.vkCreateShaderModule, v.vkDestroyShaderModule,
                     v.VkShaderModuleCreateInfo(codeSize=len(code), pCode=code))
                 blur_stage = v.VkPipelineShaderStageCreateInfo(
@@ -283,7 +299,8 @@ class Renderer:
                 newLayout=v.VK_IMAGE_LAYOUT_GENERAL, image=im, subresourceRange=subresource,
                 srcQueueFamilyIndex=v.VK_QUEUE_FAMILY_IGNORED, dstQueueFamilyIndex=v.VK_QUEUE_FAMILY_IGNORED,
                 dstAccessMask=v.VK_ACCESS_SHADER_WRITE_BIT | v.VK_ACCESS_TRANSFER_WRITE_BIT)
-                for im in [target, linear] + ([blurred] if blur else []) + [im for im, _ in source_images]]
+                for im in [target, linear] + ([blurred] if blur else []) +
+                    ([small] if blur and not legacy_blur else []) + [im for im, _ in source_images]]
             v.vkCmdPipelineBarrier(cmd, v.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                 v.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, None, 0, None, len(barriers), barriers)
             def region(width, height, offset=0):
@@ -303,6 +320,12 @@ class Renderer:
             def barrier(src, dst, src_access, dst_access):
                 v.vkCmdPipelineBarrier(cmd, src, dst, 0, 1, [v.VkMemoryBarrier(
                     srcAccessMask=src_access, dstAccessMask=dst_access)], 0, None, 0, None)
+            if blur_steps is not None:
+                # An incomplete support domain must fail visibly, not depend
+                # on freshly allocated memory happening to contain zeroes.
+                for im in [linear, blurred] + ([] if legacy_blur else [small]):
+                    v.vkCmdClearColorImage(cmd, im, v.VK_IMAGE_LAYOUT_GENERAL,
+                        v.VkClearColorValue(float32=[float("nan")] * 4), 1, [subresource])
             barrier(v.VK_PIPELINE_STAGE_TRANSFER_BIT, v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                     v.VK_ACCESS_TRANSFER_WRITE_BIT, v.VK_ACCESS_SHADER_READ_BIT)
             if timings is not None:
@@ -323,16 +346,55 @@ class Renderer:
                 v.vkCmdWriteTimestamp(cmd, v.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, 0)
             v.vkCmdBindPipeline(cmd, v.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline)
             v.vkCmdBindDescriptorSets(cmd, v.VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, [ds], 0, None)
-            def dispatch(count, phases=capture_phases):
-                for rect in damage:
+            def dispatch(count, phases=capture_phases, rectangles=None, first=0):
+                for rect in damage if rectangles is None else rectangles:
                     push = struct.pack("<16I12f", background_alpha, *background, w, h,
                         int(background_alpha == 255) | (int(rgb_output) << 31), count, *rect, output_transfer,
-                        struct.unpack("<I", struct.pack("<f", output_reference))[0], 0, 0,
+                        struct.unpack("<I", struct.pack("<f", output_reference))[0], 0, first,
                         *capture_matrix[:3], phases or 0,
                         *capture_matrix[3:6], capture_transfer, *capture_matrix[6:], int(capture_shoulder) | (int(capture16) << 1))
                     v.vkCmdPushConstants(cmd, pl, v.VK_SHADER_STAGE_COMPUTE_BIT, 0, 112, v.ffi.from_buffer(push))
                     v.vkCmdDispatch(cmd, (rect[2] + 7) // 8, (rect[3] + 7) // 8, 1)
-            if capture_sequence:
+
+            def dispatch_blur(rectangles, vertical, scale):
+                v.vkCmdBindPipeline(cmd, v.VK_PIPELINE_BIND_POINT_COMPUTE, blur_pipeline)
+                for rect in rectangles:
+                    push = struct.pack("<16I", 0, 0, 0, 0, w, h, 0, 0, *rect,
+                        vertical, struct.unpack("<I", struct.pack("<f", scale))[0], 0, 0)
+                    v.vkCmdPushConstants(cmd, pl, v.VK_SHADER_STAGE_COMPUTE_BIT, 0, 64, v.ffi.from_buffer(push))
+                    v.vkCmdDispatch(cmd, (rect[2] + 7) // 8, (rect[3] + 7) // 8, 1)
+                barrier(v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        v.VK_ACCESS_SHADER_WRITE_BIT, v.VK_ACCESS_SHADER_READ_BIT | v.VK_ACCESS_SHADER_WRITE_BIT)
+                v.vkCmdBindPipeline(cmd, v.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline)
+
+            def dispatch_kawase(pass_rects, scale):
+                v.vkCmdBindPipeline(cmd, v.VK_PIPELINE_BIND_POINT_COMPUTE, blur_pipeline)
+                for i, (source_level, target_level) in enumerate(zip((0, 1, 2, 3, 2, 1), (1, 2, 3, 2, 1, 0))):
+                    source_size = tuple((n + (1 << source_level) - 1) >> source_level for n in (w, h))
+                    target_size = tuple((n + (1 << target_level) - 1) >> target_level for n in (w, h))
+                    selected = 0 if i == 0 else 3 if i == 5 else 1 if i % 2 else 2
+                    v.vkCmdBindDescriptorSets(cmd, v.VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, [blur_sets[selected]], 0, None)
+                    for rect in pass_rects[i]:
+                        push = struct.pack("<12I", *source_size, *target_size, *rect, int(i >= 3),
+                                           struct.unpack("<I", struct.pack("<f", .75 * scale))[0], 0, 0)
+                        v.vkCmdPushConstants(cmd, pl, v.VK_SHADER_STAGE_COMPUTE_BIT, 0, 48, v.ffi.from_buffer(push))
+                        v.vkCmdDispatch(cmd, (rect[2] + 7) // 8, (rect[3] + 7) // 8, 1)
+                    barrier(v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            v.VK_ACCESS_SHADER_WRITE_BIT, v.VK_ACCESS_SHADER_READ_BIT | v.VK_ACCESS_SHADER_WRITE_BIT)
+                v.vkCmdBindDescriptorSets(cmd, v.VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, [ds], 0, None)
+                v.vkCmdBindPipeline(cmd, v.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline)
+
+            if blur_steps is not None:
+                first = 0
+                for end, scale, source_rects, pass_rects in blur_steps:
+                    dispatch(0x40000000 | (0x80000000 if first else 0) | (end - first),
+                             rectangles=source_rects, first=first)
+                    barrier(v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            v.VK_ACCESS_SHADER_WRITE_BIT, v.VK_ACCESS_SHADER_READ_BIT | v.VK_ACCESS_SHADER_WRITE_BIT)
+                    dispatch_kawase(pass_rects, scale)
+                    first = end
+                dispatch(0x80000000 | (len(layers) - first), first=first)
+            elif capture_sequence:
                 dispatch(0, 1)
                 barrier(v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         v.VK_ACCESS_SHADER_WRITE_BIT, v.VK_ACCESS_SHADER_WRITE_BIT)
@@ -343,15 +405,12 @@ class Renderer:
                 barrier(v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         v.VK_ACCESS_SHADER_WRITE_BIT, v.VK_ACCESS_SHADER_READ_BIT | v.VK_ACCESS_SHADER_WRITE_BIT)
                 if blur:
-                    v.vkCmdBindPipeline(cmd, v.VK_PIPELINE_BIND_POINT_COMPUTE, blur_pipeline)
-                    for vertical in (0, 1):
-                        push = struct.pack("<16I", 0, 0, 0, 0, w, h, 0, 0, 0, 0, w, h,
-                            vertical, 0x3f800000, 0, 0)
-                        v.vkCmdPushConstants(cmd, pl, v.VK_SHADER_STAGE_COMPUTE_BIT, 0, 64, v.ffi.from_buffer(push))
-                        v.vkCmdDispatch(cmd, (w + 7) // 8, (h + 7) // 8, 1)
-                        barrier(v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            v.VK_ACCESS_SHADER_WRITE_BIT, v.VK_ACCESS_SHADER_READ_BIT | v.VK_ACCESS_SHADER_WRITE_BIT)
-                    v.vkCmdBindPipeline(cmd, v.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline)
+                    if legacy_blur:
+                        for vertical in (0, 1):
+                            dispatch_blur([(0, 0, w, h)], vertical, blur_scale)
+                    else:
+                        dispatch_kawase([[(0, 0, (w + (1 << level) - 1) >> level,
+                                          (h + (1 << level) - 1) >> level)] for level in (1, 2, 3, 2, 1, 0)], blur_scale)
                 dispatch(0x80000000)
             else:
                 dispatch(len(layers))
@@ -608,27 +667,150 @@ def test_capture16(renderer):
     print(f"RGBA16 capture: {renderer.draw_count - start} draws passed (low RGB/alpha, channel order, padded stride, 8/10-bit display)")
 
 
+def kawase_reference(values, scale):
+    """Float64 reference: fresh image per pass, scalar weighted bilinear taps."""
+    width, height = len(values[0]), len(values)
+    dimensions = [((width + (1 << i) - 1) >> i, (height + (1 << i) - 1) >> i) for i in range(4)]
+    for pass_index, level in enumerate((1, 2, 3, 2, 1, 0)):
+        tw, th = dimensions[level]
+        sw, sh = len(values[0]), len(values)
+        up = pass_index >= 3
+        taps = [(x, y, 2 if up else 1) for x in (-1, 1) for y in (-1, 1)]
+        taps += [(0, -2, 1), (0, 2, 1), (-2, 0, 1), (2, 0, 1)] if up else [(0, 0, 4)]
+        result = []
+        for y in range(th):
+            row = []
+            for x in range(tw):
+                color = [0.] * 4
+                for dx, dy, weight in taps:
+                    px, py = (x + .5) * sw / tw - .5 + dx * .75 * scale, (y + .5) * sh / th - .5 + dy * .75 * scale
+                    ix, iy = math.floor(px), math.floor(py)
+                    fx, fy = px - ix, py - iy
+                    for ox, wx in ((0, 1 - fx), (1, fx)):
+                        for oy, wy in ((0, 1 - fy), (1, fy)):
+                            sample = values[min(sh - 1, max(0, iy + oy))][min(sw - 1, max(0, ix + ox))]
+                            for c in range(4):
+                                color[c] += sample[c] * wx * wy * weight / (12 if up else 8)
+                row.append(color)
+            result.append(row)
+        values = result
+    return values
+
+
 def test_blur_precision(renderer):
-    # Independent 49-tap Gaussian, not the shader's paired weights/offsets.
-    width, height = 9, 7
-    values = [[(x / 16, y / 12, int(x == 1 and y == 4), 1)
-               for x in range(width)] for y in range(height)]
-    weights = [math.exp(-i * i / 128) for i in range(-24, 25)]
-    total = sum(weights)
-    horizontal = [[[sum(values[y][min(width - 1, max(0, x + i))][c] * weights[i + 24]
-                        for i in range(-24, 25)) / total for c in range(4)]
+    draws = 0
+    for width, height in ((37, 23), (1, 29), (31, 1), (97, 61)):
+        values = [[(x / (width + 1), y / (height + 1),
+                    (1 if x == width // 3 and y == height // 4 else 1 / 65536), .125 + .75 * ((x + 2 * y) % 31) / 30)
                    for x in range(width)] for y in range(height)]
-    expected = [round(sum(horizontal[min(height - 1, max(0, y + i))][x][c] * weights[i + 24]
-                         for i in range(-24, 25)) / total * 65535)
-                for y in range(height) for x in range(width) for c in range(4)]
-    pixels = b"".join(struct.pack("<4f", *pixel) for row in values for pixel in row)
+        pixels = b"".join(struct.pack("<4f", *pixel) for row in values for pixel in row)
+        linear = [[(r * a, g * a, b * a, a) for r, g, b, a in row] for row in values]
+        for scale in (.75, 1, 1.5, 2.25):
+            reference = kawase_reference(linear, scale)
+            expected = [round(c * 65535) for row in reference for pixel in row for c in pixel]
+            options = dict(source_format=12, source_transfer=1, output_transfer=1, capture_transfer=1,
+                           background_alpha=0, alpha_mode=2, continuation=True, blur=True,
+                           blur_scale=scale, capture16=True, capture_phases=1)
+            for mode in ("texture", "texture-buffer"):
+                _, actual, _ = renderer.render(pixels, (width, height), (width, height), mode, **options)
+                exported = struct.unpack(f"<{width * height * 4}H", actual)
+                assert max(abs(a - b) for a, b in zip(exported, expected)) <= 2, (width, height, scale, mode)
+                draws += 1
+    print(f"Dual Kawase: {draws} draws passed (Float64 reference, fractional scales, thin/odd edges, premultiplied RGBA16)")
+
+
+def kawase_plan(size, rect, scale):
+    levels = [tuple((n + (1 << i) - 1) >> i for n in size) for i in range(4)]
+    rectangles = [None] * 6
+    required = rect
+    for i in reversed(range(6)):
+        rectangles[i] = [required]
+        source, target = levels[(0, 1, 2, 3, 2, 1)[i]], levels[(1, 2, 3, 2, 1, 0)[i]]
+        reach = .75 * scale * (2 if i >= 3 else 1)
+        bounds = []
+        for start, length, s, t in zip(required[:2], required[2:], source, target):
+            low = math.floor((start + .5) * s / t - .5 - reach) - 1
+            high = math.floor((start + length - .5) * s / t - .5 + reach) + 3
+            bounds.append((max(0, min(s - 1, low)), max(1, min(s, high))))
+        required = (*[b[0] for b in bounds], *[b[1] - b[0] for b in bounds])
+    return [required], rectangles
+
+
+def test_blur_damage(renderer, capture_path=None, size=(100, 100)):
+    start_draws = renderer.draw_count
+    width, height = size
+    whole = [(0, 0, width, height)]
+    affine = (65536, 0, 32768, 0, 65536, 32768)
+    packed = scene_sample((width, height), whole[0], affine)
+    background = bytes(c for y in range(height) for x in range(width)
+                       for c in (220 if x < 31 else 30, 180 if y > 62 else 25, 240 if (x // 9 + y // 13) % 2 else 20, 255))
+    foreground = bytes(c for y in range(height) for x in range(width)
+                       for c in (x * 25 // width, y * 20 // height, 45, 64))
+    top = bytes((10, 20, 30, 40)) * (width * height)
+    scene = [(packed, data, (width, height)) for data in (background, foreground, top)]
+    options = dict(scene=scene, continuation=True, blur=True, capture16=True, capture_phases=1)
+    full_steps = [(1, 1, *kawase_plan((width, height), whole[0], 1)),
+                  (2, .5, *kawase_plan((width, height), whole[0], .5))]
+    _, reference, _ = renderer.render(background, (width, height), (width, height), "texture",
+                                       blur_steps=full_steps, **options)
+
+    # Reconstruct the lower blur across every source pixel needed by the upper
+    # pyramid, not just the final repair. All intermediates begin as NaNs.
     for mode in ("texture", "texture-buffer"):
-        _, actual, _ = renderer.render(pixels, (width, height), (width, height), mode,
-            source_format=12, source_transfer=1, output_transfer=1, capture_transfer=1,
-            background_alpha=0, alpha_mode=2, continuation=True, blur=True, capture16=True, capture_phases=1)
-        actual = struct.unpack(f"<{width * height * 4}H", actual)
-        assert max(abs(a - b) for a, b in zip(actual, expected)) <= 2, (mode, actual, expected)
-    print("FP32 blur: 2 draws passed (independent Gaussian, clamped edges, low impulse, RGBA16 export)")
+        for rect in ((width // 2, height // 2, 1, 1), (42, 50, 7, 5),
+                     (0, 1, 3, 2), (width - 3, height - 6, 3, 6)):
+            lower_output, upper_passes = kawase_plan((width, height), rect, .5)
+            steps = [(1, 1, *kawase_plan((width, height), lower_output[0], 1)),
+                     (2, .5, lower_output, upper_passes)]
+            _, actual, _ = renderer.render(background, (width, height), (width, height), mode,
+                                            damage=[rect], blur_steps=steps, **options)
+            x0, y0, rw, rh = rect
+            for y in range(height):
+                for x in range(width):
+                    offset = (y * width + x) * 8
+                    expected = reference[offset:offset + 8] if x0 <= x < x0 + rw and y0 <= y < y0 + rh else bytes([37]) * 8
+                    assert actual[offset:offset + 8] == expected, (mode, rect, x, y)
+            if rect == (42, 50, 7, 5):
+                repaired = bytearray(reference)
+                for y in range(y0, y0 + rh):
+                    start, end = (y * width + x0) * 8, (y * width + x0 + rw) * 8
+                    repaired[start:end] = actual[start:end]
+    if capture_path:
+        _, sharp, _ = renderer.render(background, (width, height), (width, height), "texture",
+                                       scene=scene, capture16=True, capture_phases=1)
+        sheet = Image.new("RGB", (1240, 454), "#202020")
+        draw = ImageDraw.Draw(sheet)
+        for i, (label, data) in enumerate((("Without effects (control)", sharp),
+                                         ("Two overlapping blurs: full frame", reference),
+                                         ("Bounded 7x5 repair: identical RGBA16", repaired))):
+            pixels = bytes(round(c / 257) for c in struct.unpack(f"<{width * height * 4}H", data))
+            preview = Image.frombytes("RGBA", (width, height), pixels).convert("RGB").resize((400, 400))
+            sheet.paste(preview, (10 + i * 410, 34))
+            draw.text((10 + i * 410, 12), label, fill="white")
+        draw.rectangle((830 + 42 * 4, 34 + 50 * 4, 830 + 49 * 4, 34 + 55 * 4), outline="yellow", width=1)
+        sheet.save(capture_path)
+    print(f"FP32 blur damage {size}: {renderer.draw_count - start_draws} draws passed (overlapping effects, poisoned support, tiny/edge damage, untouched export pixels)")
+
+
+def test_blur_influence(renderer):
+    # Independently exercise scene propagation's conservative radius with
+    # actual pixel changes, rather than deriving expected output from planning.
+    size = (509, 317)
+    width, height = size
+    for scale in (.75, 1, 1.5, 2.25):
+        radius = math.ceil(35 * .75 * scale + 28)
+        for x0, y0 in ((width // 2, height // 2), (1, height - 2)):
+            pixels = bytearray(width * height * 16)
+            struct.pack_into("<4f", pixels, (y0 * width + x0) * 16, 1, .5, .25, 1)
+            _, actual, _ = renderer.render(bytes(pixels), size, size, "texture",
+                source_format=12, source_transfer=1, output_transfer=1, capture_transfer=1,
+                background_alpha=0, alpha_mode=2, continuation=True, blur=True,
+                blur_scale=scale, capture16=True, capture_phases=1)
+            channels = struct.unpack(f"<{width * height * 4}H", actual)
+            changed = [(i % width, i // width) for i in range(width * height) if channels[i * 4 + 3]]
+            assert len(changed) > 1, (scale, x0, y0)
+            assert all(abs(x - x0) <= radius and abs(y - y0) <= radius for x, y in changed), (scale, x0, y0)
+    print("Dual Kawase influence: 8 impulse changes stay inside scene damage's conservative radius")
 
 
 def test_output_order(renderer):
@@ -1104,6 +1286,34 @@ def benchmark(renderer):
     print("GPU spans include preemption/waits. Nearest and bilinear are cost controls, not quality-equivalent replacements.")
 
 
+def benchmark_blur(renderer, compare_shader_dir):
+    # Same source pixels and composition in both variants. The small image is
+    # a blur-work-size control, not a replay of live damage or input latency.
+    pattern = Image.new("RGBA", (96, 54))
+    pattern.putdata([((x * 17 + y * 3) % 256, (x * 7 + y * 19) % 256,
+                      (x * 23 + y * 11) % 256, 255) for y in range(54) for x in range(96)])
+    for size, scale in (((2880, 1680), 1.5), ((721, 107), 1.5),
+                        ((1920, 1080), 1), ((1920, 1080), 2)):
+        pixels = pattern.resize(size, Image.Resampling.NEAREST).tobytes("raw", "BGRA")
+        variants = [("previous", compare_shader_dir), ("current", None)]
+        results = {name: [] for name, _ in variants}
+        # Alternate order; exclude two warmups per batch. Timed spans exclude
+        # resource setup/upload/readback but include composition and both passes.
+        for iteration in range(6):
+            for name, shader_dir in variants[::1 if iteration % 2 == 0 else -1]:
+                timings = []
+                renderer.render(pixels, size, size, "texture", xrgb=True, continuation=True,
+                                blur=True, blur_scale=scale, shader_dir=shader_dir, legacy_blur=name == "previous",
+                                timings=timings, timing_repeats=12)
+                results[name].extend(timings[2:])
+        for name, values in results.items():
+            p95 = sorted(values)[math.ceil(.95 * len(values)) - 1]
+            print(f"BLUR {size[0]}x{size[1]} scale={scale} {name}: "
+                  f"median={statistics.median(values):.3f} ms p95={p95:.3f} "
+                  f"min={min(values):.3f} max={max(values):.3f} samples={values}", flush=True)
+    print("GPU spans include preemption; the live desktop shares the GPU. This does not measure launcher FPS.")
+
+
 def benchmark_stall(renderer):
     # 2026-09-11 09:34:40, output 3840x2160, submit_ns=70231935993529.
     # Live sampled span: 35.637 ms. All source/output transfers are sRGB,
@@ -1168,15 +1378,21 @@ if __name__ == "__main__":
     parser.add_argument("--capture-shm", type=Path)
     parser.add_argument("--capture-video", type=Path)
     parser.add_argument("--capture-roundtrip", type=Path)
+    parser.add_argument("--capture-blur", type=Path)
     parser.add_argument("--capture-surface", type=Path, nargs=2, metavar=("SOURCE_2X", "OUTPUT"))
     parser.add_argument("--compare-shader-dir", type=Path)
     parser.add_argument("--benchmark", action="store_true", help="time UHD sampled-composition filter variants offscreen")
     parser.add_argument("--benchmark-stall", action="store_true", help="time the recorded UHD multi-layer cubic workload and controls")
+    parser.add_argument("--benchmark-blur", action="store_true", help="time blur against --compare-shader-dir offscreen")
     args = parser.parse_args()
+    if args.benchmark_blur and args.compare_shader_dir is None:
+        parser.error("--benchmark-blur requires --compare-shader-dir")
     renderer = Renderer()
     try:
         if args.benchmark:
             benchmark(renderer)
+        if args.benchmark_blur:
+            benchmark_blur(renderer, args.compare_shader_dir)
         test(renderer, args.compare_shader_dir)
         test_scene(renderer)
         test_hdr_capture(renderer, args.capture_hdr)
@@ -1187,6 +1403,9 @@ if __name__ == "__main__":
         test_capture_shoulder(renderer, args.capture_roundtrip)
         test_capture16(renderer)
         test_blur_precision(renderer)
+        test_blur_damage(renderer, args.capture_blur)
+        test_blur_damage(renderer, size=(509, 317))
+        test_blur_influence(renderer)
         test_output_order(renderer)
         test_video(renderer, args.capture_video)
         if args.benchmark_stall:

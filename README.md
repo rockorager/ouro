@@ -828,8 +828,8 @@ not included in the client-fence timings.
 Each slow submission also emits ordered `gpu-phase` lines, joined by output
 `size` and `submit_ns`. Each names the work preceding its bottom-of-pipe
 timestamp: imported-image acquisition, native copies, uploads, target acquisition,
-packed or sampled composition, backdrop composition segments, horizontal and
-vertical blur, captures, and the final `end` (release barriers). Durations are
+packed or sampled composition, backdrop composition segments, Dual Kawase
+downsample and upsample groups, captures, and the final `end` (release barriers). Durations are
 differences between consecutive timestamps, not exclusive shader execution
 times: commands can overlap, waits/preemption remain included, and timestamps
 themselves add overhead. No extra pipeline barriers or GPU waits are inserted.

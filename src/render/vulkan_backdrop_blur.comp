@@ -1,61 +1,47 @@
 #version 450
 
 layout(local_size_x = 8, local_size_y = 8) in;
-layout(set = 0, binding = 5, rgba32f) uniform image2D linear_image;
-layout(set = 0, binding = 7, rgba32f) uniform image2D blur_image;
-layout(set = 0, binding = 8) uniform sampler2D linear_source;
-layout(set = 0, binding = 9) uniform sampler2D blur_source;
+layout(set = 0, binding = 5, rgba32f) uniform writeonly image2D target_image;
+layout(set = 0, binding = 8) uniform sampler2D source_image;
 
-layout(push_constant) uniform Frame {
-    uvec4 unused_clear;
-    uvec4 output_info;
+layout(push_constant) uniform Blur {
+    uvec4 sizes; // logical source width/height, destination width/height
     uvec4 damage;
-    uvec4 blur_info; // direction, scale bits, unused, unused
+    uvec4 filter_info; // upsample, offset bits, unused, unused
 } frame;
 
-const float center_weight = 0.0499767536;
-const float weights[12] = float[](
-    0.0980269620, 0.0906877868, 0.0788341890, 0.0643936182,
-    0.0494234786, 0.0356439502, 0.0241546147, 0.0153806911,
-    0.0092026449, 0.0051738061, 0.0027331774, 0.0013567042
-);
-const float offsets[12] = float[](
-    1.4941408932, 3.4863315314, 5.4785288375, 7.4707366066,
-    9.4629586132, 11.4551986043, 13.4474602919, 15.4397473464,
-    17.4320633892, 19.4244119867, 21.4167966432, 23.4092207951
-);
-
-// FP32 linear filtering is optional in Vulkan. Interpolate the paired taps
-// explicitly so preserving UNORM16 precision does not require that feature.
-vec4 interpolated(sampler2D source, vec2 position) {
+// FP32 linear texture filtering is optional. Keep all four premultiplied
+// linear-light channels at full precision without requiring that feature.
+vec4 sampled(vec2 position) {
     ivec2 base = ivec2(floor(position));
-    ivec2 limit = textureSize(source, 0) - 1;
-    vec2 fraction = fract(position);
-    vec4 top = mix(texelFetch(source, clamp(base, ivec2(0), limit), 0),
-        texelFetch(source, clamp(base + ivec2(1, 0), ivec2(0), limit), 0), fraction.x);
-    vec4 bottom = mix(texelFetch(source, clamp(base + ivec2(0, 1), ivec2(0), limit), 0),
-        texelFetch(source, clamp(base + ivec2(1, 1), ivec2(0), limit), 0), fraction.x);
-    return mix(top, bottom, fraction.y);
+    ivec2 limit = ivec2(frame.sizes.xy) - 1;
+    vec2 f = fract(position);
+    return mix(
+        mix(texelFetch(source_image, clamp(base, ivec2(0), limit), 0),
+            texelFetch(source_image, clamp(base + ivec2(1, 0), ivec2(0), limit), 0), f.x),
+        mix(texelFetch(source_image, clamp(base + ivec2(0, 1), ivec2(0), limit), 0),
+            texelFetch(source_image, clamp(base + ivec2(1, 1), ivec2(0), limit), 0), f.x), f.y);
 }
 
 void main() {
-    ivec2 local = ivec2(gl_GlobalInvocationID.xy);
-    if (local.x >= int(frame.damage.z) || local.y >= int(frame.damage.w)) return;
-    ivec2 pixel = ivec2(frame.damage.xy) + local;
-    vec2 position = vec2(pixel);
-    float scale = uintBitsToFloat(frame.blur_info.y);
-    bool vertical = frame.blur_info.x != 0u;
-    vec2 axis = vertical ? vec2(0.0, 1.0) : vec2(1.0, 0.0);
-    vec4 color = (vertical ? texelFetch(blur_source, pixel, 0) : texelFetch(linear_source, pixel, 0)) * center_weight;
-    for (int index = 0; index < 12; ++index) {
-        vec2 delta = axis * offsets[index] * scale;
-        vec4 pair = vertical
-            ? interpolated(blur_source, position - delta) + interpolated(blur_source, position + delta)
-            : interpolated(linear_source, position - delta) + interpolated(linear_source, position + delta);
-        color += pair * weights[index];
+    uvec2 local = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(local, frame.damage.zw))) return;
+    ivec2 pixel = ivec2(frame.damage.xy + local);
+    vec2 position = (vec2(pixel) + 0.5) * vec2(frame.sizes.xy) / vec2(frame.sizes.zw) - 0.5;
+    float offset = uintBitsToFloat(frame.filter_info.y);
+    vec4 corners = sampled(position + vec2(-offset, -offset))
+        + sampled(position + vec2(offset, -offset))
+        + sampled(position + vec2(-offset, offset))
+        + sampled(position + vec2(offset, offset));
+    vec4 color;
+    if (frame.filter_info.x == 0u) {
+        color = (4.0 * sampled(position) + corners) / 8.0;
+    } else {
+        color = (2.0 * corners
+            + sampled(position + vec2(-2.0 * offset, 0.0))
+            + sampled(position + vec2(2.0 * offset, 0.0))
+            + sampled(position + vec2(0.0, -2.0 * offset))
+            + sampled(position + vec2(0.0, 2.0 * offset))) / 12.0;
     }
-    if (vertical)
-        imageStore(linear_image, pixel, color);
-    else
-        imageStore(blur_image, pixel, color);
+    imageStore(target_image, pixel, color);
 }

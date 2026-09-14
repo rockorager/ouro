@@ -5,7 +5,8 @@
 //! Only bounded alpha-mask wrappers live for the renderer lifetime. Source and
 //! destination wrappers are released before their borrowed storage can change.
 //! Sampling preserves aligned pixels and otherwise uses bilinear. Output writes
-//! are clipped to R13 damage.
+//! are clipped to R13 damage except for the in-place blur fallback, which
+//! reconstructs the complete composition to keep sampling support valid.
 
 const std = @import("std");
 const render = @import("types.zig");
@@ -127,13 +128,24 @@ pub const Renderer = struct {
     pub fn drawPhased(
         self: *Renderer,
         list: render.List,
-        plan: render.DamagePlan,
+        input_plan: render.DamagePlan,
         destination_bytes: []u8,
         destination_stride: u32,
         cursor_start: usize,
         before_cursor: ?Readback,
         after_cursor: ?Readback,
     ) Error!void {
+        var plan = input_plan;
+        // Unlike Vulkan, this fallback blurs in the scanout buffer itself.
+        // It cannot leave intermediate support pixels there after a partial
+        // repaint. Reconstruct the full composition for blur frames rather
+        // than sampling old foreground pixels as if they were the backdrop.
+        if (!plan.render_full and plan.render_damage.len != 0) {
+            for (list.samples) |sample| if (render.hasVisibleBlur(sample)) {
+                plan.render_full = true;
+                break;
+            };
+        }
         if (list.samples.len > self.caches.len or plan.samples.len > self.caches.len)
             return error.SampleCapacityExceeded;
         if (cursor_start > list.samples.len) return error.InvalidSourceIndex;
@@ -663,6 +675,9 @@ fn subtractOpaqueCoverage(
     clear_damage: *c.pixman_region32_t,
     source_end: usize,
 ) Error!void {
+    // A cover above a blur cannot replace the clear pixels it samples below.
+    for (list.samples[0..source_end]) |sample|
+        if (render.hasVisibleBlur(sample)) return;
     for (plan.samples) |planned| {
         if (planned.source_index >= list.samples.len or planned.source_index >= source_end)
             continue;
@@ -1222,7 +1237,7 @@ test "render-pixman: opaque cursor does not suppress pre-cursor clear" {
     try std.testing.expectEqualSlices(u8, &source, &destination);
 }
 
-test "render-pixman: backdrop blur smooths transparency and skips opaque coverage" {
+test "render: pixman backdrop blur smooths transparency and skips opaque coverage" {
     var renderer = try Renderer.init(std.testing.allocator, .{
         .max_samples = 2,
         .max_source_width = 64,
@@ -1311,6 +1326,17 @@ test "render-pixman: backdrop blur smooths transparency and skips opaque coverag
     try std.testing.expect(destination[31 * 4] > 0 and destination[31 * 4] < 255);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, destination[32 * 4 ..][0..4]);
     try std.testing.expectEqual(@as(usize, 54), renderer.blur_a.items.len);
+
+    const full_result = destination;
+    var partial = plan;
+    partial.render_full = false;
+    partial.render_damage = &.{.{ .x = 31, .y = 0, .width = 1, .height = 1 }};
+    // A reused framebuffer contains the old blurred foreground, not the
+    // unfiltered backdrop. Repeated partial repair must not blur it again.
+    for (0..3) |_| {
+        try renderer.draw(list, partial, &destination, 256);
+        try std.testing.expectEqualSlices(u8, &full_result, &destination);
+    }
 
     var opaque_renderer = try Renderer.init(std.testing.allocator, .{
         .max_samples = 2,

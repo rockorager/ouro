@@ -8,6 +8,7 @@
 const std = @import("std");
 const framebuffer = @import("../backend/drm/framebuffer.zig");
 const render = @import("../render/types.zig");
+const backdrop_blur = @import("../render/blur.zig");
 const surface_state = @import("../surface.zig");
 
 pub const Damage = struct {
@@ -135,13 +136,6 @@ const Region = struct {
     fn slice(self: Region) []const render.Rect {
         return self.rects[0..self.count];
     }
-
-    fn intersects(self: Region, value: render.Rect) bool {
-        if (self.full) return true;
-        for (self.rects[0..self.count]) |rect| if (intersect(rect, value) != null)
-            return true;
-        return false;
-    }
 };
 
 const Image = struct {
@@ -164,6 +158,7 @@ pub const Planner = struct {
     scene: Region,
     repair: Region,
     combined: Region,
+    changed: Region,
     pending: bool = false,
     pending_handle: framebuffer.Handle = undefined,
 
@@ -207,6 +202,8 @@ pub const Planner = struct {
         errdefer allocator.free(repair);
         const combined = try allocator.alloc(render.Rect, config.max_render_rects);
         errdefer allocator.free(combined);
+        const changed = try allocator.alloc(render.Rect, config.max_render_rects);
+        errdefer allocator.free(changed);
 
         const physical = transformedSize(output, output_transform);
         for (images, 0..) |*image, index| {
@@ -230,10 +227,12 @@ pub const Planner = struct {
             .scene = .{ .rects = scene },
             .repair = .{ .rects = repair },
             .combined = .{ .rects = combined },
+            .changed = .{ .rects = changed },
         };
     }
 
     pub fn deinit(self: *Planner) void {
+        self.allocator.free(self.changed.rects);
         self.allocator.free(self.combined.rects);
         self.allocator.free(self.repair.rects);
         self.allocator.free(self.scene.rects);
@@ -261,7 +260,7 @@ pub const Planner = struct {
             self.sample_visible.len * @sizeOf(bool) +
             (self.occlusion_fragments.capacity + self.occlusion_next.capacity) * @sizeOf(render.Rect) +
             (self.client.rects.len + self.scene.rects.len + self.repair.rects.len +
-                self.combined.rects.len) * @sizeOf(render.Rect);
+                self.combined.rects.len + self.changed.rects.len) * @sizeOf(render.Rect);
     }
 
     /// Validates all fallible identities and geometry before touching scratch
@@ -326,27 +325,34 @@ pub const Planner = struct {
             };
         }
         for (changes) |change| self.addChange(change);
-        self.combined.addRegion(self.physical_output, self.client);
         self.combined.addRegion(self.physical_output, self.scene);
-        self.combined.addRegion(self.physical_output, self.repair);
-        // A backdrop effect depends on pixels below its own destination. Walk
-        // back-to-front so damage propagated through one blur can invalidate a
-        // later overlapping blur. The complete surface rectangle is
-        // conservative for non-rectangular client regions; renderers retain
-        // the exact region mask.
+        // Geometry/stacking changes have no reliable old layer index. Treat
+        // them as backdrop damage, but insert client pixels AFTER their own
+        // effect: changing a foreground does not change its backdrop.
         for (list.samples, self.planned_samples[0..list.samples.len]) |sample, planned| {
-            if (!render.hasVisibleBlur(sample)) continue;
-            const visible = clippedPlanRect(
+            if (render.hasVisibleBlur(sample)) if (clippedPlanRect(
                 planned.destination,
                 planned.clip,
                 self.physical_output,
-            ) orelse continue;
-            const radius = blurRadius(sample, planned);
-            const dependency = expandRect(visible, radius, self.physical_output);
-            if (!self.combined.intersects(dependency)) continue;
-            self.combined.add(self.physical_output, dependency);
-            self.combined.add(self.physical_output, visible);
+            )) |visible| {
+                self.changed.clear();
+                for (self.combined.slice()) |damage| {
+                    const affected = intersect(expandRect(damage, blurRadius(sample, planned), self.physical_output), visible) orelse continue;
+                    self.changed.add(self.physical_output, affected);
+                }
+                self.combined.addRegion(self.physical_output, self.changed);
+            };
+            for (changes) |change| if (change.current) |current| {
+                if (std.meta.eql(current.sample, sample.sample))
+                    self.addClientChange(&self.combined, change);
+            };
         }
+        // Save final scene changes for other framebuffer ages. Repair already
+        // names affected OUTPUT pixels; propagating it again grows damage on
+        // each reuse. Sampling support is reconstructed by the renderer.
+        self.changed.clear();
+        self.changed.addRegion(self.physical_output, self.combined);
+        self.combined.addRegion(self.physical_output, self.repair);
         if (force_full) self.combined.setFull(self.physical_output);
         // Blur dependencies above still need the original sample/plan pairing.
         const planned_count = try self.cullOccluded(list);
@@ -394,6 +400,17 @@ pub const Planner = struct {
         self.occlusion_fragments.clearRetainingCapacity();
         try self.occlusion_fragments.append(self.allocator, candidate);
         for (list.samples[candidate_index + 1 ..], candidate_index + 1..) |sample, cover_index| {
+            // A later cover cannot hide pixels already sampled by an effect.
+            // Keep the source if any still-visible fragment feeds that effect.
+            if (render.hasVisibleBlur(sample)) if (clippedPlanRect(
+                self.planned_samples[cover_index].destination,
+                self.planned_samples[cover_index].clip,
+                self.physical_output,
+            )) |visible| {
+                const dependency = expandRect(visible, blurRadius(sample, self.planned_samples[cover_index]), self.physical_output);
+                for (self.occlusion_fragments.items) |fragment|
+                    if (intersect(fragment, dependency) != null) return false;
+            };
             if (sample.global_alpha != 255 or
                 (sample.source.format != .xrgb8888 and !render.effectRegionCoversSurface(
                     sample.opaque_region,
@@ -427,8 +444,7 @@ pub const Planner = struct {
                 image.stale.clear();
                 image.last_generation = self.pending_handle.generation;
             } else {
-                image.stale.addRegion(self.physical_output, self.client);
-                image.stale.addRegion(self.physical_output, self.scene);
+                image.stale.addRegion(self.physical_output, self.changed);
             }
         }
         self.pending = false;
@@ -453,23 +469,27 @@ pub const Planner = struct {
             if (change.previous) |previous| self.addBounds(&self.scene, previous);
             if (change.current) |current| self.addBounds(&self.scene, current);
         }
+        self.addClientChange(&self.client, change);
+    }
+
+    fn addClientChange(self: *Planner, region: *Region, change: Change) void {
         const current = change.current orelse return;
         if (change.surface_damage) |damage| {
             for (damage.items()) |rect| {
                 if (!validDamage(rect)) {
-                    self.client.setFull(self.physical_output);
+                    region.setFull(self.physical_output);
                     return;
                 }
-                self.addMapped(&self.client, mapSurfaceDamage(current, Damage.fromSurface(rect)));
+                self.addMapped(region, mapSurfaceDamage(current, Damage.fromSurface(rect)));
             }
         }
         if (change.buffer_damage) |damage| {
             for (damage.items()) |rect| {
                 if (!validDamage(rect)) {
-                    self.client.setFull(self.physical_output);
+                    region.setFull(self.physical_output);
                     return;
                 }
-                self.addMapped(&self.client, mapBufferDamage(current, Damage.fromSurface(rect)));
+                self.addMapped(region, mapBufferDamage(current, Damage.fromSurface(rect)));
             }
         }
     }
@@ -681,17 +701,9 @@ fn transformGeometryRect(value: render.Rect, output: render.Size, transform: ren
 }
 
 fn blurRadius(sample: render.SurfaceSample, planned: render.PlannedSample) u32 {
-    const x = std.math.divCeil(
-        u64,
-        @as(u64, 24) * planned.destination.width,
-        sample.effect_size.width,
-    ) catch 24;
-    const y = std.math.divCeil(
-        u64,
-        @as(u64, 24) * planned.destination.height,
-        sample.effect_size.height,
-    ) catch 24;
-    return @intCast(@min(@as(u64, std.math.maxInt(u32)), @max(x, y)));
+    const x = @as(f32, @floatFromInt(planned.destination.width)) / @as(f32, @floatFromInt(sample.effect_size.width));
+    const y = @as(f32, @floatFromInt(planned.destination.height)) / @as(f32, @floatFromInt(sample.effect_size.height));
+    return backdrop_blur.radius(@max(x, y));
 }
 
 fn expandRect(value: render.Rect, radius: u32, output: render.Size) render.Rect {
@@ -1056,15 +1068,16 @@ test "damage: culling preserves blur dependency geometry" {
     cover.opaque_region = &.{.{ .add = .{ .x = 0, .y = 0, .width = 10, .height = 10 } }};
     _ = try planner.prepare(.{ .slot = 0, .generation = 1 }, testList(&.{ hidden, blur, cover }), &.{});
     try planner.publish();
-    const previous = SurfaceState.fromSample(blur, .{ .width = 100, .height = 100 });
+    const previous = SurfaceState.fromSample(blur, .{ .width = 40, .height = 40 });
     blur.sample.commit_sequence = 2;
     const plan = try planner.prepare(.{ .slot = 0, .generation = 2 }, testList(&.{ hidden, blur, cover }), &.{.{
         .previous = previous,
-        .current = SurfaceState.fromSample(blur, .{ .width = 100, .height = 100 }),
+        .current = SurfaceState.fromSample(blur, .{ .width = 40, .height = 40 }),
         .surface_damage = damageRegion(Damage.rect(20, 20, 1, 1)),
     }});
-    try std.testing.expectEqual(@as(usize, 2), plan.samples.len);
-    try std.testing.expectEqualSlices(render.Rect, &.{.{ .x = 6, .y = 6, .width = 88, .height = 88 }}, plan.render_damage);
+    // The top cover cannot cull hidden: its corner feeds the earlier blur.
+    try std.testing.expectEqual(@as(usize, 3), plan.samples.len);
+    try std.testing.expectEqualSlices(render.Rect, &.{.{ .x = 50, .y = 50, .width = 1, .height = 1 }}, plan.render_damage);
     try planner.cancel();
 }
 
@@ -1101,7 +1114,7 @@ test "damage: backdrop blur expands underlying damage while opaque XRGB does not
     }};
     const background_old = testSample(1, 1, &pixel, .{ .x = 0, .y = 0, .width = 100, .height = 100 });
     const background_new = testSample(1, 2, &pixel, background_old.destination);
-    var blur = testSample(2, 1, &pixel, .{ .x = 30, .y = 30, .width = 40, .height = 40 });
+    var blur = testSample(2, 1, &pixel, .{ .x = 60, .y = 60, .width = 40, .height = 40 });
     blur.source.format = .argb8888_premultiplied;
     blur.effect_size = .{ .width = 40, .height = 40 };
     blur.blur_region = &blur_region;
@@ -1110,7 +1123,7 @@ test "damage: backdrop blur expands underlying damage while opaque XRGB does not
     const change = Change{
         .previous = old_state,
         .current = new_state,
-        .surface_damage = damageRegion(Damage.rect(45, 45, 1, 1)),
+        .surface_damage = damageRegion(Damage.rect(10, 15, 1, 1)),
     };
 
     var planner = try Planner.init(std.testing.allocator, .{ .width = 100, .height = 100 }, .normal, testConfig(1));
@@ -1126,13 +1139,23 @@ test "damage: backdrop blur expands underlying damage while opaque XRGB does not
         testList(&.{ background_new, blur }),
         &.{change},
     );
-    try std.testing.expectEqualSlices(render.Rect, &.{.{
-        .x = 6,
-        .y = 6,
-        .width = 88,
-        .height = 88,
-    }}, plan.render_damage);
+    // Damage OUTSIDE the effect but inside its sampling halo changes only
+    // the nearby corner of the effect, not the whole blur surface.
+    try std.testing.expectEqualSlices(render.Rect, &.{
+        .{ .x = 10, .y = 15, .width = 1, .height = 1 },
+        .{ .x = 60, .y = 60, .width = 6, .height = 11 },
+    }, plan.render_damage);
     try planner.cancel();
+
+    for ([_]i64{ 4, 5 }) |offset| {
+        var boundary = change;
+        boundary.surface_damage = damageRegion(Damage.rect(offset, offset, 1, 1));
+        plan = try planner.prepare(.{ .slot = 0, .generation = 2 }, testList(&.{ background_new, blur }), &.{boundary});
+        // Half-open conservative 55-pixel halo: (4,4) cannot reach (60,60).
+        try std.testing.expectEqual(@as(usize, if (offset == 4) 1 else 2), plan.render_damage.len);
+        if (offset == 5) try std.testing.expectEqual(render.Rect{ .x = 60, .y = 60, .width = 1, .height = 1 }, plan.render_damage[1]);
+        try planner.cancel();
+    }
 
     var opaque_planner = try Planner.init(std.testing.allocator, .{ .width = 100, .height = 100 }, .normal, testConfig(1));
     defer opaque_planner.deinit();
@@ -1149,12 +1172,96 @@ test "damage: backdrop blur expands underlying damage while opaque XRGB does not
         &.{change},
     );
     try std.testing.expectEqualSlices(render.Rect, &.{.{
-        .x = 45,
-        .y = 45,
+        .x = 10,
+        .y = 15,
         .width = 1,
         .height = 1,
     }}, plan.render_damage);
     try opaque_planner.cancel();
+}
+
+test "damage: overlapping blur propagates upward once and repair retains final pixels" {
+    var planner = try Planner.init(std.testing.allocator, .{ .width = 100, .height = 100 }, .normal, testConfig(3));
+    defer planner.deinit();
+    const pixel = [_]u8{0} ** 4;
+    var lower = testSample(1, 1, &pixel, .{ .x = 0, .y = 0, .width = 100, .height = 100 });
+    lower.source.format = .argb8888_premultiplied;
+    lower.effect_size = .{ .width = 100, .height = 100 };
+    lower.blur_region = &.{.{ .add = .{ .x = 0, .y = 0, .width = 100, .height = 100 } }};
+    var upper = lower;
+    upper.sample.surface = 2;
+    upper.effect_size = .{ .width = 200, .height = 200 };
+    upper.blur_region = &.{.{ .add = .{ .x = 0, .y = 0, .width = 200, .height = 200 } }};
+    for (0..3) |slot| {
+        _ = try planner.prepare(.{ .slot = @intCast(slot), .generation = 1 }, testList(&.{ lower, upper }), &.{});
+        try planner.publish();
+    }
+    const previous = SurfaceState.fromSample(lower, .{ .width = 100, .height = 100 });
+    lower.sample.commit_sequence = 2;
+    var plan = try planner.prepare(.{ .slot = 0, .generation = 2 }, testList(&.{ lower, upper }), &.{.{
+        .previous = previous,
+        .current = SurfaceState.fromSample(lower, .{ .width = 100, .height = 100 }),
+        .surface_damage = damageRegion(Damage.rect(40, 55, 1, 1)),
+    }});
+    // Only the UPPER 42-pixel halo propagates a lower foreground change.
+    const expected = [_]render.Rect{.{ .x = 0, .y = 13, .width = 83, .height = 85 }};
+    try std.testing.expectEqualSlices(render.Rect, &expected, plan.render_damage);
+    try planner.publish();
+    for (1..3) |slot| {
+        plan = try planner.prepare(.{ .slot = @intCast(slot), .generation = 2 }, testList(&.{ lower, upper }), &.{});
+        try std.testing.expectEqualSlices(render.Rect, &expected, plan.repair_damage);
+        try std.testing.expectEqualSlices(render.Rect, &expected, plan.render_damage);
+        try planner.publish();
+    }
+    plan = try planner.prepare(.{ .slot = 0, .generation = 3 }, testList(&.{ lower, upper }), &.{});
+    try std.testing.expectEqual(@as(usize, 0), plan.render_damage.len);
+    try planner.cancel();
+}
+
+test "damage: moved and changed blur effects retain old and new bounds under every output transform" {
+    const pixel = [_]u8{0} ** 4;
+    const transforms = [_]render.Transform{ .normal, .@"90", .@"180", .@"270", .flipped, .flipped_90, .flipped_180, .flipped_270 };
+    const expected = [_]render.Rect{
+        .{ .x = 5, .y = 20, .width = 85, .height = 55 },
+        .{ .x = 20, .y = 10, .width = 55, .height = 85 },
+        .{ .x = 10, .y = 25, .width = 85, .height = 55 },
+        .{ .x = 25, .y = 5, .width = 55, .height = 85 },
+        .{ .x = 10, .y = 20, .width = 85, .height = 55 },
+        .{ .x = 20, .y = 5, .width = 55, .height = 85 },
+        .{ .x = 5, .y = 25, .width = 85, .height = 55 },
+        .{ .x = 25, .y = 10, .width = 55, .height = 85 },
+    };
+    for (transforms, expected) |transform, bounds_expected| {
+        var planner = try Planner.init(std.testing.allocator, .{ .width = 100, .height = 100 }, transform, testConfig(1));
+        defer planner.deinit();
+        var sample = testSample(1, 1, &pixel, .{ .x = 5, .y = 20, .width = 60, .height = 40 });
+        sample.source.format = .argb8888_premultiplied;
+        sample.effect_size = .{ .width = 60, .height = 40 };
+        sample.blur_region = &.{.{ .add = .{ .x = 0, .y = 0, .width = 60, .height = 40 } }};
+        _ = try planner.prepare(.{ .slot = 0, .generation = 1 }, testList(&.{sample}), &.{});
+        try planner.publish();
+        const previous = SurfaceState.fromSample(sample, sample.effect_size);
+        sample.destination.x = 30;
+        sample.destination.y = 35;
+        sample.clip = sample.destination;
+        sample.sample.commit_sequence = 2;
+        const current = SurfaceState.fromSample(sample, sample.effect_size);
+        var plan = try planner.prepare(.{ .slot = 0, .generation = 2 }, testList(&.{sample}), &.{.{ .previous = previous, .current = current }});
+        try std.testing.expectEqualSlices(render.Rect, &.{bounds_expected}, plan.render_damage);
+        try planner.publish();
+        // Effect/opacity changes signal invalidate_bounds even with identical
+        // geometry and no client pixel damage.
+        sample.blur_region = &.{};
+        plan = try planner.prepare(.{ .slot = 0, .generation = 3 }, testList(&.{sample}), &.{.{
+            .previous = current,
+            .current = current,
+            .invalidate_bounds = true,
+        }});
+        try std.testing.expectEqualSlices(render.Rect, plan.scene_damage, plan.render_damage);
+        try std.testing.expectEqual(@as(usize, 1), plan.render_damage.len);
+        try std.testing.expectEqual(@as(u64, 2400), @as(u64, plan.render_damage[0].width) * plan.render_damage[0].height);
+        try planner.cancel();
+    }
 }
 
 test "damage: committed surface damage scales through destination and clip" {
@@ -1497,16 +1604,17 @@ test "damage: stale identities handles and cancelled plans are transactional" {
 }
 
 test "damage: prepare publish and cancel make no allocator calls" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 10 });
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var planner = try Planner.init(failing.allocator(), .{ .width = 100, .height = 100 }, .normal, testConfig(1));
     defer planner.deinit();
-    try std.testing.expectEqual(@as(usize, 10), failing.allocations);
+    const allocations = failing.allocations;
+    failing.fail_index = allocations;
     const plan = try planner.prepare(.{ .slot = 0, .generation = 1 }, testList(&.{}), &.{});
     try std.testing.expect(plan.repair_full);
     try planner.cancel();
     _ = try planner.prepare(.{ .slot = 0, .generation = 1 }, testList(&.{}), &.{});
     try planner.publish();
-    try std.testing.expectEqual(@as(usize, 10), failing.allocations);
+    try std.testing.expectEqual(allocations, failing.allocations);
     try std.testing.expect(!failing.has_induced_failure);
 }
 
