@@ -873,8 +873,12 @@ pub const Backend = struct {
             const handle = slot.handle;
             slot.active = false;
             self.restricted_count -= 1;
-            self.session.closeDevice(handle) catch {
-                self.callback_failed = true;
+            self.session.closeDevice(handle) catch |err| switch (err) {
+                // logind may have already released a hot-unplugged device.
+                // Session still closes the owned FD and retires the handle;
+                // failure of the seat release must not terminate input.
+                error.CloseDeviceFailed => log.warn("input device {d}: seat release failed after local cleanup", .{fd}),
+                else => self.callback_failed = true,
             };
             return;
         };
@@ -933,6 +937,8 @@ const FakeSeat = struct {
     next_fd: std.posix.fd_t = 100,
     opens: usize = 0,
     closes: usize = 0,
+    fd_closes: usize = 0,
+    fail_close_device: bool = false,
 
     const seat_platform = @import("../platform.zig");
     const vtable: seat_platform.Platform.VTable = .{
@@ -980,9 +986,13 @@ const FakeSeat = struct {
     fn closeDevice(context: *anyopaque, _: *anyopaque, _: i32) !void {
         const self: *FakeSeat = @ptrCast(@alignCast(context));
         self.closes += 1;
+        if (self.fail_close_device) return error.CloseDeviceFailed;
     }
 
-    fn closeFd(_: *anyopaque, _: std.posix.fd_t) !void {}
+    fn closeFd(context: *anyopaque, _: std.posix.fd_t) !void {
+        const self: *FakeSeat = @ptrCast(@alignCast(context));
+        self.fd_closes += 1;
+    }
 };
 
 const FakeInput = struct {
@@ -1117,6 +1127,58 @@ fn destroyTestBackend(backend: *Backend) !void {
     session.clearEvents();
     session.state = .draining;
     try session.destroy();
+}
+
+test "input: unplugged seat release failure closes once and permits replacement input" {
+    var seat_fake: FakeSeat = .{};
+    var input_fake: FakeInput = .{};
+    const backend = try testBackend(&seat_fake, &input_fake, 8);
+    defer destroyTestBackend(backend) catch unreachable;
+
+    input_fake.append(.{ .device_added = .{
+        .device = 7,
+        .info = .{ .capabilities = .{ .keyboard = true } },
+    } });
+    try backend.drainEvents();
+    const old_device = backend.events()[0].device_added.device;
+    backend.clearEvents();
+
+    seat_fake.fail_close_device = true;
+    const old_fd = input_fake.opened_fd.?;
+    input_fake.restricted.?.close_fn(input_fake.restricted.?.userdata, old_fd);
+    input_fake.opened_fd = null;
+    input_fake.append(.{ .device_removed = 7 });
+    try backend.drainEvents();
+    try std.testing.expectEqual(old_device, backend.events()[0].device_removed);
+    try std.testing.expectEqual(@as(usize, 1), seat_fake.closes);
+    try std.testing.expectEqual(@as(usize, 1), seat_fake.fd_closes);
+    try std.testing.expectEqual(@as(usize, 0), backend.restricted_count);
+    backend.clearEvents();
+
+    seat_fake.fail_close_device = false;
+    input_fake.opened_fd = try input_fake.restricted.?.open_fn(input_fake.restricted.?.userdata, "/dev/input/replacement");
+    input_fake.append(.{ .device_added = .{
+        .device = 8,
+        .info = .{ .capabilities = .{ .keyboard = true } },
+    } });
+    input_fake.append(.{ .keyboard_key = .{
+        .device = 8,
+        .time_usec = 19,
+        .key = 30,
+        .pressed = true,
+    } });
+    try backend.drainEvents();
+    const replacement = backend.events()[0].device_added.device;
+    try std.testing.expect(!std.meta.eql(old_device, replacement));
+    try std.testing.expectEqual(replacement, backend.events()[1].keyboard_key.device);
+    try std.testing.expectEqual(@as(u32, 30), backend.events()[1].keyboard_key.key);
+    try std.testing.expectEqual(@as(usize, 1), seat_fake.fd_closes);
+
+    // A repeated callback is still an ownership violation, not hot-unplug.
+    input_fake.restricted.?.close_fn(input_fake.restricted.?.userdata, old_fd);
+    try std.testing.expectError(error.RestrictedDeviceFailed, backend.checkCallback());
+    try std.testing.expectEqual(@as(usize, 1), seat_fake.fd_closes);
+    backend.callback_failed = false; // Allow fixture teardown after the assertion.
 }
 
 test "input: multitouch preserves contacts frames cancellation and generations" {
