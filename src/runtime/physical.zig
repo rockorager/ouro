@@ -9118,6 +9118,12 @@ pub fn Coordinator(comptime protocol: type) type {
                     !candidateMatches(layer.candidate.value, pending))
                     return false;
             }
+            // Hidden/discarded commits can finish without a presentation
+            // clearing the previous borrowed source. Keep the next candidate
+            // pending until that retirement slot is available, before any
+            // renderer, effect, or presentation ownership changes.
+            if (layer.retains_source and layer.retired_source != null and
+                !try self.retryRetiredSource(layer)) return false;
             const candidate = layer.candidate.get().?;
             if (candidate.superseded) {
                 _ = try self.adapter.activateFrames(candidate.surface, &candidate.content);

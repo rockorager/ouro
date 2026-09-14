@@ -5519,18 +5519,22 @@ fn runWindowResize(mode: enum { floating, floating_child, tiled }) !void {
 }
 
 test "shell-input: independent commits proceed while another output flip is held" {
-    try runCommitDuringRepaint(false, false);
+    try runCommitDuringRepaint(false, false, false);
+}
+
+test "shell-input: occupied retired source defers replacement until presentation" {
+    try runCommitDuringRepaint(false, false, true);
 }
 
 test "shell-input: repaint pins completed surface contents and synchronized commits" {
-    try runCommitDuringRepaint(false, true);
-    try runCommitDuringRepaint(true, true);
+    try runCommitDuringRepaint(false, true, false);
+    try runCommitDuringRepaint(true, true, false);
     // Only the child crosses onto the secondary output. A commit to the
     // unsampled parent must still wait for that child's held repaint.
-    try runCommitDuringRepaint(true, false);
+    try runCommitDuringRepaint(true, false, false);
 }
 
-fn runCommitDuringRepaint(synchronized: bool, hold_primary: bool) !void {
+fn runCommitDuringRepaint(synchronized: bool, hold_primary: bool, retirement_pending: bool) !void {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-commit-during-flip-{d}.sock", .{linux.getpid()});
@@ -5619,16 +5623,41 @@ fn runCommitDuringRepaint(synchronized: bool, hold_primary: bool) !void {
         try std.testing.expectEqual(ids[1].index, held_surface.index);
         try std.testing.expectEqual(ids[1].generation, held_surface.generation);
     }
+    // Drain startup damage on the primary before seeding retirement: an
+    // unrelated presentation would otherwise legitimately free the slot.
+    if (retirement_pending) for (0..64) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        const delay: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = linux.nanosleep(&delay, null);
+    };
     const applied_before = coordinator.stats.applied;
     const flips_before = fixture.page_flips;
-    const blocked = hold_primary or synchronized;
-    const commit_count: usize = if (blocked) 2 else 1;
+    if (retirement_pending) {
+        const layer = findLayer(coordinator.app_layers, ids[0]).?;
+        // Model a retained external source whose previous source still awaits
+        // presentation. Use the already-consumed protocol content (no lease or
+        // callbacks) to isolate retirement-slot admission from GPU imports.
+        try std.testing.expect(!layer.content.owned);
+        try std.testing.expect(layer.content.value.attachment_lease == null);
+        layer.content.value.effects = .{
+            .allocator = allocator,
+            .opaque_operations = &.{},
+            .blur_operations = &.{},
+        };
+        layer.retired_source = .{ .peer = layer.peer.?, .content = layer.content.value };
+        layer.content.owned = true;
+        layer.retains_source = true;
+        layer.source_release_pending = true;
+    }
+    const blocked = hold_primary or synchronized or retirement_pending;
+    const commit_count: usize = if (blocked and !retirement_pending) 2 else 1;
     const expected_completions = 2 + commit_count;
     var replacement_pixels = pixels;
     replacement_pixels[0] = 0x7f;
     handler.source_pixels = &replacement_pixels;
     // Child first, parent last also exercises atomic synchronized admission.
-    if (blocked) try handler.mapSurface(1);
+    if (commit_count == 2) try handler.mapSurface(1);
     try handler.mapSurface(0);
     try submitMultiClient(&reactor, &driver, &handler);
     for (0..64) |_| {
@@ -5641,6 +5670,13 @@ fn runCommitDuringRepaint(synchronized: bool, hold_primary: bool) !void {
     }
     try std.testing.expectEqual(held_frame, output.in_flight_frame.?);
     if (blocked) {
+        if (retirement_pending) {
+            const layer = findLayer(coordinator.app_layers, ids[0]).?;
+            try std.testing.expect(layer.retired_source != null);
+            try std.testing.expect(!layer.retired_source.?.releasable);
+            try std.testing.expect(layer.retains_source);
+            try std.testing.expect(layer.content.owned);
+        }
         try std.testing.expectEqual(applied_before, coordinator.stats.applied);
         try std.testing.expectEqual(@as(usize, 2), handler.frame_done);
         try std.testing.expectEqual(@as(usize, 2), handler.buffer_releases);
@@ -5670,6 +5706,7 @@ fn runCommitDuringRepaint(synchronized: bool, hold_primary: bool) !void {
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
     for (ids[0..commit_count], sequences[0..commit_count]) |id, sequence| {
         const layer = findLayer(coordinator.app_layers, id).?;
+        try std.testing.expect(layer.retired_source == null);
         try std.testing.expect(layer.sample.?.sample.commit_sequence > sequence);
         const source = try coordinator.render_device.?.content.resolve(layer.rendered.?);
         try std.testing.expectEqualSlices(u8, replacement_pixels[0..12], source.bytes[0..12]);
