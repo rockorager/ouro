@@ -28,6 +28,13 @@ const default_source =
     \\"super+shift+5":["move-focused-to-workspace","5"],"super+shift+6":["move-focused-to-workspace","6"],
     \\"super+shift+7":["move-focused-to-workspace","7"],"super+shift+8":["move-focused-to-workspace","8"],
     \\"super+shift+9":["move-focused-to-workspace","9"],"super+shift+0":["move-focused-to-workspace","10"],
+    \\"XF86AudioRaiseVolume":{"action":["run","wpctl","set-volume","--limit","1.0","@DEFAULT_AUDIO_SINK@","5%+"],"repeat":true},
+    \\"XF86AudioLowerVolume":{"action":["run","wpctl","set-volume","@DEFAULT_AUDIO_SINK@","5%-"],"repeat":true},
+    \\"XF86AudioMute":["run","wpctl","set-mute","@DEFAULT_AUDIO_SINK@","toggle"],
+    \\"XF86MonBrightnessUp":{"action":["run","brightnessctl","--class=backlight","--min-value=1","set","5%+"],"repeat":true},
+    \\"XF86MonBrightnessDown":{"action":["run","brightnessctl","--class=backlight","--min-value=1","set","5%-"],"repeat":true},
+    \\"XF86KbdBrightnessUp":{"action":["run","brightnessctl","--device=*::kbd_backlight","set","1+"],"repeat":true},
+    \\"XF86KbdBrightnessDown":{"action":["run","brightnessctl","--device=*::kbd_backlight","set","1-"],"repeat":true},
     \\"super+return":["run","monstar"]}}
 ;
 
@@ -762,7 +769,7 @@ test "merge patch replaces adds and removes bindings" {
     for (snapshot.bindings) |binding| switch (binding.action) {
         .close => saw_q = true,
         .exit => saw_x = true,
-        .run => |argv| saw_foot = argv.len == 1 and std.mem.eql(u8, argv[0], "foot"),
+        .run => |argv| saw_foot = saw_foot or (argv.len == 1 and std.mem.eql(u8, argv[0], "foot")),
         else => {},
     };
     try std.testing.expect(!saw_q and saw_x and saw_foot);
@@ -835,15 +842,57 @@ test "store applies sibling fragments in lexical order" {
 test "default bindings" {
     var snapshot = try defaultSnapshot(std.testing.allocator);
     defer snapshot.deinit();
-    try std.testing.expectEqual(@as(usize, 37), snapshot.bindings.len);
+    try std.testing.expectEqual(@as(usize, 44), snapshot.bindings.len);
     var saw_exit = false;
     var saw_monstar = false;
     for (snapshot.bindings) |binding| switch (binding.action) {
         .exit => saw_exit = true,
-        .run => |argv| saw_monstar = argv.len == 1 and std.mem.eql(u8, argv[0], "monstar"),
+        .run => |argv| saw_monstar = saw_monstar or (argv.len == 1 and std.mem.eql(u8, argv[0], "monstar")),
         else => {},
     };
     try std.testing.expect(saw_exit and saw_monstar);
+}
+
+test "default hardware bindings select devices directions and repeat policy" {
+    var snapshot = try defaultSnapshot(std.testing.allocator);
+    defer snapshot.deinit();
+    const cases = [_]struct { keysym: u32, argv: []const []const u8, repeat: bool = true }{
+        .{ .keysym = c.XKB_KEY_XF86AudioRaiseVolume, .argv = &.{ "wpctl", "set-volume", "--limit", "1.0", "@DEFAULT_AUDIO_SINK@", "5%+" } },
+        .{ .keysym = c.XKB_KEY_XF86AudioLowerVolume, .argv = &.{ "wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "5%-" } },
+        .{ .keysym = c.XKB_KEY_XF86AudioMute, .argv = &.{ "wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle" }, .repeat = false },
+        .{ .keysym = c.XKB_KEY_XF86MonBrightnessUp, .argv = &.{ "brightnessctl", "--class=backlight", "--min-value=1", "set", "5%+" } },
+        .{ .keysym = c.XKB_KEY_XF86MonBrightnessDown, .argv = &.{ "brightnessctl", "--class=backlight", "--min-value=1", "set", "5%-" } },
+        .{ .keysym = c.XKB_KEY_XF86KbdBrightnessUp, .argv = &.{ "brightnessctl", "--device=*::kbd_backlight", "set", "1+" } },
+        .{ .keysym = c.XKB_KEY_XF86KbdBrightnessDown, .argv = &.{ "brightnessctl", "--device=*::kbd_backlight", "set", "1-" } },
+    };
+    for (cases) |expected| {
+        const binding = for (snapshot.bindings) |candidate| {
+            if (candidate.trigger.keysym == expected.keysym) break candidate;
+        } else return error.MissingHardwareBinding;
+        try std.testing.expectEqual(Modifiers{}, binding.trigger.modifiers);
+        try std.testing.expectEqual(expected.repeat, binding.repeat);
+        try std.testing.expect(binding.action == .run);
+        try std.testing.expectEqualDeep(expected.argv, binding.action.run);
+    }
+}
+
+test "hardware defaults can be overridden and removed" {
+    var snapshot = try mergeSources(std.testing.allocator, &.{
+        \\{"bindings":{"XF86AudioRaiseVolume":["run","custom-volume","up"],"XF86KbdBrightnessDown":null}}
+    });
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, 43), snapshot.bindings.len);
+    var saw_override = false;
+    for (snapshot.bindings) |binding| {
+        try std.testing.expect(binding.trigger.keysym != c.XKB_KEY_XF86KbdBrightnessDown);
+        if (binding.trigger.keysym == c.XKB_KEY_XF86AudioRaiseVolume) {
+            try std.testing.expect(binding.action == .run);
+            try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "custom-volume", "up" }), binding.action.run);
+            try std.testing.expect(!binding.repeat);
+            saw_override = true;
+        }
+    }
+    try std.testing.expect(saw_override);
 }
 
 test "machine policy rules repeat sorting matching and defaults" {

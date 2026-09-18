@@ -169,6 +169,23 @@ the former primary follow it without changing workspace number; windows from
 any disconnected secondary output also move to primary. Matched key
 press/release pairs are consumed before client seat delivery.
 
+Hardware keys work without modifiers and require `wpctl` (WirePlumber) and
+`brightnessctl` on the systemd user manager's executable search path:
+
+| Keys | Default behavior |
+| --- | --- |
+| `XF86AudioRaiseVolume` / `XF86AudioLowerVolume` | Adjust the default audio sink by 5 percentage points; raising stops at 100%. |
+| `XF86AudioMute` | Toggle mute on the default audio sink. |
+| `XF86MonBrightnessUp` / `XF86MonBrightnessDown` | Adjust screen backlight by 5% of its maximum, with a minimum hardware value of 1. |
+| `XF86KbdBrightnessUp` / `XF86KbdBrightnessDown` | Adjust keyboard backlight by one hardware step, including down to off. |
+
+Up/down keys repeat while held; mute does not. Screen brightness selects the
+`backlight` class; keyboard brightness selects `*::kbd_backlight` devices.
+Brightness control requires a supported device and permission to change it
+(through logind or brightnessctl's udev rules). These are ordinary `run`
+bindings and can be replaced or removed through configuration using the exact
+keys above, for example `"XF86AudioMute": null`.
+
 Hold `Super` (`Logo`) and left-drag to move a floating window or reposition a
 tiled window. Tiled drops swap with a window's center or split beside its
 left/right/top/bottom edge; dropping at an output's left/right edge inserts at
