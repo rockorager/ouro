@@ -7,6 +7,7 @@
 const std = @import("std");
 const wayring = @import("wayring");
 const slot_pool = @import("slot_pool.zig");
+const geometry = @import("../scene/geometry.zig");
 
 const objects = wayring.objects;
 const none = std.math.maxInt(u32);
@@ -38,8 +39,10 @@ pub const OutputValidator = struct {
 };
 
 pub const OutputMode = struct {
+    // Transformed physical dimensions; region requests are output-local logical.
     width: u32,
     height: u32,
+    scale: geometry.OutputScale,
     identity: u64,
     generation: u64,
 };
@@ -316,7 +319,7 @@ pub fn Adapter(comptime protocol: type) type {
             frame.region = if (!output_available)
                 .{ .x = 0, .y = 0, .width = 0, .height = 0 }
             else if (requested) |region| clipped: {
-                const clipped = clipRegion(region, mode.?.width, mode.?.height) orelse
+                const clipped = clipRegion(region, mode.?.width, mode.?.height, mode.?.scale) orelse
                     break :clipped .{ .x = 0, .y = 0, .width = 0, .height = 0 };
                 break :clipped .{
                     .x = clipped.x,
@@ -736,12 +739,14 @@ fn captureWaitGeneration(
 
 const ClippedRegion = struct { x: u32, y: u32, width: u32, height: u32 };
 
-fn clipRegion(requested: anytype, width: u32, height: u32) ?ClippedRegion {
+fn clipRegion(requested: anytype, width: u32, height: u32, scale: geometry.OutputScale) ?ClippedRegion {
     if (requested.width <= 0 or requested.height <= 0) return null;
-    const x1 = @max(@as(i64, requested.x), 0);
-    const y1 = @max(@as(i64, requested.y), 0);
-    const x2 = @min(@as(i64, requested.x) + requested.width, width);
-    const y2 = @min(@as(i64, requested.y) + requested.height, height);
+    // Scale both edges with the same rounding as scene rendering, then clip
+    // to the transformed pixel bounds consumed by the readback copier.
+    const x1 = @max(scale.physicalEdge(requested.x) catch return null, 0);
+    const y1 = @max(scale.physicalEdge(requested.y) catch return null, 0);
+    const x2 = @min(scale.physicalEdge(@as(i64, requested.x) + requested.width) catch return null, width);
+    const y2 = @min(scale.physicalEdge(@as(i64, requested.y) + requested.height) catch return null, height);
     if (x2 <= x1 or y2 <= y1) return null;
     return .{
         .x = @intCast(x1),
@@ -781,13 +786,26 @@ fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
 }
 
 test "screencopy: regions are clipped to output extents" {
-    const region = clipRegion(.{ .x = -20, .y = 10, .width = 80, .height = 100 }, 50, 60).?;
+    const scale = try geometry.OutputScale.init(120);
+    const region = clipRegion(.{ .x = -20, .y = 10, .width = 80, .height = 100 }, 50, 60, scale).?;
     try std.testing.expectEqual(@as(u32, 0), region.x);
     try std.testing.expectEqual(@as(u32, 10), region.y);
     try std.testing.expectEqual(@as(u32, 50), region.width);
     try std.testing.expectEqual(@as(u32, 50), region.height);
-    try std.testing.expect(clipRegion(.{ .x = 60, .y = 0, .width = 10, .height = 10 }, 50, 60) == null);
-    try std.testing.expect(clipRegion(.{ .x = 0, .y = 0, .width = 0, .height = 10 }, 50, 60) == null);
+    try std.testing.expect(clipRegion(.{ .x = 60, .y = 0, .width = 10, .height = 10 }, 50, 60, scale) == null);
+    try std.testing.expect(clipRegion(.{ .x = 0, .y = 0, .width = 0, .height = 10 }, 50, 60, scale) == null);
+}
+
+test "screencopy: logical crop origins and edges scale before physical clipping" {
+    const fractional = try geometry.OutputScale.init(180);
+    const double = try geometry.OutputScale.init(240);
+    const requested = .{ .x = 3, .y = 5, .width = 7, .height = 3 };
+    // Rounding the width independently would produce 11 rather than 10.
+    try std.testing.expectEqual(ClippedRegion{ .x = 5, .y = 8, .width = 10, .height = 4 }, clipRegion(requested, 40, 30, fractional).?);
+    try std.testing.expectEqual(ClippedRegion{ .x = 6, .y = 10, .width = 14, .height = 6 }, clipRegion(requested, 40, 30, double).?);
+    try std.testing.expectEqual(ClippedRegion{ .x = 5, .y = 8, .width = 8, .height = 2 }, clipRegion(requested, 13, 10, fractional).?);
+    try std.testing.expectEqual(ClippedRegion{ .x = 0, .y = 3, .width = 6, .height = 5 }, clipRegion(.{ .x = -3, .y = 2, .width = 7, .height = 3 }, 13, 10, fractional).?);
+    try std.testing.expect(clipRegion(.{ .x = 9, .y = 0, .width = 1, .height = 1 }, 13, 10, fractional) == null);
 }
 
 test "screencopy: damage waits only on a manager's current baseline" {
@@ -831,7 +849,7 @@ test "screencopy: unavailable output fails frames without disconnecting" {
     const Validator = struct {
         fn validate(context: ?*anyopaque, _: wayring.io_uring.Peer, _: objects.Handle, _: objects.Object) ?OutputMode {
             const available: *bool = @ptrCast(@alignCast(context.?));
-            return if (available.*) .{ .width = 8, .height = 8, .identity = 1, .generation = 1 } else null;
+            return if (available.*) .{ .width = 8, .height = 8, .scale = .{ .value_120 = 120 }, .identity = 1, .generation = 1 } else null;
         }
     };
     var adapter = try A.init(std.testing.allocator, .{ .outbound_capacity = 3 });

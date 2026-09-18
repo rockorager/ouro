@@ -136,6 +136,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
         outbound_len: usize = 0,
         next_serial: u32,
         popup_adopter: ?PopupAdopter = null,
+        default_output: ?OutputAdapter.OutputId = null,
 
         pub fn init(allocator: std.mem.Allocator, core: *CoreSurface, output: *OutputAdapter, config: Config) !Self {
             try config.validate();
@@ -167,6 +168,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
 
         pub fn setPopupAdopter(self: *Self, adopter: PopupAdopter) void {
             self.popup_adopter = adopter;
+        }
+
+        /// Runtime policy for newly created surfaces with no explicit output.
+        /// Existing surfaces retain their selected output.
+        pub fn setDefaultOutput(self: *Self, output: ?OutputAdapter.OutputId) void {
+            self.default_output = output;
         }
 
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
@@ -202,7 +209,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
                         if (surface.sequence != 0 or surface.current_buffer != null or surface.hasPendingBufferAttachment())
                             return try self.managerError(actor, decoded.handle.id, Manager.@"error".already_constructed.value, "surface already has a role or content");
                         var output_resource: ?objects.Handle = null;
-                        var output = self.output.primaryOutput();
+                        var output = self.default_output orelse self.output.primaryOutput();
                         if (v.output) |oid| {
                             const oh = server_objects.namespace.lookupHandle(oid) orelse return try self.managerError(actor, decoded.handle.id, Manager.@"error".role.value, "invalid output");
                             const oo = server_objects.namespace.resolve(oh) orelse return try self.managerError(actor, decoded.handle.id, Manager.@"error".role.value, "invalid output");

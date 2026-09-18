@@ -2962,6 +2962,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.flushProtocol();
                 return control;
             }
+            if (target.object.interface == &protocol.zwlr_layer_shell_v1.info)
+                self.layer_shell_adapter.setDefaultOutput(if (self.pointerPhysicalOutput()) |output|
+                    output.protocol_output
+                else
+                    null);
             if (try self.layer_shell_adapter.request(peer, target, message, fds)) |control| {
                 try self.advanceShell();
                 if (self.layer_shell_adapter.pendingOutbound(peer))
@@ -4458,6 +4463,11 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn pointerOutput(self: *Self) ?OutputId {
+            const physical = self.pointerPhysicalOutput() orelse return null;
+            return .{ .value = @as(u64, physical.id.generation) << 32 | physical.id.index };
+        }
+
+        fn pointerPhysicalOutput(self: *Self) ?*PhysicalOutput {
             const pointer = self.interaction.pointerPosition();
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 if (!physical.connected or physical.kms_output == null) continue;
@@ -4466,9 +4476,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 const bottom = @as(i64, bounds.y) + bounds.height;
                 if (pointer.x < bounds.x or pointer.y < bounds.y or
                     pointer.x >= right or pointer.y >= bottom) continue;
-                return .{
-                    .value = @as(u64, physical.id.generation) << 32 | physical.id.index,
-                };
+                return physical;
             }
             return null;
         }
@@ -6832,9 +6840,11 @@ pub fn Coordinator(comptime protocol: type) type {
             const reference = self.output_adapter.reference(peer, handle, object) catch return null;
             const physical = self.physicalOutputForProtocolId(reference.output) orelse return null;
             const output = physical.kms_output orelse return null;
+            const head = self.output_management_adapter.lifecycle.currentHead(physical.management_head) catch return null;
             return .{
                 .width = output.planner.output.width,
                 .height = output.planner.output.height,
+                .scale = geometry.OutputScale.init(head.scale_120) catch return null,
                 .identity = (@as(u64, reference.output.generation) << 32) |
                     reference.output.index,
                 .generation = physical.screencopy_generation,
@@ -6985,6 +6995,9 @@ pub fn Coordinator(comptime protocol: type) type {
         fn processActivationEvents(self: *Self) !void {
             while (self.activation_adapter.popEvent()) |event| switch (event) {
                 .activate => |surface| {
+                    // Token validation may precede a session lock. Never let a
+                    // queued pre-lock activation mutate desktop policy.
+                    if (self.sessionLockActive()) continue;
                     const scene = self.desktop.toplevelSceneForSurface(surface) catch continue;
                     self.interaction.activateToplevel(
                         &self.desktop,

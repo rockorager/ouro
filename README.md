@@ -127,6 +127,9 @@ responsibilities:
   exclusive zones, layer, and keyboard-interactivity state; publish exact
   acknowledged configure transactions; reserve desktop work area; and compose
   background, bottom, top, and overlay surfaces in protocol order.
+  Without an explicit output, new surfaces use the display under the pointer,
+  falling back to the primary output when no active display contains it.
+  Placement stays fixed until the surface is destroyed; reopening selects again.
 - [Session lock](src/protocol/session_lock.zig): bounded
   `ext_session_lock_v1` roles replace ordinary scene and input ownership,
   publish `locked` only after an opaque lock frame is physically presented,
@@ -137,9 +140,11 @@ responsibilities:
   validate explicit grabs against exact seat/user-action serials, and compose
   above their owning toplevel with flip, slide, and resize constraint adjustment.
 - [XDG activation](src/protocol/xdg_activation.zig): bounded opaque tokens
-  require the exact focused surface and latest user-action serial, remain valid
-  across launcher/client boundaries, and activate a target toplevel exactly
-  once through the normal desktop and keyboard-focus policy boundary.
+  require the exact input surface, pointer or keyboard focus, and latest
+  user-action serial. They remain valid across launcher/client boundaries and
+  activate a target toplevel exactly once, revealing a minimized window and
+  switching its output to its workspace before focusing it. Other outputs keep
+  their selected workspaces. Activation cannot change focus while locked.
 - [XDG decoration](src/protocol/xdg_decoration.zig): bounded per-toplevel
   negotiation selects server-side decorations. Ouro intentionally leaves
   tiled and floating windows borderless, with no compositor-drawn title bar or

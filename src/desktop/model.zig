@@ -3667,12 +3667,59 @@ test "desktop: hidden windows decline focus requests without changing focus" {
         const before = try desktop.policy.windowState(id);
         const commands = desktop.pendingCommands();
         const focus = desktop.focused();
-        for (std.enums.values(TestDesktop.FocusSource)) |source|
+        for (std.enums.values(TestDesktop.FocusSource)) |source| {
+            if (source == .activation) continue;
             try std.testing.expect(!try desktop.requestFocus(id, source));
+        }
         try std.testing.expectEqual(before, try desktop.policy.windowState(id));
         try std.testing.expectEqual(commands, desktop.pendingCommands());
         try std.testing.expectEqual(focus, desktop.focused());
     }
+}
+
+test "desktop: activation reveals the target workspace without moving the window or switching other outputs" {
+    var desktop = try initTestDesktop(16);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    const left: TestDesktop.OutputId = .{ .value = 10 };
+    const right: TestDesktop.OutputId = .{ .value = 20 };
+    const topology = [_]TestDesktop.OutputArea{
+        .{ .id = left, .geometry = .{ .x = 0, .y = 0, .width = 100, .height = 60 } },
+        .{ .id = right, .geometry = .{ .x = 100, .y = 0, .width = 100, .height = 60 } },
+    };
+    try desktop.validateTopology(.{ .x = 0, .y = 0, .width = 200, .height = 60 }, &topology);
+    desktop.applyTopology(.{ .x = 0, .y = 0, .width = 200, .height = 60 }, &topology);
+    desktop.setNextSpawnOutput(left);
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    const target = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const uncommitted = try desktop.policy.windowState(target);
+    try std.testing.expect(!try desktop.requestFocus(target, .activation));
+    try std.testing.expectEqual(uncommitted, try desktop.policy.windowState(target));
+    try settleDesktop(&desktop, &shell);
+    try desktop.moveFocusedToWorkspace(3);
+    try desktop.setToplevelState(target, .minimized, true);
+    try settleDesktop(&desktop, &shell);
+    try desktop.switchWorkspace(right, 2);
+    desktop.setNextSpawnOutput(right);
+    shell.push(created(1));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const other = try desktop.idForShell(.{ .index = 1, .generation = 1 });
+    try std.testing.expect(!desktop.desired[target.index].visible);
+    const revision = desktop.workspaceRevision();
+    try std.testing.expect(try desktop.requestFocus(target, .activation));
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(target, desktop.focused().?);
+    const state = try desktop.policy.windowState(target);
+    try std.testing.expectEqual(left, state.output.?);
+    try std.testing.expectEqual(@as(u8, 3), state.workspace);
+    try std.testing.expect(!state.minimized);
+    try std.testing.expect(desktop.desired[target.index].visible);
+    try std.testing.expect(desktop.desired[other.index].visible);
+    try std.testing.expectEqual(@as(u8, 2), (try desktop.policy.windowState(other)).workspace);
+    try std.testing.expect(!std.meta.eql(revision, desktop.workspaceRevision()));
+    try std.testing.expectError(error.StaleToplevel, desktop.requestFocus(.{ .index = target.index, .generation = target.generation + 1 }, .activation));
 }
 
 test "desktop: hidden interactive requests leave window and tiling state unchanged" {

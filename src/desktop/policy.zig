@@ -317,6 +317,23 @@ pub fn Policy(
         pub fn focusRequested(policy: *Self, id: ToplevelId, source: FocusSource) !FocusDecision {
             if (source == .pointer_motion and !policy.focus_follows_mouse)
                 return .{ .accepted = false };
+            if (source == .activation) {
+                const state = try policy.resolve(id);
+                // Validate the complete destination before changing either the
+                // window or per-output workspace inventory.
+                if (!state.active or !state.committed or state.output == null or
+                    policy.outputGeometry(state.output.?) == null)
+                    return .{ .accepted = false };
+                var changed = false;
+                if (state.minimized) {
+                    state.minimized = false;
+                    policy.workspace_revision +%= 1;
+                    changed = true;
+                }
+                changed = policy.switchWorkspace(state.output.?, state.workspace) or changed;
+                changed = (try policy.focus(id)) or changed;
+                return .{ .accepted = true, .changed = changed };
+            }
             // Retained input and client requests can outlive visibility.
             const changed = policy.focus(id) catch |err| switch (err) {
                 error.NotVisible => return .{ .accepted = false },

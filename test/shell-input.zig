@@ -3647,7 +3647,11 @@ fn fullscreenLayer(overlay: bool) !void {
 }
 
 test "shell-input: secondary output removal closes its reactive layer popup root" {
-    try layerPopupOutputLifecycle(false);
+    try layerPopupOutputLifecycle(false, false);
+}
+
+test "shell-input: unspecified layer output follows the pointer across scaled outputs" {
+    try layerPopupOutputLifecycle(false, true);
 }
 
 test "shell-input: positive exclusive-zone bars stack in adapter order" {
@@ -3860,10 +3864,10 @@ fn runLayerStacking(destroy: bool) !void {
 }
 
 test "shell-input: powered off outputs retain client commits and resume after pointer input" {
-    try layerPopupOutputLifecycle(true);
+    try layerPopupOutputLifecycle(true, false);
 }
 
-fn layerPopupOutputLifecycle(power_cycle: bool) !void {
+fn layerPopupOutputLifecycle(power_cycle: bool, pointer_selected: bool) !void {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-layer-popup-{d}.sock", .{linux.getpid()});
@@ -3926,6 +3930,23 @@ fn layerPopupOutputLifecycle(power_cycle: bool) !void {
             try waitServer(&root.ring);
     }
 
+    if (pointer_selected) {
+        const device: ouro.input_backend.DeviceId = .{ .slot = 1, .generation = 1, .seat_generation = 1 };
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{
+            .device = device,
+            .info = .{ .capabilities = .{ .pointer = true } },
+        } }));
+        // External logical bounds start at (2, -1), with a different scale
+        // from the primary. No explicit output is sent by this client.
+        const delta = coordinator.interaction.motionToPoint(.{ .x = 3, .y = -1 });
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_motion = .{
+            .device = device,
+            .time_usec = 1_000,
+            .dx = delta.dx,
+            .dy = delta.dy,
+        } }));
+    }
+
     var client_reactor: wayring.io_uring.Reactor = undefined;
     try client_reactor.initOwned(
         allocator,
@@ -3947,6 +3968,7 @@ fn layerPopupOutputLifecycle(power_cycle: bool) !void {
         .queue = &actor.transmit,
         .registry = registry,
         .minimum_outputs = 2,
+        .unspecified_output = pointer_selected,
         .reactive = true,
         .test_output_power = power_cycle,
         .layer_height = 1,
@@ -3967,6 +3989,7 @@ fn layerPopupOutputLifecycle(power_cycle: bool) !void {
             const layer_ids = try coordinator.layer_shell_adapter.ids(coordinator.layer_surface_ids);
             try std.testing.expectEqual(@as(usize, 1), layer_ids.len);
             const layer_state = try coordinator.layer_shell_adapter.state(layer_ids[0]);
+            try std.testing.expectEqual(coordinator.physical_outputs[1].protocol_output, layer_state.output);
             const work_area: @TypeOf(coordinator.desktop.workArea()) =
                 .{ .x = 0, .y = 0, .width = 5, .height = 2 };
             try std.testing.expectEqual(work_area, coordinator.desktop.workArea());
@@ -4671,24 +4694,30 @@ test "shell-input: popup retains parent keyboard focus and applies each configur
 }
 
 test "shell-input: screencopy captures clipped output into writable SHM" {
-    try runScreencopyCapture(.none, false);
+    try runScreencopyCapture(.none, false, 120);
+}
+
+test "shell-input: screencopy scales logical regions on rotated outputs" {
+    try runScreencopyCapture(.none, false, 180);
+    try runScreencopyCapture(.none, false, 240);
 }
 
 test "shell-input: copy with damage waits for a newer output frame" {
-    try runScreencopyCapture(.none, true);
+    try runScreencopyCapture(.none, true, 120);
 }
 
 test "shell-input: session disable fails screencopy before submission" {
-    try runScreencopyCapture(.before_submission, false);
+    try runScreencopyCapture(.before_submission, false, 120);
 }
 
 test "shell-input: session disable completes submitted screencopy" {
-    try runScreencopyCapture(.after_submission, false);
+    try runScreencopyCapture(.after_submission, false, 120);
 }
 
 fn runScreencopyCapture(
     disable: enum { none, before_submission, after_submission },
     repeat_with_damage: bool,
+    scale_120: u32,
 ) !void {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
@@ -4720,6 +4749,7 @@ fn runScreencopyCapture(
     try coordinator.start(&loop);
     var rotated = coordinator.output_management_adapter.lifecycle.current;
     rotated.transform = 1;
+    rotated.scale_120 = scale_120;
     _ = try coordinator.output_management_adapter.publishHead(
         coordinator.output_management_adapter.lifecycle.primary,
         rotated,
@@ -4746,6 +4776,8 @@ fn runScreencopyCapture(
         .queue = &actor.transmit,
         .registry = registry,
         .capture_goal = if (repeat_with_damage) 2 else 1,
+        .region_x = if (scale_120 == 120) 1 else 0,
+        .capture_size = if (scale_120 == 120) 1 else 2,
     };
     defer {
         if (handler.read_fd >= 0) _ = linux.close(handler.read_fd);
@@ -4821,11 +4853,14 @@ fn runScreencopyCapture(
         );
         try std.testing.expectEqual(completed, handler.flags_events);
         try std.testing.expectEqual(completed, handler.damage_events);
-        var captured: [4]u8 = undefined;
-        const read = linux.pread(handler.read_fd, &captured, captured.len, 0);
+        var storage: [16]u8 = undefined;
+        const captured = storage[0 .. handler.capture_size * handler.capture_size * 4];
+        const read = linux.pread(handler.read_fd, captured.ptr, captured.len, 0);
         try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(read));
         try std.testing.expectEqual(@as(usize, captured.len), read);
-        try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0xff }, &captured);
+        var captured_pixels = std.mem.window(u8, captured, 4, 4);
+        while (captured_pixels.next()) |pixel|
+            try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0xff }, pixel);
     }
 
     coordinator.disconnected(coordinator.peer.?);
@@ -7682,6 +7717,8 @@ const ScreencopyHandler = struct {
     objects: *wayring.objects.ClientObjects,
     queue: *wayring.tx.Queue,
     registry: wayring.objects.Handle,
+    region_x: i32 = 1,
+    capture_size: u32 = 1,
     shm: ?wayring.objects.Handle = null,
     output: ?wayring.objects.Handle = null,
     manager: ?wayring.objects.Handle = null,
@@ -7735,9 +7772,9 @@ const ScreencopyHandler = struct {
             switch (try protocol.zwlr_screencopy_frame_v1.decodeEvent(message, fds)) {
                 .buffer => |value| {
                     try std.testing.expectEqual(protocol.wl_shm.format.xrgb8888.value, value.format.value);
-                    try std.testing.expectEqual(@as(u32, 1), value.width);
-                    try std.testing.expectEqual(@as(u32, 1), value.height);
-                    try std.testing.expectEqual(@as(u32, 4), value.stride);
+                    try std.testing.expectEqual(self.capture_size, value.width);
+                    try std.testing.expectEqual(self.capture_size, value.height);
+                    try std.testing.expectEqual(self.capture_size * 4, value.stride);
                     self.buffer_events += 1;
                 },
                 .buffer_done => {
@@ -7751,8 +7788,8 @@ const ScreencopyHandler = struct {
                 .damage => |value| {
                     try std.testing.expectEqual(@as(u32, 0), value.x);
                     try std.testing.expectEqual(@as(u32, 0), value.y);
-                    try std.testing.expectEqual(@as(u32, 1), value.width);
-                    try std.testing.expectEqual(@as(u32, 1), value.height);
+                    try std.testing.expectEqual(self.capture_size, value.width);
+                    try std.testing.expectEqual(self.capture_size, value.height);
                     self.damage_events += 1;
                 },
                 .ready => {
@@ -7799,7 +7836,7 @@ const ScreencopyHandler = struct {
             .{
                 .overlay_cursor = 0,
                 .output = self.output.?.id,
-                .x = 1,
+                .x = self.region_x,
                 .y = 0,
                 .width = 1,
                 .height = 1,
@@ -7810,7 +7847,9 @@ const ScreencopyHandler = struct {
 
     fn requestCopy(self: *ScreencopyHandler) !void {
         if (self.copy_requested) return;
-        const descriptor = try ordinaryMemfd(4, 0, &.{ 0x55, 0x55, 0x55, 0x55 });
+        const bytes = self.capture_size * self.capture_size * 4;
+        const initial = [_]u8{0x55} ** 16;
+        const descriptor = try ordinaryMemfd(bytes, 0, initial[0..bytes]);
         const retained = linux.fcntl(descriptor, linux.F.DUPFD_CLOEXEC, 0);
         if (linux.errno(retained) != .SUCCESS) return error.DuplicateFailed;
         self.read_fd = @intCast(retained);
@@ -7822,7 +7861,7 @@ const ScreencopyHandler = struct {
             self.objects,
             self.queue,
             self.shm.?,
-            .{ .fd = descriptor, .size = 4 },
+            .{ .fd = descriptor, .size = @intCast(bytes) },
         );
         self.buffer = (try protocol.wl_shm_pool.construct_create_buffer(
             self.objects,
@@ -7830,9 +7869,9 @@ const ScreencopyHandler = struct {
             pool.id,
             .{
                 .offset = 0,
-                .width = 1,
-                .height = 1,
-                .stride = 4,
+                .width = @intCast(self.capture_size),
+                .height = @intCast(self.capture_size),
+                .stride = @intCast(self.capture_size * 4),
                 .format = .xrgb8888,
             },
         )).id;
@@ -8078,6 +8117,7 @@ const LayerPopupHandler = struct {
     output: ?wayring.objects.Handle = null,
     output_count: usize = 0,
     minimum_outputs: usize = 0,
+    unspecified_output: bool = false,
     test_output_power: bool = false,
     power_manager: ?wayring.objects.Handle = null,
     power_outputs: [2]?wayring.objects.Handle = .{ null, null },
@@ -8371,7 +8411,7 @@ const LayerPopupHandler = struct {
             self.layer_shell.?,
             .{
                 .surface = self.layer_wl_surface.?.id,
-                .output = if (self.output) |output| output.id else null,
+                .output = if (self.unspecified_output) null else if (self.output) |output| output.id else null,
                 .layer = .top,
                 .namespace = "ouro-test",
             },

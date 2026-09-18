@@ -133,6 +133,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             peer: wayring.io_uring.Peer = undefined,
             last_implicit_grab_serial: u32 = 0,
             last_user_action_serial: u32 = 0,
+            last_user_action_target: ?FocusTarget = null,
         };
         const PointerSlot = struct {
             header: slot_pool.Header = .{},
@@ -978,9 +979,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (serial == 0) return false;
             const seat = adapter.seatByObject(server_objects, peer, seat_object) orelse return false;
             if (seat.last_user_action_serial != serial) return false;
-            const focus = adapter.keyboard_focus orelse return false;
-            return sameClient(focus.client, clientId(peer)) and
-                std.meta.eql(focus.surface, surface);
+            const target = seat.last_user_action_target orelse return false;
+            if (!sameClient(target.client, clientId(peer)) or !std.meta.eql(target.surface, surface)) return false;
+            // A clicked non-keyboard-interactive layer may authorize focus,
+            // but a historical press on a surface with no focus may not.
+            for ([_]?FocusTarget{ adapter.keyboard_focus, adapter.pointer_focus }) |focus| {
+                if (focus) |current| if (sameClient(current.client, target.client) and
+                    std.meta.eql(current.surface, target.surface)) return true;
+            }
+            return false;
         }
 
         pub fn validateInteractiveGrab(
@@ -1205,7 +1212,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 } }) catch unreachable;
                 touch.pending_frame_events +|= 1;
             };
-            adapter.setUserActionSerial(target.client, serial);
+            adapter.setUserActionSerial(target, serial);
             return serial;
         }
 
@@ -1785,7 +1792,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 } }) catch unreachable;
             };
             adapter.setLastPointerSerial(delivery.client, serial);
-            if (value.pressed) adapter.setImplicitGrabSerial(delivery.client, serial);
+            if (value.pressed) adapter.setImplicitGrabSerial(delivery, serial);
             if (!value.pressed and !anySet(&adapter.pressed_buttons)) {
                 adapter.pointer_grab = .idle;
                 try adapter.transitionPointer(adapter.pointer_focus);
@@ -1912,7 +1919,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     .key = value.key,
                     .pressed = value.pressed,
                 } }) catch unreachable;
-            if (value.pressed) adapter.setUserActionSerial(delivery.client, serial);
+            if (value.pressed) adapter.setUserActionSerial(delivery, serial);
             if (modifiers_changed) {
                 const modifier_serial = adapter.issueSerial();
                 for (adapter.keyboards.entries.items, 0..) |slot, index| if (adapter.keyboardBelongs(slot, delivery.client))
@@ -2152,22 +2159,25 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             }
         }
 
-        fn setImplicitGrabSerial(adapter: *Self, client: ClientId, serial: u32) void {
+        fn setImplicitGrabSerial(adapter: *Self, target: FocusTarget, serial: u32) void {
             for (adapter.pointers.entries.items) |pointer| {
-                if (!adapter.pointerActive(pointer) or !sameClient(pointer.client, client)) continue;
+                if (!adapter.pointerActive(pointer) or !sameClient(pointer.client, target.client)) continue;
                 if (pointer.seat_index >= adapter.seats.entries.items.len) continue;
                 const seat = adapter.seats.entries.items[pointer.seat_index];
                 if (seat.header.active and seat.header.generation == pointer.seat_generation) {
                     seat.last_implicit_grab_serial = serial;
                     seat.last_user_action_serial = serial;
+                    seat.last_user_action_target = target;
                 }
             }
         }
 
-        fn setUserActionSerial(adapter: *Self, client: ClientId, serial: u32) void {
+        fn setUserActionSerial(adapter: *Self, target: FocusTarget, serial: u32) void {
             for (adapter.seats.entries.items) |seat| {
-                if (seat.header.active and sameClient(clientId(seat.peer), client))
+                if (seat.header.active and sameClient(clientId(seat.peer), target.client)) {
                     seat.last_user_action_serial = serial;
+                    seat.last_user_action_target = target;
+                }
             }
         }
 
@@ -3107,7 +3117,7 @@ test "seat: clipboard selections require the exact seat and latest user action s
     try std.testing.expect(!adapter.validateSelectionOn(&server_objects, peer, 2, 0));
 }
 
-test "seat: activation requires the exact focused surface and latest user action serial" {
+test "seat: activation requires the exact action surface and latest user action serial" {
     var core: FakeCore = .{};
     var adapter = try testAdapter(&core);
     defer adapter.deinit();
@@ -3124,6 +3134,7 @@ test "seat: activation requires the exact focused surface and latest user action
     const seat = try adapter.seats.acquire();
     seat.peer = peer;
     seat.last_user_action_serial = 91;
+    seat.last_user_action_target = .{ .client = clientId(peer), .surface = surface };
     seat.resource = try server_objects.insertClient(2, &test_protocol.wl_seat.info, 9, seat);
     adapter.keyboard_focus = .{ .client = clientId(peer), .surface = surface };
 
@@ -3144,6 +3155,13 @@ test "seat: activation requires the exact focused surface and latest user action
         .{ .index = 0, .generation = 2 },
     ));
     adapter.keyboard_focus = null;
+    try std.testing.expect(!adapter.validateActivationOn(&server_objects, peer, 2, 91, surface));
+    adapter.pointer_focus = .{ .client = clientId(peer), .surface = surface };
+    try std.testing.expect(adapter.validateActivationOn(&server_objects, peer, 2, 91, surface));
+    adapter.pointer_focus = .{ .client = clientId(peer), .surface = .{ .index = 1, .generation = 1 } };
+    try std.testing.expect(!adapter.validateActivationOn(&server_objects, peer, 2, 91, surface));
+    adapter.pointer_focus = .{ .client = clientId(peer), .surface = surface };
+    seat.last_user_action_target = null;
     try std.testing.expect(!adapter.validateActivationOn(&server_objects, peer, 2, 91, surface));
 }
 
