@@ -929,8 +929,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         /// Validates an input serial against the exact wl_seat resource named
-        /// by an xdg_popup.grab request. Pointer-enter serials intentionally do
-        /// not qualify: only a delivered button press establishes this token.
+        /// by an xdg_popup.grab request. Delivered button and key presses
+        /// qualify; pointer-enter and release serials do not.
         pub fn validatePopupGrab(
             adapter: *Self,
             peer: wayring.io_uring.Peer,
@@ -1041,13 +1041,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             serial: u32,
         ) bool {
             if (serial == 0) return false;
-            const handle = server_objects.namespace.lookupHandle(seat_object) orelse return false;
-            const object = server_objects.namespace.resolve(handle) orelse return false;
-            if (object.interface != &Seat.info) return false;
-            const seat = adapter.seats.fromContext(object.context) orelse return false;
-            return std.meta.eql(seat.resource, handle) and
-                std.meta.eql(seat.peer, peer) and
-                seat.last_implicit_grab_serial == serial;
+            const seat = adapter.seatByObject(server_objects, peer, seat_object) orelse return false;
+            return seat.last_implicit_grab_serial == serial or seat.last_user_action_serial == serial;
         }
 
         pub fn setPointerFocus(adapter: *Self, target: ?FocusTarget, point: Point) !void {
@@ -3074,6 +3069,20 @@ test "seat: popup grabs require the exact seat and delivered press serial" {
     try std.testing.expect(adapter.validatePopupGrabOn(&server_objects, peer, 2, 81));
     try std.testing.expect(!adapter.validatePopupGrabOn(&server_objects, peer, 2, 82));
     try std.testing.expect(!adapter.validatePopupGrabOn(&server_objects, peer, 3, 81));
+    // A keyboard action must qualify without replacing the pointer-grab token.
+    seat.last_user_action_serial = 91;
+    other.last_user_action_serial = 92;
+    try std.testing.expect(adapter.validatePopupGrabOn(&server_objects, peer, 2, 91));
+    try std.testing.expect(adapter.validatePopupGrabOn(&server_objects, peer, 2, 81));
+    try std.testing.expect(!adapter.validatePopupGrabOn(&server_objects, peer, 2, 92));
+    try std.testing.expect(!adapter.validatePopupGrabOn(&server_objects, peer, 3, 91));
+    try std.testing.expect(!adapter.validatePopupGrabOn(&server_objects, peer, 2, 90));
+    try std.testing.expect(!adapter.validatePopupGrabOn(
+        &server_objects,
+        .{ .slot = peer.slot, .generation = peer.generation + 1 },
+        2,
+        91,
+    ));
     try std.testing.expect(!adapter.validatePopupGrabOn(
         &server_objects,
         .{ .slot = peer.slot, .generation = peer.generation + 1 },
@@ -3081,6 +3090,60 @@ test "seat: popup grabs require the exact seat and delivered press serial" {
         81,
     ));
     try std.testing.expect(!adapter.validatePopupGrabOn(&server_objects, peer, 2, 0));
+}
+
+test "seat: keyboard popup grabs reject focus, modifier, release and superseded serials" {
+    var core: FakeCore = .{};
+    var adapter = try testAdapter(&core);
+    defer adapter.deinit();
+    var server_objects = try wayring.objects.ServerObjects.init(std.testing.allocator, 8, 4, &TestCore.Display.info, null);
+    defer server_objects.deinit(std.testing.allocator);
+    const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 7 };
+    const seat = try adapter.seats.acquire();
+    seat.peer = peer;
+    seat.resource = try server_objects.insertClient(2, &test_protocol.wl_seat.info, 9, seat);
+    const keyboard = try adapter.keyboards.acquire();
+    keyboard.client = clientId(peer);
+    const device: input.DeviceId = .{ .slot = 0, .generation = 2, .seat_generation = 8 };
+    try adapter.consume(.{ .device_added = .{
+        .device = device,
+        .info = .{ .capabilities = .{ .keyboard = true } },
+    } });
+    clearTestOutbound(&adapter);
+    try adapter.setKeyboardFocus(try adapter.makeTarget(peer, .{ .index = 0, .generation = 1 }));
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .keyboard_enter));
+    for (adapter.outbound) |slot| if (slot.active) switch (slot.value) {
+        .keyboard_enter => |value| try std.testing.expect(!adapter.validatePopupGrabOn(&server_objects, peer, 2, value.serial)),
+        .keyboard_modifiers => |value| try std.testing.expect(!adapter.validatePopupGrabOn(&server_objects, peer, 2, value.serial)),
+        else => {},
+    };
+
+    var previous_press: u32 = 0;
+    for ([_]u32{ 30, key_left_shift }) |key| {
+        for ([_]bool{ true, false }) |pressed| {
+            clearTestOutbound(&adapter);
+            try adapter.consume(.{ .keyboard_key = .{
+                .device = device,
+                .time_usec = 1_000,
+                .key = key,
+                .pressed = pressed,
+            } });
+            try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .keyboard_key));
+            for (adapter.outbound) |slot| if (slot.active) switch (slot.value) {
+                .keyboard_key => |value| {
+                    try std.testing.expectEqual(pressed, adapter.validatePopupGrabOn(&server_objects, peer, 2, value.serial));
+                    if (pressed) {
+                        try std.testing.expect(!adapter.validatePopupGrabOn(&server_objects, peer, 2, previous_press));
+                        previous_press = value.serial;
+                    }
+                },
+                .keyboard_modifiers => |value| try std.testing.expect(!adapter.validatePopupGrabOn(&server_objects, peer, 2, value.serial)),
+                else => {},
+            };
+            // A release does not invalidate the press that opened the menu.
+            try std.testing.expect(adapter.validatePopupGrabOn(&server_objects, peer, 2, previous_press));
+        }
+    }
 }
 
 test "seat: clipboard selections require the exact seat and latest user action serial" {

@@ -4220,14 +4220,22 @@ fn layerPopupOutputLifecycle(power_cycle: bool, pointer_selected: bool) !void {
 }
 
 test "shell-input: grabbed layer popup receives keys instead of its exclusive bar and restores focus" {
-    try popupKeyboardFocus(false);
+    try popupKeyboardFocus(false, false);
 }
 
 test "shell-input: grabbed toplevel popup receives keys and restores focus on dismissal" {
-    try popupKeyboardFocus(true);
+    try popupKeyboardFocus(true, false);
 }
 
-fn popupKeyboardFocus(toplevel_root: bool) !void {
+test "shell-input: keyboard-opened layer popup receives keys and restores focus" {
+    try popupKeyboardFocus(false, true);
+}
+
+test "shell-input: keyboard-opened toplevel popup receives keys and restores focus" {
+    try popupKeyboardFocus(true, true);
+}
+
+fn popupKeyboardFocus(toplevel_root: bool, keyboard_open: bool) !void {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-popup-keyboard-{d}.sock", .{linux.getpid()});
@@ -4310,6 +4318,33 @@ fn popupKeyboardFocus(toplevel_root: bool) !void {
         try protocol.wl_surface.encodeRequest(handler.queue, parent, .{ .commit = .{} });
     }
     handler.popup_grab_serial = handler.button_serial;
+    if (keyboard_open) {
+        try submitLayerPopupClient(&reactor, &driver, &handler);
+        for (0..256) |_| {
+            _ = try drainLayerPopupClient(&reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (handler.keyboard_surface == parent) break;
+            _ = linux.sched_yield();
+        }
+        try std.testing.expectEqual(parent, handler.keyboard_surface.?);
+        for ([_]bool{ true, false }) |pressed| try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .keyboard_key = .{
+            .device = device,
+            .time_usec = 2_500,
+            .key = 28,
+            .pressed = pressed,
+        } }));
+        for (0..256) |_| {
+            _ = try drainLayerPopupClient(&reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (handler.keyboard_keys == 2) break;
+            _ = linux.sched_yield();
+        }
+        try std.testing.expectEqual(@as(usize, 2), handler.keyboard_keys);
+        try std.testing.expect(handler.key_press_serial != null);
+        try std.testing.expect(handler.key_press_serial.? != handler.button_serial.?);
+        handler.popup_grab_serial = handler.key_press_serial;
+        handler.keyboard_keys = 0;
+    }
     try handler.createPopup();
     try submitLayerPopupClient(&reactor, &driver, &handler);
     const popup = handler.popup_surface.?.id;
@@ -8108,6 +8143,7 @@ const LayerPopupHandler = struct {
     keyboard_leaves: usize = 0,
     keyboard_keys: usize = 0,
     key_surface: ?u32 = null,
+    key_press_serial: ?u32 = null,
     button_serial: ?u32 = null,
     defer_popup: bool = false,
     popup_grab_serial: ?u32 = null,
@@ -8207,9 +8243,11 @@ const LayerPopupHandler = struct {
                     self.keyboard_surface = null;
                     self.keyboard_leaves += 1;
                 },
-                .key => {
+                .key => |value| {
                     self.keyboard_keys += 1;
                     self.key_surface = self.keyboard_surface;
+                    if (value.state.value == protocol.wl_keyboard.key_state.pressed.value)
+                        self.key_press_serial = value.serial;
                 },
                 else => {},
             }
