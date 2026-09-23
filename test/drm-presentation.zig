@@ -5353,7 +5353,7 @@ pub fn coordinatorConfig() Coordinator.Config {
     return .{ .cursor_directory = "/dev/null", .router_capacity = 12, .timer_capacity = 6, .device_capacity = 1, .shm = .{ .limits = .{ .max_pool_bytes = 4096 }, .pool_capacity = 1, .buffer_capacity = 1, .formats = &shm_formats }, .surface = .{ .surface_capacity = 1, .region_capacity = 1, .viewport_capacity = 1, .presentation_resource_capacity = 1, .presentation_feedback_capacity = 2, .region_operation_capacity = 1, .frame_callback_capacity = 1, .release_callback_capacity = 1, .content_update_capacity = 1, .dependency_capacity = 1, .attachment_capacity = 1, .copy_capacity = 1, .max_copy_bytes = pixels.len }, .drm = .{ .card_capacity = 1, .connector_capacity = 3, .mode_capacity = 3, .connector_encoder_capacity = 3, .encoder_capacity = 3, .crtc_capacity = 3, .plane_capacity = 3, .format_capacity = 3, .event_capacity = 4 }, .output = .{ .output_id = .{ .index = 0, .generation = 1 }, .scheduler = .{ .refresh_ns = 4 * std.time.ns_per_ms, .render_budget_ns = std.time.ns_per_ms }, .renderer = .pixman, .image_count = 2, .max_samples = 2, .max_source_bytes = pixels.len, .max_source_width = 3, .max_source_height = 2, .kms = .{ .event_capacity = 2 } } };
 }
 pub fn compositorConfig() Compositor.Config {
-    return .{ .ring = .{ .entries = 32, .flags = 0 }, .reactor = clientReactorConfig(), .runtime = .{ .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .object_capacity = 32, .object_quota = 32, .buckets_per_client = 32, .max_globals = 64, .registry_capacity = 1 } };
+    return .{ .ring = .{ .entries = 32 }, .reactor = clientReactorConfig(), .runtime = .{ .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .object_capacity = 32, .object_quota = 32, .buckets_per_client = 32, .max_globals = 64, .registry_capacity = 1 } };
 }
 pub fn clientReactorConfig() wayring.io_uring.Config {
     return .{ .receive_buffer_size = 4096, .receive_buffer_count = 4, .receive_control_capacity = 256, .fragment_block_size = 256, .fragment_block_count = 4, .transmit_block_size = 512, .transmit_block_count = 8, .descriptor_count = 4, .send_descriptor_capacity = 2 };
@@ -5415,8 +5415,13 @@ fn waitReady(ring: *linux.IoUring) !void {
         .revents = 0,
     }};
     if (try std.posix.poll(&descriptors, 5_000) == 0) return error.CompletionTimeout;
-    if (descriptors[0].revents & (linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL) != 0 or
-        ring.cq_ready() == 0) return error.CompletionWaitFailed;
+    if (descriptors[0].revents & (linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL) != 0)
+        return error.CompletionWaitFailed;
+    // With IORING_SETUP_DEFER_TASKRUN the ring reports readable while the
+    // completion is still parked as task work; a non-blocking GETEVENTS enter
+    // from the issuing thread posts it to the CQ.
+    _ = try ring.enter(0, 0, linux.IORING_ENTER_GETEVENTS);
+    if (ring.cq_ready() == 0) return error.CompletionWaitFailed;
 }
 fn pauseReady(ring: *linux.IoUring) !void {
     if (ring.cq_ready() != 0) return;

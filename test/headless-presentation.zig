@@ -45,7 +45,7 @@ test "generated client presents ordinary SHM through the integrated headless run
 
     const listener = try wayring.unix_socket.listen(path, 1);
     const root = try Compositor.create(allocator, listener, .{
-        .ring = .{ .entries = 32, .flags = 0 },
+        .ring = .{ .entries = 32 },
         .reactor = .{
             .receive_buffer_size = 4096,
             .receive_buffer_count = 4,

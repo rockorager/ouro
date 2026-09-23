@@ -623,7 +623,10 @@ fn usage() void {
 
 fn compositorConfig() Compositor.Config {
     return .{
-        .ring = .{ .entries = 64, .flags = 0 },
+        // Multishot receive/accept/poll and per-output timers can post far
+        // more CQEs per turn than the 64 SQEs that armed them; the loop drains
+        // 32 per turn, so a deeper CQ absorbs bursts without overflow.
+        .ring = .{ .entries = 64, .cq_entries = 256 },
         .reactor = .{
             .receive_buffer_size = 8192,
             .receive_buffer_count = 8,

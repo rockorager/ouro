@@ -17,6 +17,16 @@ fn boundedCount(ready: u32, capacity: usize) usize {
     return @min(@as(usize, ready), capacity);
 }
 
+/// Reports completions the kernel holds outside the visible CQ: the overflow
+/// list, or task work parked by `IORING_SETUP_DEFER_TASKRUN` until this thread
+/// enters the ring with `IORING_ENTER_GETEVENTS`. A submit without that flag
+/// does not run deferred task work, so `cq_ready() == 0` alone cannot prove
+/// the ring is idle. `IoUring.cq_ring_needs_flush` only observes overflow.
+fn hiddenCompletionsPending(ring: *const linux.IoUring) bool {
+    const flags = @atomicLoad(u32, ring.sq.flags, .unordered);
+    return flags & (linux.IORING_SQ_CQ_OVERFLOW | linux.IORING_SQ_TASKRUN) != 0;
+}
+
 pub const Error = std.mem.Allocator.Error || error{InvalidConfig};
 
 pub const Config = struct {
@@ -290,12 +300,29 @@ pub fn Loop(comptime protocol: type) type {
             const copied = if (self.pending_wayring_count != 0)
                 0
             else copied: {
-                const ready = self.compositor.ring.cq_ready();
-                const count = boundedCount(ready, self.cqes.len);
+                const ring = &self.compositor.ring;
+                if (hiddenCompletionsPending(ring)) {
+                    // Non-blocking enter: runs deferred task work and flushes
+                    // the overflow list into the CQ without waiting. This runs
+                    // even when CQEs are already visible so a turn sees every
+                    // completed operation, as it did when task work ran on
+                    // every return to user space. Otherwise an inline
+                    // completion (multishot accept of a pending connection)
+                    // could be dispatched a turn ahead of a parked poll or
+                    // timer completion that the kernel finished first. The
+                    // previous turn's enter already carried GETEVENTS when
+                    // work was flagged, so this covers only completions that
+                    // landed between turns.
+                    _ = ring.enter(0, 0, linux.IORING_ENTER_GETEVENTS) catch |err| switch (err) {
+                        error.SignalInterrupt => {},
+                        else => return err,
+                    };
+                }
+                const count = boundedCount(ring.cq_ready(), self.cqes.len);
                 break :copied if (count == 0)
                     0
                 else
-                    try self.compositor.ring.copy_cqes(self.cqes[0..count], 0);
+                    try ring.copy_cqes(self.cqes[0..count], 0);
             };
 
             var wayring_count = self.pending_wayring_count;
@@ -489,10 +516,21 @@ pub fn Loop(comptime protocol: type) type {
                     error.SignalInterrupt => 0,
                     else => return err,
                 }
-            else if (self.compositor.ring.sq_ready() != 0)
-                try self.compositor.ring.submit()
-            else
-                0;
+            else submit: {
+                // Like liburing's io_uring_submit: when deferred task work or
+                // an overflow is flagged, ride GETEVENTS on the submit so the
+                // parked completions post now instead of costing the next
+                // turn a separate enter. `min_complete = 0` never blocks.
+                const ring = &self.compositor.ring;
+                const to_submit = ring.flush_sq();
+                const flush = hiddenCompletionsPending(ring);
+                if (to_submit == 0 and !flush) break :submit 0;
+                const flags: u32 = if (flush) linux.IORING_ENTER_GETEVENTS else 0;
+                break :submit ring.enter(to_submit, 0, flags) catch |err| switch (err) {
+                    error.SignalInterrupt => 0,
+                    else => return err,
+                };
+            };
             const progress: Progress = .{
                 .reaped = copied,
                 .wayring_completions = wayring_count,
@@ -505,6 +543,7 @@ pub fn Loop(comptime protocol: type) type {
                 .reload_requested = self.retained_reload_requested,
                 .settings_changed = self.retained_settings_changed,
                 .needs_more_work = self.compositor.ring.cq_ready() != 0 or
+                    hiddenCompletionsPending(&self.compositor.ring) or
                     self.pending_wayring_count != 0 or wayring_progress.pending or
                     bindings_work_pending or submission_work_pending or configuration_ready or control_pending,
             };
@@ -533,4 +572,37 @@ test "ready completions are clipped to the configured batch" {
     try std.testing.expectEqual(@as(usize, 3), boundedCount(8, 3));
     try std.testing.expectEqual(@as(usize, 2), boundedCount(2, 3));
     try std.testing.expectEqual(@as(usize, 0), boundedCount(0, 3));
+}
+
+test "deferred task work is visible before it reaches the completion queue" {
+    var ring = compositor.initRing(.{ .entries = 4 }) catch |err| switch (err) {
+        error.PermissionDenied, error.SystemOutdated => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ring.deinit();
+    if (ring.flags & linux.IORING_SETUP_DEFER_TASKRUN == 0) return error.SkipZigTest;
+
+    var fds: [2]linux.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
+    defer for (fds) |fd| {
+        _ = linux.close(fd);
+    };
+
+    _ = try ring.poll_add(0xdead, fds[0], linux.POLL.IN);
+    try std.testing.expectEqual(@as(u32, 1), try ring.submit());
+    try std.testing.expect(!hiddenCompletionsPending(&ring));
+
+    // The writer wakes the poll synchronously, but DEFER_TASKRUN parks the
+    // completion as task work rather than posting it, so a plain
+    // `submit()` or `cq_ready()` never observes it.
+    try std.testing.expectEqual(@as(usize, 1), linux.write(fds[1], "x", 1));
+    try std.testing.expectEqual(@as(u32, 0), ring.cq_ready());
+    try std.testing.expect(hiddenCompletionsPending(&ring));
+
+    _ = try ring.enter(0, 0, linux.IORING_ENTER_GETEVENTS);
+    try std.testing.expectEqual(@as(u32, 1), ring.cq_ready());
+    try std.testing.expect(!hiddenCompletionsPending(&ring));
+    var cqes: [1]Cqe = undefined;
+    try std.testing.expectEqual(@as(u32, 1), try ring.copy_cqes(&cqes, 0));
+    try std.testing.expectEqual(@as(u64, 0xdead), cqes[0].user_data);
 }
