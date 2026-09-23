@@ -217,6 +217,9 @@ const WaylandFixesHandler = struct {
             return .continue_dispatch;
         }
         if (target.object.interface != &ClientCore.Registry.info) return .continue_dispatch;
+        // The replacement registry reuses the destroyed one's ID and receives
+        // its own global listing; only the bound registry drives this handler.
+        if (message.header.object_id != self.registry.id) return .continue_dispatch;
         switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
             .global => |value| if (std.mem.eql(u8, value.interface, protocol.wl_fixes.info.name)) {
                 self.fixes_version = value.version;
