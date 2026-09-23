@@ -1,7 +1,7 @@
 #version 450
 
 layout(local_size_x = 8, local_size_y = 8) in;
-layout(set = 0, binding = 5, rgba32f) uniform writeonly image2D target_image;
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D target_image;
 layout(set = 0, binding = 8) uniform sampler2D source_image;
 
 layout(push_constant) uniform Blur {

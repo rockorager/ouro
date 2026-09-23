@@ -595,9 +595,12 @@ const RealRenderer = struct {
 };
 
 /// Linear-light working images hold premultiplied colour between composite
-/// batches and blur levels. The image qualifiers in
+/// batches and blur levels. Half floats keep 11 significant bits at every
+/// brightness, more than a 10-bit output shows after its transfer curve,
+/// at half the memory of RGBA32F; storage and sampled use of the format is
+/// mandatory in Vulkan 1.0. The `rgba16f` qualifiers in
 /// vulkan_texture_composite.comp and vulkan_backdrop_blur.comp must match.
-const linear_image_format = c.VK_FORMAT_R32G32B32A32_SFLOAT;
+const linear_image_format = c.VK_FORMAT_R16G16B16A16_SFLOAT;
 
 const LinearImage = struct {
     image: c.VkImage,
