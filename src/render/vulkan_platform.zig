@@ -527,8 +527,25 @@ const RealRenderer = struct {
     lut_capacity: usize,
     lut_hashes: [][32]u8,
     lut_count: usize,
+    /// Linear-light working image for frames that need more than one
+    /// composite batch or a blur. Every such frame starts it from
+    /// UNDEFINED, so nothing persists between frames and one image sized to
+    /// the largest target serves every target. Created on first use; most
+    /// desktops never need it.
+    linear_scratch: ?LinearImage,
+    /// 1×1 image bound at binding 5 until the scratch exists, because the
+    /// composite shader statically references it.
+    linear_placeholder: LinearImage,
     resource_epoch: u64,
     gpu_clock: GpuClock,
+};
+
+const LinearImage = struct {
+    image: c.VkImage,
+    memory: c.VkDeviceMemory,
+    view: c.VkImageView,
+    width: u32,
+    height: u32,
 };
 
 const GpuClock = struct {
@@ -1109,9 +1126,6 @@ const RealTarget = struct {
     image: c.VkImage,
     image_memory: c.VkDeviceMemory,
     view: c.VkImageView,
-    linear_image: c.VkImage,
-    linear_memory: c.VkDeviceMemory,
-    linear_view: c.VkImageView,
     blur_image: c.VkImage,
     blur_memory: c.VkDeviceMemory,
     blur_view: c.VkImageView,
@@ -1820,6 +1834,9 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         &self.content_placeholder_memory,
         &placeholder_map,
     );
+    errdefer destroyBuffer(self, self.content_placeholder_buffer, self.content_placeholder_memory);
+    self.linear_scratch = null;
+    self.linear_placeholder = try createLinearImage(self, 1, 1);
     return @ptrCast(self);
 }
 
@@ -1919,10 +1936,37 @@ fn contentSlotDescriptor(self: *const RealRenderer, slot: usize) c.VkDescriptorB
     };
 }
 
-/// Points a ready target's LUT and content descriptors at the current
-/// buffers. Descriptor writes are only legal while no submission using
-/// these sets is pending, and recorded command buffers consume descriptor
-/// contents at execution time, so the replayable recording is dropped.
+fn linearDescriptor(self: *const RealRenderer) c.VkDescriptorImageInfo {
+    const view = if (self.linear_scratch) |scratch| scratch.view else self.linear_placeholder.view;
+    return .{ .sampler = null, .imageView = view, .imageLayout = c.VK_IMAGE_LAYOUT_GENERAL };
+}
+
+/// Guarantees the shared linear scratch covers a target of the given size. Replacing a
+/// smaller scratch drains the device first because other targets' descriptor
+/// sets still name it; they rewrite on their next draw. Scratch growth only
+/// happens when a larger output first needs a multi-batch or blurred frame.
+fn ensureLinearScratch(self: *RealRenderer, target_width: u32, target_height: u32) !void {
+    var width = target_width;
+    var height = target_height;
+    if (self.linear_scratch) |scratch| {
+        if (scratch.width >= width and scratch.height >= height) return;
+        width = @max(width, scratch.width);
+        height = @max(height, scratch.height);
+    }
+    const scratch = try createLinearImage(self, width, height);
+    if (self.linear_scratch) |old| {
+        _ = c.vkDeviceWaitIdle(self.device);
+        destroyLinearImage(self, old);
+    }
+    self.linear_scratch = scratch;
+    bumpSharedDescriptorEpoch(self);
+}
+
+/// Points a ready target's LUT, content, and linear scratch descriptors at
+/// the current resources. Descriptor writes are only legal while no
+/// submission using these sets is pending, and recorded command buffers
+/// consume descriptor contents at execution time, so the replayable
+/// recording is dropped.
 fn refreshTargetSharedDescriptors(self: *RealRenderer, target: *RealTarget) !void {
     if (target.shared_descriptor_epoch == self.shared_descriptor_epoch) return;
     std.debug.assert(target.state == .ready);
@@ -1930,15 +1974,18 @@ fn refreshTargetSharedDescriptors(self: *RealRenderer, target: *RealTarget) !voi
     defer std.heap.c_allocator.free(infos);
     for (infos, 0..) |*info, slot| info.* = contentSlotDescriptor(self, slot);
     var lut_info = lutDescriptor(self);
+    var linear_info = linearDescriptor(self);
     for (target.descriptor_sets) |set| {
         var content_write = descriptorWrite(set, 6, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, null, &infos[0]);
         content_write.descriptorCount = @intCast(infos.len);
         const writes = [_]c.VkWriteDescriptorSet{
             descriptorWrite(set, 4, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, null, &lut_info),
+            descriptorWrite(set, 5, c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &linear_info, null),
             content_write,
         };
         c.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
     }
+    if (target.blur_image != null) updateBlurDescriptors(self, target);
     target.recorded_sampled_frame.valid = false;
     target.shared_descriptor_epoch = self.shared_descriptor_epoch;
 }
@@ -1965,6 +2012,8 @@ fn realDestroy(_: *anyopaque, renderer: Renderer) void {
     for (self.content_backings[0..self.content_backing_count]) |backing|
         destroyBuffer(self, backing.buffer, backing.memory);
     destroyBuffer(self, self.content_placeholder_buffer, self.content_placeholder_memory);
+    if (self.linear_scratch) |scratch| destroyLinearImage(self, scratch);
+    destroyLinearImage(self, self.linear_placeholder);
     std.heap.c_allocator.free(self.content_backings);
     std.heap.c_allocator.free(self.content_slot_backings);
     std.heap.c_allocator.free(self.content_allocations);
@@ -2118,6 +2167,46 @@ test "render-vulkan: real LUT buffer doubles on demand and carries cached LUTs" 
         for (lut.rgba, texels[slot * icc.texel_count ..][0..icc.texel_count]) |expected, actual|
             try std.testing.expectEqual([4]f32{ expected[0], expected[1], expected[2], expected[3] }, actual);
     }
+}
+
+test "render-vulkan: real linear scratch is created on demand and grows to cover every target" {
+    var context: u8 = 0;
+    const opened = try openTestRenderer(&context, .{
+        .max_samples = 1,
+        .max_color_luts = 1,
+        .max_source_bytes = 4096,
+        .max_targets = 2,
+        .content_bytes = 4096,
+    });
+    defer _ = linux.close(opened.fd);
+    defer realDestroy(&context, opened.renderer);
+    const self: *RealRenderer = @ptrCast(@alignCast(opened.renderer));
+    // Opening a renderer binds only the 1×1 placeholder.
+    try std.testing.expect(self.linear_scratch == null);
+    try std.testing.expectEqual(self.linear_placeholder.view, linearDescriptor(self).imageView);
+    const initial_epoch = self.shared_descriptor_epoch;
+
+    try ensureLinearScratch(self, 64, 48);
+    const first = self.linear_scratch.?;
+    try std.testing.expectEqual(@as(u32, 64), first.width);
+    try std.testing.expectEqual(@as(u32, 48), first.height);
+    try std.testing.expectEqual(first.view, linearDescriptor(self).imageView);
+    try std.testing.expect(self.shared_descriptor_epoch != initial_epoch);
+    const first_epoch = self.shared_descriptor_epoch;
+
+    // A target the scratch already covers reuses it without a rewrite.
+    try ensureLinearScratch(self, 32, 48);
+    try std.testing.expectEqual(first.image, self.linear_scratch.?.image);
+    try std.testing.expectEqual(first_epoch, self.shared_descriptor_epoch);
+
+    // A taller but narrower target grows the scratch to the union of both
+    // extents, so the first target still fits.
+    try ensureLinearScratch(self, 40, 96);
+    const second = self.linear_scratch.?;
+    try std.testing.expectEqual(@as(u32, 64), second.width);
+    try std.testing.expectEqual(@as(u32, 96), second.height);
+    try std.testing.expect(second.image != first.image);
+    try std.testing.expect(self.shared_descriptor_epoch != first_epoch);
 }
 
 fn realPacksSources(_: *anyopaque, renderer: Renderer) bool {
@@ -3123,15 +3212,6 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
     };
     try vk(c.vkCreateImageView(self.device, &view_info, null, &target.view), error.CreateTargetViewFailed);
     errdefer c.vkDestroyImageView(self.device, target.view, null);
-    try createLinearImage(
-        self,
-        metadata.width,
-        metadata.height,
-        &target.linear_image,
-        &target.linear_memory,
-        &target.linear_view,
-    );
-    errdefer destroyLinearImage(self, target);
     target.blur_image = null;
     target.blur_memory = null;
     target.blur_view = null;
@@ -3223,7 +3303,6 @@ fn realDestroyTarget(_: *anyopaque, renderer: Renderer, target_value: Target) vo
     c.vkDestroyImage(self.device, target.image, null);
     c.vkFreeMemory(self.device, target.image_memory, null);
     if (target.blur_image != null) destroyBlurImage(self, target);
-    destroyLinearImage(self, target);
     std.heap.c_allocator.free(target.retired_textures);
     std.heap.c_allocator.free(target.content_leases);
     std.heap.c_allocator.free(target.native_leases);
@@ -3466,7 +3545,7 @@ fn growTargetBatches(self: *RealRenderer, target: *RealTarget, count: usize) !vo
     var set_info: c.VkDescriptorSetAllocateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .pNext = null, .descriptorPool = pool, .descriptorSetCount = @intCast(count), .pSetLayouts = layouts.ptr };
     try vk(c.vkAllocateDescriptorSets(self.device, &set_info, sets.ptr), error.AllocateDescriptorSetFailed);
     var image_descriptor: c.VkDescriptorImageInfo = .{ .sampler = null, .imageView = target.view, .imageLayout = c.VK_IMAGE_LAYOUT_GENERAL };
-    var linear_descriptor: c.VkDescriptorImageInfo = .{ .sampler = null, .imageView = target.linear_view, .imageLayout = c.VK_IMAGE_LAYOUT_GENERAL };
+    var linear_descriptor = linearDescriptor(self);
     var source_descriptor: c.VkDescriptorBufferInfo = .{ .buffer = target.source_buffer, .offset = 0, .range = @min(target.source_buffer_size, self.max_source_bytes) };
     var lut_descriptor = lutDescriptor(self);
     const content_descriptors = try allocator.alloc(c.VkDescriptorBufferInfo, self.content_slot_backings.len);
@@ -4266,13 +4345,13 @@ fn recordSampledPass(
         c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &target.descriptor_sets[0], 0, null);
         for (frame.render_damage) |damage|
             recordSampledDispatch(self, target, frame, damage, intermediate_bit, 0);
-        recordSampledBarrier(target);
+        recordSampledBarrier(self, target);
 
         for (0..pass_batch_count) |batch_index| {
             const partition = batchAt(sample_count, self.max_samples, batch_index);
             c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &target.descriptor_sets[batch_index], 0, null);
             recordSampledPartition(self, target, frame, partition);
-            recordSampledBarrier(target);
+            recordSampledBarrier(self, target);
         }
 
         c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &target.descriptor_sets[0], 0, null);
@@ -4364,7 +4443,7 @@ fn recordBackdropEffectPass(
 
         frame.render_damage = stage.input.items;
         recordSampledRange(self, target, frame, segment_start, index, true);
-        recordSampledBarrier(target);
+        recordSampledBarrier(self, target);
         recordBlurRegions(self, target, frame, index, stage);
         segment_start = index;
     }
@@ -4925,7 +5004,7 @@ fn rectFromEdges(left: i64, top: i64, right: i64, bottom: i64) ?render.Rect {
     };
 }
 
-fn recordSampledBarrier(target: *RealTarget) void {
+fn recordSampledBarrier(self: *const RealRenderer, target: *RealTarget) void {
     var between: c.VkImageMemoryBarrier = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .pNext = null,
@@ -4935,13 +5014,13 @@ fn recordSampledBarrier(target: *RealTarget) void {
         .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
         .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
-        .image = target.linear_image,
+        .image = self.linear_scratch.?.image,
         .subresourceRange = colorRange(),
     };
     c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &between);
 }
 
-fn recordRestartSampledPass(target: *RealTarget, uses_linear_image: bool) void {
+fn recordRestartSampledPass(self: *const RealRenderer, target: *RealTarget, uses_linear_image: bool) void {
     recordResumeAfterCapture(target);
     if (!uses_linear_image) return;
     var barrier: c.VkImageMemoryBarrier = .{
@@ -4953,7 +5032,7 @@ fn recordRestartSampledPass(target: *RealTarget, uses_linear_image: bool) void {
         .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
         .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
-        .image = target.linear_image,
+        .image = self.linear_scratch.?.image,
         .subresourceRange = colorRange(),
     };
     c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &barrier);
@@ -4975,6 +5054,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     const has_blur = try frameHasVisibleBlur(frame);
     if (has_blur and frame.samples.len > self.max_samples) return error.CapacityExceeded;
     const batch_count = try ensureSampledFrameCapacity(self, target, frame.samples.len);
+    if (has_blur or frame.samples.len > self.max_samples) try ensureLinearScratch(self, target.width, target.height);
     if (has_blur) try ensureBlurImage(self, target);
     try refreshTargetSharedDescriptors(self, target);
     const batch = try prepareTextures(self, frame, self.staging_buffer_size);
@@ -5372,16 +5452,19 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
             var linear_barrier: c.VkImageMemoryBarrier = .{
                 .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
                 .pNext = null,
-                .srcAccessMask = 0,
+                // The scratch is shared, so another target's frame may still
+                // be reading or writing it: wait for that compute work
+                // before this frame discards the contents.
+                .srcAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
                 .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
                 .oldLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
                 .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
                 .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
-                .image = target.linear_image,
+                .image = self.linear_scratch.?.image,
                 .subresourceRange = colorRange(),
             };
-            c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &linear_barrier);
+            c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &linear_barrier);
         }
         if (has_blur) {
             var blur_barrier: c.VkImageMemoryBarrier = .{
@@ -5411,7 +5494,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
                 try recordSampledPass(self, target, frame, frame.cursor_start);
             recordCapture(self, target, frame, .before_cursor);
             if (frame.cursor_start != frame.samples.len) {
-                recordRestartSampledPass(target, uses_linear_image);
+                recordRestartSampledPass(self, target, uses_linear_image);
                 if (has_blur)
                     try recordBackdropEffectPass(self, target, frame, frame.samples.len)
                 else
@@ -6172,14 +6255,10 @@ fn destroyBuffer(self: *RealRenderer, buffer: c.VkBuffer, memory: c.VkDeviceMemo
     c.vkFreeMemory(self.device, memory, null);
 }
 
-fn createLinearImage(
-    self: *RealRenderer,
-    width: u32,
-    height: u32,
-    image: *c.VkImage,
-    memory: *c.VkDeviceMemory,
-    view: *c.VkImageView,
-) !void {
+fn createLinearImage(self: *RealRenderer, width: u32, height: u32) !LinearImage {
+    var image: c.VkImage = undefined;
+    var memory: c.VkDeviceMemory = undefined;
+    var view: c.VkImageView = undefined;
     var image_info: c.VkImageCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = null,
@@ -6197,24 +6276,24 @@ fn createLinearImage(
         .pQueueFamilyIndices = null,
         .initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
     };
-    try vk(c.vkCreateImage(self.device, &image_info, null, image), error.CreateLinearImageFailed);
-    errdefer c.vkDestroyImage(self.device, image.*, null);
+    try vk(c.vkCreateImage(self.device, &image_info, null, &image), error.CreateLinearImageFailed);
+    errdefer c.vkDestroyImage(self.device, image, null);
     var requirements: c.VkMemoryRequirements = undefined;
-    c.vkGetImageMemoryRequirements(self.device, image.*, &requirements);
+    c.vkGetImageMemoryRequirements(self.device, image, &requirements);
     var allocation: c.VkMemoryAllocateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .pNext = null,
         .allocationSize = requirements.size,
         .memoryTypeIndex = try memoryType(self, requirements.memoryTypeBits, c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
     };
-    try vk(c.vkAllocateMemory(self.device, &allocation, null, memory), error.AllocateLinearImageMemoryFailed);
-    errdefer c.vkFreeMemory(self.device, memory.*, null);
-    try vk(c.vkBindImageMemory(self.device, image.*, memory.*, 0), error.BindLinearImageMemoryFailed);
+    try vk(c.vkAllocateMemory(self.device, &allocation, null, &memory), error.AllocateLinearImageMemoryFailed);
+    errdefer c.vkFreeMemory(self.device, memory, null);
+    try vk(c.vkBindImageMemory(self.device, image, memory, 0), error.BindLinearImageMemoryFailed);
     var view_info: c.VkImageViewCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .pNext = null,
         .flags = 0,
-        .image = image.*,
+        .image = image,
         .viewType = c.VK_IMAGE_VIEW_TYPE_2D,
         .format = c.VK_FORMAT_R32G32B32A32_SFLOAT,
         .components = .{
@@ -6225,13 +6304,14 @@ fn createLinearImage(
         },
         .subresourceRange = colorRange(),
     };
-    try vk(c.vkCreateImageView(self.device, &view_info, null, view), error.CreateLinearImageViewFailed);
+    try vk(c.vkCreateImageView(self.device, &view_info, null, &view), error.CreateLinearImageViewFailed);
+    return .{ .image = image, .memory = memory, .view = view, .width = width, .height = height };
 }
 
-fn destroyLinearImage(self: *RealRenderer, target: *RealTarget) void {
-    c.vkDestroyImageView(self.device, target.linear_view, null);
-    c.vkDestroyImage(self.device, target.linear_image, null);
-    c.vkFreeMemory(self.device, target.linear_memory, null);
+fn destroyLinearImage(self: *RealRenderer, linear: LinearImage) void {
+    c.vkDestroyImageView(self.device, linear.view, null);
+    c.vkDestroyImage(self.device, linear.image, null);
+    c.vkFreeMemory(self.device, linear.memory, null);
 }
 
 fn ensureBlurImage(self: *RealRenderer, target: *RealTarget) !void {
@@ -6241,24 +6321,10 @@ fn ensureBlurImage(self: *RealRenderer, target: *RealTarget) !void {
     const size = render.Size{ .width = target.width, .height = target.height };
     const half = blur.levelSize(size, 1);
     const quarter = blur.levelSize(size, 2);
-    var image: c.VkImage = undefined;
-    var memory: c.VkDeviceMemory = undefined;
-    var view: c.VkImageView = undefined;
-    try createLinearImage(self, half.width, half.height, &image, &memory, &view);
-    errdefer {
-        c.vkDestroyImageView(self.device, view, null);
-        c.vkDestroyImage(self.device, image, null);
-        c.vkFreeMemory(self.device, memory, null);
-    }
-    var small_image: c.VkImage = undefined;
-    var small_memory: c.VkDeviceMemory = undefined;
-    var small_view: c.VkImageView = undefined;
-    try createLinearImage(self, quarter.width, quarter.height, &small_image, &small_memory, &small_view);
-    errdefer {
-        c.vkDestroyImageView(self.device, small_view, null);
-        c.vkDestroyImage(self.device, small_image, null);
-        c.vkFreeMemory(self.device, small_memory, null);
-    }
+    const half_image = try createLinearImage(self, half.width, half.height);
+    errdefer destroyLinearImage(self, half_image);
+    const quarter_image = try createLinearImage(self, quarter.width, quarter.height);
+    errdefer destroyLinearImage(self, quarter_image);
     const sizes = [_]c.VkDescriptorPoolSize{
         .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 4 * 3 },
         .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = @intCast(4 * (5 + self.content_slot_backings.len)) },
@@ -6285,12 +6351,12 @@ fn ensureBlurImage(self: *RealRenderer, target: *RealTarget) !void {
     };
     var sets: [4]c.VkDescriptorSet = undefined;
     try vk(c.vkAllocateDescriptorSets(self.device, &allocation, &sets), error.AllocateDescriptorSetFailed);
-    target.blur_image = image;
-    target.blur_memory = memory;
-    target.blur_view = view;
-    target.blur_small_image = small_image;
-    target.blur_small_memory = small_memory;
-    target.blur_small_view = small_view;
+    target.blur_image = half_image.image;
+    target.blur_memory = half_image.memory;
+    target.blur_view = half_image.view;
+    target.blur_small_image = quarter_image.image;
+    target.blur_small_memory = quarter_image.memory;
+    target.blur_small_view = quarter_image.view;
     target.blur_descriptor_pool = pool;
     target.blur_descriptor_sets = sets;
     target.blur_initialized_layout = false;
@@ -6299,8 +6365,11 @@ fn ensureBlurImage(self: *RealRenderer, target: *RealTarget) !void {
 
 fn updateBlurDescriptors(self: *RealRenderer, target: *RealTarget) void {
     std.debug.assert(target.blur_image != null);
-    const sources = [_]c.VkImageView{ target.linear_view, target.blur_view, target.blur_small_view, target.blur_view };
-    const destinations = [_]c.VkImageView{ target.blur_view, target.blur_small_view, target.blur_view, target.linear_view };
+    // Blur is only recorded after ensureLinearScratch, so the scratch view is
+    // in place here; the placeholder merely keeps the sets valid before.
+    const linear_view = linearDescriptor(self).imageView;
+    const sources = [_]c.VkImageView{ linear_view, target.blur_view, target.blur_small_view, target.blur_view };
+    const destinations = [_]c.VkImageView{ target.blur_view, target.blur_small_view, target.blur_view, linear_view };
     for (target.blur_descriptor_sets, sources, destinations) |set, source, destination| {
         var storage = c.VkDescriptorImageInfo{ .sampler = null, .imageView = destination, .imageLayout = c.VK_IMAGE_LAYOUT_GENERAL };
         var sampled = c.VkDescriptorImageInfo{ .sampler = self.blur_sampler.?, .imageView = source, .imageLayout = c.VK_IMAGE_LAYOUT_GENERAL };
