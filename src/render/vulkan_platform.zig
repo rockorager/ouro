@@ -260,10 +260,11 @@ const UploadAllocation = struct {
 /// it geometrically up to the configured maximum.
 const initial_staging_bytes: usize = 256 * 1024;
 
-/// Preferred content slot size. Larger slots reduce descriptor count; the
-/// renderer raises the shift when the device's storage-buffer descriptor
-/// limit cannot hold one descriptor per slot.
-const content_chunk_shift_default: u6 = 26;
+/// Preferred content slot size (16 MiB). Smaller slots track what clients
+/// actually keep alive more closely; larger slots reduce descriptor count.
+/// The renderer raises the shift when the device's storage-buffer
+/// descriptor limit cannot hold one descriptor per slot.
+const content_chunk_shift_default: u6 = 24;
 
 /// One committed run of content slots. Host-visible memory is committed only
 /// when an allocation first lands in a slot, so the retained-content arena

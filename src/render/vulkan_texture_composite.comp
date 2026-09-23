@@ -36,7 +36,7 @@ layout(std430, set = 0, binding = 4) readonly buffer ColorLuts { vec4 lut_texels
 // dynamically uniform and the offset within that slot may exceed the slot
 // size only inside a multi-slot backing.
 layout(constant_id = 1) const uint content_chunk_count = 1u;
-layout(constant_id = 2) const uint content_chunk_shift = 26u;
+layout(constant_id = 2) const uint content_chunk_shift = 24u;
 layout(std430, set = 0, binding = 6) readonly buffer Contents { uint content_words[]; } contents[content_chunk_count];
 
 layout(push_constant) uniform Frame {
