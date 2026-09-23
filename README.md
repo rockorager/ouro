@@ -327,6 +327,7 @@ authorization**. Existing socket paths are never unlinked on startup.
 | `run` | `{"argv": ["application", "argument"]}` |
 | `call` | `{"address": "unix:/absolute/path", "method": "tool-name", "arguments": {}}` |
 | `get-state`, `get-memory`, `reload-config` | `{}` |
+| `set-performance-recorder` | `{"enabled": true}` |
 
 Controls use the same typed dispatch as keybindings at a turn boundary. Their
 success result means **accepted**, not that a client has repainted, closed, or
@@ -339,8 +340,11 @@ and native textures, per-output staging, the shared linear scratch and blur
 images, LUTs, and imported client dmabufs (counted in pixels, since
 clients own that memory). Compare it with the process's `/proc/<pid>/fdinfo`
 to see what the kernel attributes to Ouro beyond the compositor's own
-allocations. `reload-config` requests an asynchronous file reload; it returns a
-tool error in settings mode, where updates already arrive automatically.
+allocations. `set-performance-recorder` enables or disables the bounded
+performance flight recorder described under Diagnostics; it is off by default
+and disabling it keeps any pending incident report. `reload-config` requests an
+asynchronous file reload; it returns a tool error in settings mode, where
+updates already arrive automatically.
 Structured tool results also include the identical serialized JSON in a text
 content block, so content-only MCP hosts can read state and acknowledgments.
 Invalid names/arguments return JSON-RPC errors; execution failures return MCP
@@ -800,8 +804,11 @@ is shared: an event-read diagnostic identifies the reader, not necessarily the
 display whose event was in the batch. These diagnostics do not log keyboard
 events, protocol payloads, or framebuffer contents.
 
-The `ouro` executable automatically records performance incidents, without
-`WAYLAND_DEBUG` or `--trace-pacing`. Look for `perf-incident`, `perf-summary`,
+With the recorder enabled (`set-performance-recorder {"enabled": true}` over
+MCP), the `ouro` executable records performance incidents without
+`WAYLAND_DEBUG` or `--trace-pacing`. It is off by default because each recorded
+stage reads the monotonic and thread-CPU clocks on the compositor thread; when
+enabled but idle it costs no wakeups. Look for `perf-incident`, `perf-summary`,
 `perf-worst`, and `perf-context` in the compositor's stderr/session log:
 
 ```sh
@@ -1100,7 +1107,7 @@ descheduling, or a particular wait cause. Similar elapsed and CPU time suggests
 execution, not necessarily useful work. Clock reads and synchronous trace
 logging add overhead, included in these intervals; blocking on the log itself
 can contribute. Disabling verbose tracing avoids its synchronous logging; the
-automatic bounded performance recorder remains active. Neither diagnostic
+bounded performance recorder stays as the MCP tool left it. Neither diagnostic
 changes the scheduling/rendering policy.
 
 Queueing is not socket transmission or client receipt. These server timestamps

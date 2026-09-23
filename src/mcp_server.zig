@@ -631,7 +631,7 @@ test "MCP server production catalog is one complete newline-delimited frame" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, reply, .{});
     defer parsed.deinit();
     const tools = field(field(parsed.value, "result"), "tools").array.items;
-    try std.testing.expectEqual(control.actions.len + 3, tools.len);
+    try std.testing.expectEqual(control.actions.len + 4, tools.len);
     try std.testing.expectEqualStrings("reload-config", field(tools[tools.len - 1], "name").string);
 }
 

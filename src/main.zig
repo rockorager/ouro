@@ -90,9 +90,9 @@ pub fn main(init: std.process.Init) !void {
     // inherit the blocked mask so TERM/INT/HUP are delivered through signalfd.
     var shutdown_signals = try ouro.shutdown_signal.Watcher.install();
     defer shutdown_signals.deinit();
+    // Off until the set-performance-recorder tool enables it: every recorded
+    // stage costs clock reads on the compositor thread.
     var performance: ouro.diagnostics.Recorder = .{};
-    // Diagnostics must not prevent a graphical session from starting.
-    performance.start() catch |err| std.log.warn("performance recorder unavailable: {t}", .{err});
     defer performance.stop();
     const config_store: ouro.config.Store = .{
         .allocator = allocator,
@@ -285,7 +285,6 @@ pub fn main(init: std.process.Init) !void {
         root.deinit() catch {};
         return err;
     };
-    if (performance.thread != null) coordinator.performance = &performance;
     coordinator.installConfig(
         &initial.engine,
         &initial.bindings,
@@ -411,7 +410,7 @@ pub fn main(init: std.process.Init) !void {
                 else
                     &small_response;
                 var response = std.Io.Writer.fixed(response_storage);
-                const stopped = executeControl(arena.allocator(), command, coordinator, &systemd_session, &launcher, &mcp, settings == null, &control_reload, &response) catch |err| failed: {
+                const stopped = executeControl(arena.allocator(), command, coordinator, &systemd_session, &launcher, &mcp, &performance, settings == null, &control_reload, &response) catch |err| failed: {
                     response = std.Io.Writer.fixed(response_storage);
                     try response.print("{{\"resultType\":\"complete\",\"content\":[{{\"type\":\"text\",\"text\":{f}}}],\"isError\":true}}", .{std.json.fmt(@errorName(err), .{})});
                     break :failed false;
@@ -515,6 +514,7 @@ fn executeControl(
     systemd_session: *SystemdSession,
     launcher: *const ouro.launcher.Systemd,
     mcp: *ouro.mcp_client.Client,
+    performance: *ouro.diagnostics.Recorder,
     file_config: bool,
     reload: *bool,
     writer: *std.Io.Writer,
@@ -537,6 +537,16 @@ fn executeControl(
             var state = std.Io.Writer.fixed(&state_storage);
             try device.writeMemoryReport(&state);
             try ouro.control.writeStateResult(writer, state.buffered());
+            return false;
+        },
+        .set_performance_recorder => |enabled| {
+            if (enabled) {
+                // The reporting thread starts once and then parks for free
+                // while idle or detached, so disabling never joins it here.
+                if (performance.thread == null) try performance.start();
+                coordinator.performance = performance;
+            } else coordinator.performance = null;
+            try writer.writeAll(ouro.control.accepted);
             return false;
         },
         .reload_config => {

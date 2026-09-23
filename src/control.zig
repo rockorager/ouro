@@ -42,6 +42,7 @@ comptime {
 }
 
 const empty_schema = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+const enabled_schema = "{\"type\":\"object\",\"properties\":{\"enabled\":{\"type\":\"boolean\"}},\"required\":[\"enabled\"],\"additionalProperties\":false}";
 const accepted_schema = "{\"type\":\"object\",\"properties\":{\"accepted\":{\"type\":\"boolean\"}},\"required\":[\"accepted\"],\"additionalProperties\":false}";
 pub const accepted = "{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"{\\\"accepted\\\":true}\"}],\"structuredContent\":{\"accepted\":true},\"isError\":false}";
 
@@ -90,6 +91,11 @@ fn writeTools(writer: *std.Io.Writer) !void {
         \\,"outputSchema":{"type":"object","required":["renderer","content_store"],"properties":{"renderer":{"type":["string","null"]},"content_store":{"type":"object"},"vulkan":{"type":["object","null"]}}}},
     );
     try writer.writeAll(
+        \\{"name":"set-performance-recorder","description":"Enable or disable the bounded performance flight recorder that logs perf-incident records for slow compositor work. Off by default: every recorded stage costs clock reads on the compositor thread. Disabling detaches the recorder without discarding a pending report.","inputSchema":
+    );
+    try writer.writeAll(enabled_schema);
+    try writer.print(",\"outputSchema\":{s}}},", .{accepted_schema});
+    try writer.writeAll(
         \\{"name":"reload-config","description":"Request a reload of --config files. In ourosettings mode settings update automatically and this tool returns an error.","inputSchema":
     );
     try writer.writeAll(empty_schema);
@@ -103,7 +109,7 @@ pub fn writeDescriptor(writer: *std.Io.Writer) !void {
     try writer.writeByte('}');
 }
 
-pub const Command = union(enum) { action: config.Action, get_state, get_memory, reload_config };
+pub const Command = union(enum) { action: config.Action, get_state, get_memory, set_performance_recorder: bool, reload_config };
 
 /// Returned variable-length action data belongs to the caller's arena.
 pub fn decode(allocator: std.mem.Allocator, name: []const u8, arguments: std.json.Value) !Command {
@@ -117,6 +123,11 @@ pub fn decode(allocator: std.mem.Allocator, name: []const u8, arguments: std.jso
         if (arguments.object.count() != 0) return error.InvalidArguments;
         return entry.command;
     };
+    if (std.mem.eql(u8, name, "set-performance-recorder")) {
+        const enabled = arguments.object.get("enabled") orelse return error.InvalidArguments;
+        if (arguments.object.count() != 1 or enabled != .bool) return error.InvalidArguments;
+        return .{ .set_performance_recorder = enabled.bool };
+    }
     const declaration = for (actions) |action| {
         if (std.mem.eql(u8, name, action.name)) break action;
     } else return error.UnknownTool;
@@ -245,11 +256,21 @@ test "MCP control catalog shares declarations and validates asymmetric arguments
     try writeCatalog(&out.writer);
     const catalog = try std.json.parseFromSlice(std.json.Value, a, out.written(), .{});
     const tools = catalog.value.object.get("tools").?.array.items;
-    try std.testing.expectEqual(actions.len + 3, tools.len);
+    try std.testing.expectEqual(actions.len + 4, tools.len);
     try std.testing.expectEqualStrings("get-state", tools[actions.len].object.get("name").?.string);
     try std.testing.expectEqualStrings("get-memory", tools[actions.len + 1].object.get("name").?.string);
-    try std.testing.expectEqualStrings("reload-config", tools[actions.len + 2].object.get("name").?.string);
+    try std.testing.expectEqualStrings("set-performance-recorder", tools[actions.len + 2].object.get("name").?.string);
+    try std.testing.expectEqualStrings("reload-config", tools[actions.len + 3].object.get("name").?.string);
     try std.testing.expectEqual(Command.get_memory, try decode(a, "get-memory", .{ .object = .empty }));
+    for ([_]bool{ true, false }) |enabled| {
+        const source = if (enabled) "{\"enabled\":true}" else "{\"enabled\":false}";
+        const args = try std.json.parseFromSlice(std.json.Value, a, source, .{});
+        try std.testing.expectEqual(Command{ .set_performance_recorder = enabled }, try decode(a, "set-performance-recorder", args.value));
+    }
+    for ([_][]const u8{ "{}", "{\"enabled\":1}", "{\"enabled\":\"true\"}", "{\"enabled\":true,\"extra\":true}" }) |source| {
+        const args = try std.json.parseFromSlice(std.json.Value, a, source, .{});
+        try std.testing.expectError(error.InvalidArguments, decode(a, "set-performance-recorder", args.value));
+    }
     for (actions, tools[0..actions.len]) |action, tool| {
         try std.testing.expectEqualStrings(action.name, tool.object.get("name").?.string);
         const source = switch (action.action) {
