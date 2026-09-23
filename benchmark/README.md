@@ -83,7 +83,8 @@ window and may exceed 100. A DRM client closed before the gate loses its time
 and marks the row `(incomplete)`. `GPU resident MiB` reads `drm-resident-*`, or
 the older `drm-memory-*`, at the gate; this is the GPU-side allocation that RSS
 excludes. Drivers without `drm-engine-*` keys report GPU as unavailable rather
-than zero.
+than zero, except amdgpu, which omits the line for an engine the client has
+never used; there a DRM client with no engine lines is reported as zero.
 
 RAPL is system-wide, not per-process: it includes the benchmark clients, the
 display pipeline, and everything else on the host. Rows are comparable only

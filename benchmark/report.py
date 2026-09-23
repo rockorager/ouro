@@ -97,6 +97,9 @@ def parse_fdinfo(path: Path) -> dict[str, dict[str, Any]]:
                 if key.startswith(prefix):
                     number, _, unit = value.partition(" ")
                     scale = {"KiB": 1, "MiB": 1024, "GiB": 1024 * 1024}.get(unit)
+                    if scale is None and unit == "" and int(number) == 0:
+                        # amdgpu prints zero-sized regions without a unit.
+                        scale = 1
                     if scale is None:
                         raise ValueError(f"{path}: unexpected memory unit in {key}: {value}")
                     memory.setdefault(prefix.strip("-").removeprefix("drm-"), {})[
@@ -111,6 +114,13 @@ def parse_fdinfo(path: Path) -> dict[str, dict[str, Any]]:
     return clients
 
 
+# Drivers that print a drm-engine-* line only once the client has used that
+# engine. For these, a DRM client with no engine lines is a client that did no
+# GPU work, not a driver without accounting. Every other driver is treated as
+# unavailable when no engine line is present.
+ENGINE_ELIDING_DRIVERS = frozenset({"amdgpu"})
+
+
 def gpu_delta(pre_path: Path, gate_path: Path, window_ns: int | None) -> dict[str, Any] | None:
     """Engine time consumed between the two snapshots, summed over DRM clients.
 
@@ -122,7 +132,11 @@ def gpu_delta(pre_path: Path, gate_path: Path, window_ns: int | None) -> dict[st
         return None
     pre = parse_fdinfo(pre_path)
     gate = parse_fdinfo(gate_path)
-    if not any(client["engines"] for client in gate.values()):
+    if not gate:
+        return None
+    if not any(client["engines"] for client in gate.values()) and not all(
+        client["driver"] in ENGINE_ELIDING_DRIVERS for client in gate.values()
+    ):
         return None
     engine_ns: dict[str, int] = {}
     for identity, client in gate.items():
