@@ -335,8 +335,8 @@ IDs (index and generation), titles, app IDs, logical state/workspace membership,
 published geometry, output IDs/bounds/work areas, and active or occupied
 workspaces. `get-memory` returns the renderer's device memory by purpose:
 committed retained-content slots and the versions still alive in them, cached
-and native textures, per-output staging and blur images, the shared linear
-scratch image, LUTs, and imported client dmabufs (counted in pixels, since
+and native textures, per-output staging, the shared linear scratch and blur
+images, LUTs, and imported client dmabufs (counted in pixels, since
 clients own that memory). Compare it with the process's `/proc/<pid>/fdinfo`
 to see what the kernel attributes to Ouro beyond the compositor's own
 allocations. `reload-config` requests an asynchronous file reload; it returns a

@@ -83,7 +83,7 @@ fn writeTools(writer: *std.Io.Writer) !void {
         \\,"outputSchema":{"type":"object","required":["windows","outputs","workspaces","focused"],"properties":{"windows":{"type":"array"},"outputs":{"type":"array"},"workspaces":{"type":"array"},"focused":{"type":["object","null"]}}}},
     );
     try writer.writeAll(
-        \\{"name":"get-memory","description":"Read the renderer's device memory by purpose: retained shm content, cached textures, per-output staging and blur images, the linear scratch image, LUTs, and imported client dmabufs. Byte counts cover only compositor-owned allocations.","inputSchema":
+        \\{"name":"get-memory","description":"Read the renderer's device memory by purpose: retained shm content, cached textures, per-output staging, the shared linear scratch and blur images, LUTs, and imported client dmabufs. Byte counts cover only compositor-owned allocations.","inputSchema":
     );
     try writer.writeAll(empty_schema);
     try writer.writeAll(

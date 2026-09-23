@@ -10,8 +10,9 @@ layout(push_constant) uniform Blur {
     uvec4 filter_info; // upsample, offset bits, unused, unused
 } frame;
 
-// FP32 linear texture filtering is optional. Keep all four premultiplied
-// linear-light channels at full precision without requiring that feature.
+// Manual bilinear filtering clamps to the logical level size in `sizes`,
+// not the backing image, because the levels are shared and may be larger
+// than this target's pyramid.
 vec4 sampled(vec2 position) {
     ivec2 base = ivec2(floor(position));
     ivec2 limit = ivec2(frame.sizes.xy) - 1;
