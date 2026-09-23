@@ -3647,11 +3647,11 @@ fn fullscreenLayer(overlay: bool) !void {
 }
 
 test "shell-input: secondary output removal closes its reactive layer popup root" {
-    try layerPopupOutputLifecycle(false, false);
+    try layerPopupOutputLifecycle(.session, false);
 }
 
 test "shell-input: unspecified layer output follows the pointer across scaled outputs" {
-    try layerPopupOutputLifecycle(false, true);
+    try layerPopupOutputLifecycle(.session, true);
 }
 
 test "shell-input: positive exclusive-zone bars stack in adapter order" {
@@ -3864,10 +3864,14 @@ fn runLayerStacking(destroy: bool) !void {
 }
 
 test "shell-input: powered off outputs retain client commits and resume after pointer input" {
-    try layerPopupOutputLifecycle(true, false);
+    try layerPopupOutputLifecycle(.power, false);
 }
 
-fn layerPopupOutputLifecycle(power_cycle: bool, pointer_selected: bool) !void {
+test "shell-input: layer commits survive last-output unplug and reconnect" {
+    try layerPopupOutputLifecycle(.hotplug, false);
+}
+
+fn layerPopupOutputLifecycle(cycle: enum { power, session, hotplug }, pointer_selected: bool) !void {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-layer-popup-{d}.sock", .{linux.getpid()});
@@ -3970,7 +3974,7 @@ fn layerPopupOutputLifecycle(power_cycle: bool, pointer_selected: bool) !void {
         .minimum_outputs = 2,
         .unspecified_output = pointer_selected,
         .reactive = true,
-        .test_output_power = power_cycle,
+        .test_output_power = cycle == .power,
         .layer_height = 1,
         .fractional_scale = true,
         // Model Vulkan clients which cannot allocate their first buffer until
@@ -4045,7 +4049,7 @@ fn layerPopupOutputLifecycle(power_cycle: bool, pointer_selected: bool) !void {
     );
     try std.testing.expectEqual(@as(usize, 1), popups.len);
 
-    if (power_cycle) {
+    if (cycle == .power) {
         const work_area_before_power_off = coordinator.desktop.workArea();
         for (handler.powers) |power| try protocol.zwlr_output_power_v1.encodeRequest(
             &actor.transmit,
@@ -4132,6 +4136,63 @@ fn layerPopupOutputLifecycle(power_cycle: bool, pointer_selected: bool) !void {
             off_commit.presentation,
             coordinator.physical_outputs[1].kms_output.?.sample_storage[0].presentation,
         );
+    } else if (cycle == .hotplug) {
+        // Promote the output owning the bar before unplugging the last display.
+        fixture.first_desktop = false;
+        try fixture.signalHotplug();
+        for (0..512) |_| {
+            client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (!coordinator.physical_outputs[0].connected and
+                !coordinator.physical_outputs[0].removing) break;
+            try waitForEither(&root.ring, client_reactor.ring);
+        }
+        try std.testing.expect(!coordinator.physical_outputs[0].connected);
+        try std.testing.expectEqual(layer_state.output, coordinator.output_adapter.primaryOutput());
+        const retained_work_area = coordinator.desktop.workArea();
+        fixture.second_desktop = false;
+        try fixture.signalHotplug();
+        for (0..512) |_| {
+            client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (coordinator.topology_refresh_pending and
+                coordinator.physical_outputs[1].kms_output == null) break;
+            try waitForEither(&root.ring, client_reactor.ring);
+        }
+        try std.testing.expect(coordinator.topology_refresh_pending);
+        try std.testing.expect(coordinator.physical_outputs[1].kms_output == null);
+        const applied_before = coordinator.stats.applied;
+        const submitted_before = coordinator.stats.submitted;
+        try handler.commitPopup();
+        try handler.mapSurface(0, handler.layer_wl_surface.?);
+        for (0..512) |_| {
+            client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (coordinator.stats.applied == applied_before + 2) break;
+            try waitForEither(&root.ring, client_reactor.ring);
+        }
+        try std.testing.expectEqual(applied_before + 2, coordinator.stats.applied);
+        try std.testing.expectEqual(submitted_before, coordinator.stats.submitted);
+        try std.testing.expectEqual(retained_work_area, coordinator.desktop.workArea());
+        try std.testing.expectEqual(@as(usize, 0), handler.layer_closed);
+
+        fixture.second_desktop = true;
+        try fixture.signalHotplug();
+        const presented_before = coordinator.stats.presented;
+        for (0..512) |_| {
+            client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (!coordinator.topology_refresh_pending and
+                coordinator.stats.presented > presented_before and handler.releases == 3) break;
+            try waitForEither(&root.ring, client_reactor.ring);
+        }
+        try std.testing.expect(!coordinator.topology_refresh_pending);
+        try std.testing.expect(coordinator.physical_outputs[1].kms_output != null);
+        try std.testing.expect(coordinator.stats.presented > presented_before);
+        try std.testing.expectEqual(@as(usize, 3), handler.releases);
+        try std.testing.expectEqual(layer_state.output, coordinator.output_adapter.primaryOutput());
+        try std.testing.expectEqual(@as(usize, 0), handler.layer_closed);
+        try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
     } else {
         try fixture.signalSession(.disable);
         for (0..512) |_| {

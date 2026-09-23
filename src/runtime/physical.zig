@@ -523,6 +523,9 @@ pub fn Coordinator(comptime protocol: type) type {
             id: PhysicalOutputId,
             connected: bool = true,
             desired_enabled: bool = true,
+            // Published geometry survives temporary KMS drains (hotplug and VT
+            // switches) so client commits do not depend on scanout availability.
+            layout_initialized: bool = false,
             // DPMS suspends scanout, not the logical display used by clients.
             power_suspended: bool = false,
             repaint_available: bool = false,
@@ -557,7 +560,8 @@ pub fn Coordinator(comptime protocol: type) type {
 
             fn hasLayout(self: *const PhysicalOutput) bool {
                 return self.kms_output != null or
-                    (self.connected and !self.removing and self.power_suspended);
+                    (self.layout_initialized and self.connected and !self.removing and
+                        (self.desired_enabled or self.power_suspended));
             }
         };
         const Presentations = presentation.Queue(Imported);
@@ -4586,13 +4590,19 @@ pub fn Coordinator(comptime protocol: type) type {
                     var stale: ?ForeignToplevelListAdapter.OutputId = null;
                     for (try self.foreign_toplevel_list_adapter.outputs(entry.protocol_id)) |published_output| {
                         const physical = self.physicalOutputForForeignId(published_output);
-                        if (physical == null or try clipToOutput(
-                            destination,
-                            self.outputBoundsFor(physical.?) catch {
-                                stale = published_output;
-                                break;
-                            },
-                        ) == null) {
+                        // Retained layout is not a live output association.
+                        // Keep the existing DPMS exception, but leave outputs
+                        // drained for session switches or topology replacement.
+                        if (physical == null or
+                            (physical.?.kms_output == null and !physical.?.power_suspended) or
+                            try clipToOutput(
+                                destination,
+                                self.outputBoundsFor(physical.?) catch {
+                                    stale = published_output;
+                                    break;
+                                },
+                            ) == null)
+                        {
                             stale = published_output;
                             break;
                         }
@@ -8680,6 +8690,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     physical.management_head,
                     head_state,
                 );
+                physical.layout_initialized = true;
                 try self.recomputeLayerConfigures();
                 try self.recomputeSessionLockConfigures();
                 self.markProtocolAll(ProtocolReady.output | ProtocolReady.xdg_output |
@@ -8786,6 +8797,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 physical.management_head,
                 state,
             );
+            physical.layout_initialized = true;
         }
 
         fn publishOutputLayout(self: *Self) !void {
