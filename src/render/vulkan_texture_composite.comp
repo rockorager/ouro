@@ -30,7 +30,14 @@ layout(std430, set = 0, binding = 1) readonly buffer Samples { Sample items[]; }
 layout(constant_id = 0) const uint source_descriptor_count = 32u;
 layout(set = 0, binding = 3) uniform sampler2D source_images[source_descriptor_count];
 layout(std430, set = 0, binding = 4) readonly buffer ColorLuts { vec4 lut_texels[]; };
-layout(std430, set = 0, binding = 6) readonly buffer Contents { uint content_words[]; };
+// Retained client content lives in one virtual byte range backed by slots of
+// 2^content_chunk_shift bytes, each committed on demand. A sample never
+// starts in one backing and continues in another, so its slot index is
+// dynamically uniform and the offset within that slot may exceed the slot
+// size only inside a multi-slot backing.
+layout(constant_id = 1) const uint content_chunk_count = 1u;
+layout(constant_id = 2) const uint content_chunk_shift = 26u;
+layout(std430, set = 0, binding = 6) readonly buffer Contents { uint content_words[]; } contents[content_chunk_count];
 
 layout(push_constant) uniform Frame {
     uvec4 clear_color;  // straight alpha, red, green, blue
@@ -121,11 +128,13 @@ vec4 raw_pixel(Sample item, uint index, ivec2 coordinate) {
         return texelFetch(source_images[index], coordinate, 0);
     uint byte_offset = item.source.x + uint(coordinate.y) * item.source.w +
         uint(coordinate.x) * shm_pixel_bytes(item.attributes.x);
-    uint word = byte_offset >> 2u;
+    uint chunk = item.source.x >> content_chunk_shift;
+    uint word = (byte_offset - (chunk << content_chunk_shift)) >> 2u;
     if (item.attributes.x == 12u)
-        return uintBitsToFloat(uvec4(content_words[word], content_words[word + 1u], content_words[word + 2u], content_words[word + 3u]));
-    uint high = shm_pixel_bytes(item.attributes.x) == 8u ? content_words[word + 1u] : 0u;
-    return unpack_shm(content_words[word], high, item.attributes.x);
+        return uintBitsToFloat(uvec4(contents[chunk].content_words[word], contents[chunk].content_words[word + 1u],
+                                     contents[chunk].content_words[word + 2u], contents[chunk].content_words[word + 3u]));
+    uint high = shm_pixel_bytes(item.attributes.x) == 8u ? contents[chunk].content_words[word + 1u] : 0u;
+    return unpack_shm(contents[chunk].content_words[word], high, item.attributes.x);
 }
 
 vec4 decode_pixel(Sample item, vec4 value) {

@@ -256,6 +256,146 @@ const UploadAllocation = struct {
     references: usize = 0,
 };
 
+/// Per-target staging buffer size at creation. Frames that stage more grow
+/// it geometrically up to the configured maximum.
+const initial_staging_bytes: usize = 256 * 1024;
+
+/// Preferred content slot size. Larger slots reduce descriptor count; the
+/// renderer raises the shift when the device's storage-buffer descriptor
+/// limit cannot hold one descriptor per slot.
+const content_chunk_shift_default: u6 = 26;
+
+/// One committed run of content slots. Host-visible memory is committed only
+/// when an allocation first lands in a slot, so the retained-content arena
+/// costs what clients actually keep alive rather than its configured cap.
+/// Backings are never released while the renderer lives: their buffers stay
+/// referenced by every target's descriptor sets.
+const ContentBacking = struct {
+    first_slot: u32,
+    slot_count: u32,
+    size: usize,
+    buffer: c.VkBuffer = null,
+    memory: c.VkDeviceMemory = null,
+    map: ?[*]u8 = null,
+
+    fn endSlot(self: ContentBacking) usize {
+        return @as(usize, self.first_slot) + self.slot_count;
+    }
+};
+
+const ContentPlacement = struct {
+    offset: usize,
+    /// Slots to commit before the allocation exists, or null when an existing
+    /// backing already covers the whole allocation.
+    commit: ?struct { first_slot: u32, slot_count: u32 },
+};
+
+/// First-fit placement in the virtual content range. An allocation must lie
+/// inside one backing and within `max_range` bytes of its first slot's start,
+/// because the shader indexes the backing by the sample's first slot and
+/// reads through that slot's descriptor range. Gaps that would straddle a
+/// backing boundary are skipped, never split.
+fn placeContent(
+    allocations: []const UploadAllocation,
+    slot_backings: []const ?u32,
+    backings: []const ContentBacking,
+    size: usize,
+    alignment: usize,
+    capacity: usize,
+    chunk_shift: u6,
+    max_range: usize,
+) !ContentPlacement {
+    std.debug.assert(size != 0 and size <= max_range);
+    var offset: usize = 0;
+    while (true) {
+        offset = std.mem.alignForward(usize, offset, alignment);
+        const end = std.math.add(usize, offset, size) catch
+            return error.ContentByteCapacityExceeded;
+        if (end > capacity) return error.ContentByteCapacityExceeded;
+        var conflict_end: ?usize = null;
+        for (allocations) |allocation| {
+            if (!allocation.active) continue;
+            const allocation_end = allocation.offset + allocation.size;
+            if (offset < allocation_end and end > allocation.offset)
+                conflict_end = @max(conflict_end orelse 0, allocation_end);
+        }
+        if (conflict_end) |next| {
+            offset = next;
+            continue;
+        }
+        const first = offset >> chunk_shift;
+        const last = (end - 1) >> chunk_shift;
+        const slot_start = first << chunk_shift;
+        if (offset - slot_start + size > max_range) {
+            offset = (first + 1) << chunk_shift;
+            continue;
+        }
+        if (slot_backings[first]) |index| {
+            const backing = backings[index];
+            if (last < backing.endSlot()) return .{ .offset = offset, .commit = null };
+            offset = backing.endSlot() << chunk_shift;
+            continue;
+        }
+        const occupied = for (first + 1..last + 1) |slot| {
+            if (slot_backings[slot]) |index| break index;
+        } else null;
+        if (occupied) |index| {
+            offset = backings[index].endSlot() << chunk_shift;
+            continue;
+        }
+        return .{
+            .offset = offset,
+            .commit = .{ .first_slot = @intCast(first), .slot_count = @intCast(last - first + 1) },
+        };
+    }
+}
+
+test "render-vulkan: content placement commits slots lazily and never straddles a backing" {
+    const shift: u6 = 10; // 1 KiB slots
+    var allocations = [_]UploadAllocation{.{}} ** 4;
+    var slot_backings = [_]?u32{null} ** 8;
+    var backings = [_]ContentBacking{undefined} ** 8;
+    const capacity: usize = 8 << shift;
+    // The first allocation commits exactly the slots it covers, starting at 0.
+    const first = try placeContent(&allocations, &slot_backings, &backings, 1500, 16, capacity, shift, 1 << 20);
+    try std.testing.expectEqual(@as(usize, 0), first.offset);
+    try std.testing.expectEqual(@as(u32, 0), first.commit.?.first_slot);
+    try std.testing.expectEqual(@as(u32, 2), first.commit.?.slot_count);
+    backings[0] = .{ .first_slot = 0, .slot_count = 2, .size = 2 << shift };
+    slot_backings[0] = 0;
+    slot_backings[1] = 0;
+    allocations[0] = .{ .active = true, .generation = 1, .offset = 0, .size = 1500, .references = 1 };
+    // 548 bytes remain in backing 0. A 500-byte allocation reuses them without
+    // committing; a 600-byte allocation would straddle out of the backing and
+    // must start a fresh backing at the next slot instead of splitting.
+    const fits = try placeContent(&allocations, &slot_backings, &backings, 500, 16, capacity, shift, 1 << 20);
+    try std.testing.expectEqual(@as(usize, 1504), fits.offset);
+    try std.testing.expect(fits.commit == null);
+    const straddles = try placeContent(&allocations, &slot_backings, &backings, 600, 16, capacity, shift, 1 << 20);
+    try std.testing.expectEqual(@as(usize, 2 << shift), straddles.offset);
+    try std.testing.expectEqual(@as(u32, 2), straddles.commit.?.first_slot);
+    try std.testing.expectEqual(@as(u32, 1), straddles.commit.?.slot_count);
+    // The same 500 bytes would fit backing 0, but reading them through slot
+    // 1's descriptor needs 980 bytes of range. A 900-byte limit moves the
+    // allocation to a fresh slot instead of reading past the descriptor.
+    const ranged = try placeContent(&allocations, &slot_backings, &backings, 500, 16, capacity, shift, 900);
+    try std.testing.expectEqual(@as(usize, 2 << shift), ranged.offset);
+    try std.testing.expectEqual(@as(u32, 2), ranged.commit.?.first_slot);
+    // Committed slots elsewhere bound a new backing: slots 2..3 are free but
+    // slot 4 is taken, so a 3-slot allocation must begin after slot 4.
+    backings[1] = .{ .first_slot = 4, .slot_count = 1, .size = 1 << shift };
+    slot_backings[4] = 1;
+    const skips = try placeContent(&allocations, &slot_backings, &backings, 2100, 16, capacity, shift, 1 << 20);
+    try std.testing.expectEqual(@as(usize, 5 << shift), skips.offset);
+    try std.testing.expectEqual(@as(u32, 5), skips.commit.?.first_slot);
+    try std.testing.expectEqual(@as(u32, 3), skips.commit.?.slot_count);
+    // Virtual capacity still bounds the total, committed or not.
+    try std.testing.expectError(
+        error.ContentByteCapacityExceeded,
+        placeContent(&allocations, &slot_backings, &backings, 3500, 16, capacity, shift, 1 << 20),
+    );
+}
+
 const NativeAllocation = struct {
     active: bool = false,
     generation: u32 = 0,
@@ -355,11 +495,22 @@ const RealRenderer = struct {
     max_source_bytes: usize,
     copy_offset_alignment: usize,
     staging_buffer_size: usize,
-    content_buffer: c.VkBuffer,
-    content_memory: c.VkDeviceMemory,
-    content_map: *anyopaque,
-    content_memory_type: u32,
+    max_storage_range: usize,
+    /// Virtual content range; `content_slot_backings.len` slots of
+    /// `1 << content_chunk_shift` bytes cover it.
     content_buffer_size: usize,
+    content_chunk_shift: u6,
+    content_slot_backings: []?u32,
+    content_backings: []ContentBacking,
+    content_backing_count: usize,
+    /// Incremented per committed backing. Targets rewrite their content
+    /// descriptors when their recorded epoch falls behind.
+    content_epoch: u64,
+    /// Valid, never-read storage buffer bound to uncommitted slots. It also
+    /// fixes the memory type reported for content allocations.
+    content_placeholder_buffer: c.VkBuffer,
+    content_placeholder_memory: c.VkDeviceMemory,
+    content_memory_type: u32,
     content_allocations: []UploadAllocation,
     native_allocations: []NativeAllocation,
     imported_images: []ImportedImage,
@@ -1003,6 +1154,10 @@ const RealTarget = struct {
     captured: Captures = .{},
     capture_encoding: CaptureEncoding = .desktop_gamma22,
     recorded_sampled_frame: RecordedSampledFrame = .{},
+    /// `RealRenderer.content_epoch` the binding-6 descriptors were written
+    /// for; a lagging value means newly committed content backings are not
+    /// yet visible to this target's shaders.
+    content_epoch: u64 = 0,
     gpu_trace: GpuTrace,
 };
 
@@ -1252,9 +1407,51 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         physical_properties.limits.maxPerStageDescriptorStorageImages < 3 or
         physical_properties.limits.maxDescriptorSetStorageImages < 3)
         return error.InvalidConfig;
+    self.max_storage_range = @intCast(physical_properties.limits.maxStorageBufferRange);
+    self.copy_offset_alignment = @max(
+        @as(usize, @intCast(physical_properties.limits.optimalBufferCopyOffsetAlignment)),
+        16, // Includes the internal RGBA32F single-pixel source.
+    );
+    self.staging_buffer_size = std.math.add(
+        usize,
+        config.max_source_bytes,
+        std.math.mul(
+            usize,
+            std.math.mul(
+                usize,
+                config.max_samples,
+                render.upload_damage_rect_capacity,
+            ) catch return error.InvalidConfig,
+            self.copy_offset_alignment - 1,
+        ) catch return error.InvalidConfig,
+    ) catch return error.InvalidConfig;
+    self.content_buffer_size = std.math.add(
+        usize,
+        config.content_bytes,
+        std.math.mul(
+            usize,
+            config.content_allocations,
+            self.copy_offset_alignment - 1,
+        ) catch return error.InvalidConfig,
+    ) catch return error.InvalidConfig;
+    // Bindings 1, 2, 4, 10, and 11 are single storage buffers; binding 6
+    // holds one descriptor per content slot. Prefer the default slot size and
+    // coarsen only when the device cannot address that many descriptors.
+    const storage_buffer_limit: usize = @min(
+        physical_properties.limits.maxPerStageDescriptorStorageBuffers,
+        physical_properties.limits.maxDescriptorSetStorageBuffers,
+    );
+    self.content_chunk_shift = content_chunk_shift_default;
+    while (contentSlotCount(self.content_buffer_size, self.content_chunk_shift) + 5 > storage_buffer_limit) {
+        if (self.content_chunk_shift == @bitSizeOf(usize) - 1) return error.InvalidConfig;
+        self.content_chunk_shift += 1;
+    }
+    const content_slot_count = contentSlotCount(self.content_buffer_size, self.content_chunk_shift);
+    if (content_slot_count > std.math.maxInt(u32)) return error.InvalidConfig;
     self.sampled_enabled = config.max_samples <= sampled_image_capacity and
         sampled_descriptor_count <= std.math.maxInt(u32) and
         physical_features.shaderSampledImageArrayDynamicIndexing == c.VK_TRUE and
+        physical_features.shaderStorageBufferArrayDynamicIndexing == c.VK_TRUE and
         physical_properties.limits.maxPerStageDescriptorSampledImages >= self.sampled_descriptors + 2 and
         physical_properties.limits.maxDescriptorSetSampledImages >= self.sampled_descriptors + 2 and
         physical_properties.limits.maxPerStageDescriptorSamplers >= self.sampled_descriptors + 2 and
@@ -1277,6 +1474,7 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         c.VK_TRUE
     else
         c.VK_FALSE;
+    enabled_features.shaderStorageBufferArrayDynamicIndexing = enabled_features.shaderSampledImageArrayDynamicIndexing;
     enabled_features.shaderStorageImageWriteWithoutFormat =
         physical_features.shaderStorageImageWriteWithoutFormat;
     var device_info: c.VkDeviceCreateInfo = .{
@@ -1306,7 +1504,13 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         descriptorBinding(2, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
         descriptorBinding(4, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
         descriptorBinding(5, c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
-        descriptorBinding(6, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
+        .{
+            .binding = 6,
+            .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = @intCast(content_slot_count),
+            .stageFlags = c.VK_SHADER_STAGE_COMPUTE_BIT,
+            .pImmutableSamplers = null,
+        },
         descriptorBinding(10, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
         descriptorBinding(11, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
         .{
@@ -1372,12 +1576,21 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         c.vkDestroyPipeline(self.device, pipeline, null);
     errdefer if (self.blur_pipeline) |pipeline|
         c.vkDestroyPipeline(self.device, pipeline, null);
-    const descriptor_constant = c.VkSpecializationMapEntry{ .constantID = 0, .offset = 0, .size = @sizeOf(u32) };
+    const specialization_data = [_]u32{
+        self.sampled_descriptors,
+        @intCast(content_slot_count),
+        self.content_chunk_shift,
+    };
+    const specialization_constants = [_]c.VkSpecializationMapEntry{
+        .{ .constantID = 0, .offset = 0, .size = @sizeOf(u32) },
+        .{ .constantID = 1, .offset = @sizeOf(u32), .size = @sizeOf(u32) },
+        .{ .constantID = 2, .offset = 2 * @sizeOf(u32), .size = @sizeOf(u32) },
+    };
     const specialization = c.VkSpecializationInfo{
-        .mapEntryCount = 1,
-        .pMapEntries = &descriptor_constant,
-        .dataSize = @sizeOf(u32),
-        .pData = &self.sampled_descriptors,
+        .mapEntryCount = specialization_constants.len,
+        .pMapEntries = &specialization_constants,
+        .dataSize = @sizeOf(@TypeOf(specialization_data)),
+        .pData = &specialization_data,
     };
     if (self.sampled_enabled) {
         const sampled_shader_bytes align(@alignOf(u32)) = @embedFile("vulkan_texture_composite.spv").*;
@@ -1558,32 +1771,6 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         @alignOf(Sample),
     );
     self.max_source_bytes = config.max_source_bytes;
-    self.copy_offset_alignment = @max(
-        @as(usize, @intCast(physical_properties.limits.optimalBufferCopyOffsetAlignment)),
-        16, // Includes the internal RGBA32F single-pixel source.
-    );
-    self.staging_buffer_size = std.math.add(
-        usize,
-        config.max_source_bytes,
-        std.math.mul(
-            usize,
-            std.math.mul(
-                usize,
-                config.max_samples,
-                render.upload_damage_rect_capacity,
-            ) catch return error.InvalidConfig,
-            self.copy_offset_alignment - 1,
-        ) catch return error.InvalidConfig,
-    ) catch return error.InvalidConfig;
-    self.content_buffer_size = std.math.add(
-        usize,
-        config.content_bytes,
-        std.math.mul(
-            usize,
-            config.content_allocations,
-            self.copy_offset_alignment - 1,
-        ) catch return error.InvalidConfig,
-    ) catch return error.InvalidConfig;
     self.content_allocations = try allocator.alloc(UploadAllocation, config.content_allocations);
     @memset(self.content_allocations, .{});
     errdefer allocator.free(self.content_allocations);
@@ -1605,17 +1792,109 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     self.resource_epoch = 1;
     _ = try createHostBuffer(self, lut_buffer_size, 0, &self.lut_buffer, &self.lut_memory, &self.lut_map);
     errdefer destroyBuffer(self, self.lut_buffer, self.lut_memory);
-    // Partial copy-on-write commits read the whole predecessor on the CPU.
-    // Prefer cached backing without relaxing host visibility or coherency.
+    self.content_slot_backings = try allocator.alloc(?u32, content_slot_count);
+    @memset(self.content_slot_backings, null);
+    errdefer allocator.free(self.content_slot_backings);
+    self.content_backings = try allocator.alloc(ContentBacking, content_slot_count);
+    errdefer allocator.free(self.content_backings);
+    self.content_backing_count = 0;
+    self.content_epoch = 1;
+    // Content memory is committed per slot on first use. The placeholder
+    // keeps every binding-6 descriptor valid and selects the memory type
+    // content backings will use: cached when available, because partial
+    // copy-on-write commits read the whole predecessor on the CPU, without
+    // relaxing host visibility or coherency.
+    var placeholder_map: *anyopaque = undefined;
     self.content_memory_type = try createHostBuffer(
         self,
-        self.content_buffer_size,
-        c.VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-        &self.content_buffer,
-        &self.content_memory,
-        &self.content_map,
+        self.copy_offset_alignment,
+        content_memory_preference,
+        &self.content_placeholder_buffer,
+        &self.content_placeholder_memory,
+        &placeholder_map,
     );
     return @ptrCast(self);
+}
+
+const content_memory_preference: c.VkMemoryPropertyFlags = c.VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+fn contentSlotCount(capacity: usize, chunk_shift: u6) usize {
+    return std.math.divCeil(usize, capacity, @as(usize, 1) << chunk_shift) catch unreachable;
+}
+
+/// Commits host-visible memory for `slot_count` consecutive uncommitted
+/// slots. The final slot may be shorter than a full slot when the virtual
+/// range does not divide evenly.
+fn commitContentBacking(self: *RealRenderer, first_slot: u32, slot_count: u32) !u32 {
+    std.debug.assert(slot_count != 0);
+    std.debug.assert(self.content_backing_count < self.content_backings.len);
+    for (self.content_slot_backings[first_slot..][0..slot_count]) |backing|
+        std.debug.assert(backing == null);
+    const start = @as(usize, first_slot) << self.content_chunk_shift;
+    const end = @min(
+        self.content_buffer_size,
+        (@as(usize, first_slot) + slot_count) << self.content_chunk_shift,
+    );
+    var backing: ContentBacking = .{ .first_slot = first_slot, .slot_count = slot_count, .size = end - start };
+    var map: *anyopaque = undefined;
+    _ = try createHostBuffer(self, backing.size, content_memory_preference, &backing.buffer, &backing.memory, &map);
+    backing.map = @ptrCast(map);
+    const index: u32 = @intCast(self.content_backing_count);
+    self.content_backings[index] = backing;
+    self.content_backing_count += 1;
+    @memset(self.content_slot_backings[first_slot..][0..slot_count], index);
+    self.content_epoch +%= 1;
+    if (self.content_epoch == 0) self.content_epoch = 1;
+    return index;
+}
+
+const ContentLocation = struct { buffer: c.VkBuffer, offset: usize };
+
+/// Resolves a virtual content offset to its committed buffer. Valid only for
+/// offsets inside an active allocation, whose backing is committed.
+fn contentLocation(self: *const RealRenderer, offset: usize) ContentLocation {
+    const backing = self.content_backings[self.content_slot_backings[offset >> self.content_chunk_shift].?];
+    return .{
+        .buffer = backing.buffer,
+        .offset = offset - (@as(usize, backing.first_slot) << self.content_chunk_shift),
+    };
+}
+
+/// Descriptor for one content slot. Slots inside a multi-slot backing expose
+/// the rest of that backing, clamped to the device's storage range, so a
+/// sample whose first slot this is can read past the slot boundary.
+fn contentSlotDescriptor(self: *const RealRenderer, slot: usize) c.VkDescriptorBufferInfo {
+    const index = self.content_slot_backings[slot] orelse return .{
+        .buffer = self.content_placeholder_buffer,
+        .offset = 0,
+        .range = c.VK_WHOLE_SIZE,
+    };
+    const backing = self.content_backings[index];
+    const offset = (slot - backing.first_slot) << self.content_chunk_shift;
+    return .{
+        .buffer = backing.buffer,
+        .offset = offset,
+        .range = @min(backing.size - offset, self.max_storage_range),
+    };
+}
+
+/// Points every content descriptor of a ready target at the current
+/// backings. Descriptor writes are only legal while no submission using
+/// these sets is pending, and recorded command buffers consume descriptor
+/// contents at execution time, so the replayable recording is dropped.
+fn refreshTargetContentDescriptors(self: *RealRenderer, target: *RealTarget) !void {
+    if (target.content_epoch == self.content_epoch) return;
+    std.debug.assert(target.state == .ready);
+    const infos = try std.heap.c_allocator.alloc(c.VkDescriptorBufferInfo, self.content_slot_backings.len);
+    defer std.heap.c_allocator.free(infos);
+    for (infos, 0..) |*info, slot| info.* = contentSlotDescriptor(self, slot);
+    for (target.descriptor_sets) |set| {
+        var write = descriptorWrite(set, 6, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, null, &infos[0]);
+        write.descriptorCount = @intCast(infos.len);
+        c.vkUpdateDescriptorSets(self.device, 1, &write, 0, null);
+    }
+    target.recorded_sampled_frame.valid = false;
+    target.content_epoch = self.content_epoch;
 }
 
 fn realDestroy(_: *anyopaque, renderer: Renderer) void {
@@ -1637,7 +1916,11 @@ fn realDestroy(_: *anyopaque, renderer: Renderer) void {
     std.heap.c_allocator.free(self.pending_acquires);
     destroyBuffer(self, self.lut_buffer, self.lut_memory);
     std.heap.c_allocator.free(self.lut_hashes);
-    destroyBuffer(self, self.content_buffer, self.content_memory);
+    for (self.content_backings[0..self.content_backing_count]) |backing|
+        destroyBuffer(self, backing.buffer, backing.memory);
+    destroyBuffer(self, self.content_placeholder_buffer, self.content_placeholder_memory);
+    std.heap.c_allocator.free(self.content_backings);
+    std.heap.c_allocator.free(self.content_slot_backings);
     std.heap.c_allocator.free(self.content_allocations);
     for (self.cache) |entry| if (entry.occupied) destroyTexture(self, entry.texture);
     std.heap.c_allocator.free(self.prepared);
@@ -1763,25 +2046,22 @@ fn allocateContent(context: *anyopaque, size: usize) !render_content.Allocation 
     const index = for (self.content_allocations, 0..) |allocation, candidate| {
         if (!allocation.active) break candidate;
     } else try growRecords(UploadAllocation, &self.content_allocations);
-    var offset: usize = 0;
-    while (true) {
-        offset = std.mem.alignForward(usize, offset, self.copy_offset_alignment);
-        const end = std.math.add(usize, offset, size) catch
-            return error.ContentByteCapacityExceeded;
-        if (end > self.content_buffer_size) return error.ContentByteCapacityExceeded;
-        var conflict_end: ?usize = null;
-        for (self.content_allocations) |allocation| {
-            if (!allocation.active) continue;
-            const allocation_end = allocation.offset + allocation.size;
-            if (offset < allocation_end and end > allocation.offset)
-                conflict_end = @max(conflict_end orelse 0, allocation_end);
-        }
-        if (conflict_end) |next| {
-            offset = next;
-            continue;
-        }
-        break;
-    }
+    // A sample reads its whole allocation through one slot descriptor.
+    if (size == 0 or size > self.max_storage_range) return error.ContentByteCapacityExceeded;
+    const placement = try placeContent(
+        self.content_allocations,
+        self.content_slot_backings,
+        self.content_backings[0..self.content_backing_count],
+        size,
+        self.copy_offset_alignment,
+        self.content_buffer_size,
+        self.content_chunk_shift,
+        self.max_storage_range,
+    );
+    if (placement.commit) |commit| _ = try commitContentBacking(self, commit.first_slot, commit.slot_count);
+    const offset = placement.offset;
+    const location = contentLocation(self, offset);
+    const backing = self.content_backings[self.content_slot_backings[offset >> self.content_chunk_shift].?];
     const allocation = &self.content_allocations[index];
     allocation.generation +%= 1;
     if (allocation.generation == 0) allocation.generation = 1;
@@ -1791,7 +2071,7 @@ fn allocateContent(context: *anyopaque, size: usize) !render_content.Allocation 
     allocation.references = 1;
     const token = (@as(u64, allocation.generation) << 32) | @as(u32, @intCast(index));
     return .{
-        .bytes = @as([*]u8, @ptrCast(self.content_map))[offset..][0..size],
+        .bytes = backing.map.?[location.offset..][0..size],
         .upload = .{ .owner = self, .token = token, .offset = offset },
     };
 }
@@ -2755,8 +3035,11 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
     target.batch_capacity = 0;
     target.sample_buffer_size = 0;
     target.state = .ready;
-    _ = try createHostBuffer(self, self.staging_buffer_size, 0, &target.source_buffer, &target.source_memory, &target.source_map);
-    target.source_buffer_size = self.staging_buffer_size;
+    // Staging starts small and grows with what frames stage (see
+    // `growTargetSource`) instead of reserving the maximum per target.
+    const initial_staging = @min(self.staging_buffer_size, initial_staging_bytes);
+    _ = try createHostBuffer(self, initial_staging, 0, &target.source_buffer, &target.source_memory, &target.source_map);
+    target.source_buffer_size = initial_staging;
     errdefer destroyBuffer(self, target.source_buffer, target.source_memory);
 
     try growTargetBatches(self, target, 1);
@@ -3043,9 +3326,10 @@ fn growTargetBatches(self: *RealRenderer, target: *RealTarget, count: usize) !vo
     defer allocator.free(layouts);
     @memset(layouts, self.descriptor_layout);
     const combined_count = std.math.mul(usize, count, self.sampled_descriptors + 2) catch return error.CapacityExceeded;
+    const storage_buffer_count = std.math.mul(usize, count, 5 + self.content_slot_backings.len) catch return error.CapacityExceeded;
     const pool_sizes = [_]c.VkDescriptorPoolSize{
         .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = @intCast(count * 3) },
-        .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = @intCast(count * 6) },
+        .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = @intCast(storage_buffer_count) },
         .{ .type = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = if (self.sampled_enabled) @intCast(combined_count) else 0 },
     };
     var pool_info: c.VkDescriptorPoolCreateInfo = .{
@@ -3063,18 +3347,22 @@ fn growTargetBatches(self: *RealRenderer, target: *RealTarget, count: usize) !vo
     try vk(c.vkAllocateDescriptorSets(self.device, &set_info, sets.ptr), error.AllocateDescriptorSetFailed);
     var image_descriptor: c.VkDescriptorImageInfo = .{ .sampler = null, .imageView = target.view, .imageLayout = c.VK_IMAGE_LAYOUT_GENERAL };
     var linear_descriptor: c.VkDescriptorImageInfo = .{ .sampler = null, .imageView = target.linear_view, .imageLayout = c.VK_IMAGE_LAYOUT_GENERAL };
-    var source_descriptor: c.VkDescriptorBufferInfo = .{ .buffer = target.source_buffer, .offset = 0, .range = self.max_source_bytes };
+    var source_descriptor: c.VkDescriptorBufferInfo = .{ .buffer = target.source_buffer, .offset = 0, .range = @min(target.source_buffer_size, self.max_source_bytes) };
     var lut_descriptor: c.VkDescriptorBufferInfo = .{ .buffer = self.lut_buffer, .offset = 0, .range = c.VK_WHOLE_SIZE };
-    var content_descriptor: c.VkDescriptorBufferInfo = .{ .buffer = self.content_buffer, .offset = 0, .range = c.VK_WHOLE_SIZE };
+    const content_descriptors = try allocator.alloc(c.VkDescriptorBufferInfo, self.content_slot_backings.len);
+    defer allocator.free(content_descriptors);
+    for (content_descriptors, 0..) |*info, slot| info.* = contentSlotDescriptor(self, slot);
     for (sets, 0..) |set, index| {
         var sample_descriptor: c.VkDescriptorBufferInfo = .{ .buffer = buffer, .offset = stride * index, .range = self.sample_buffer_size };
+        var content_write = descriptorWrite(set, 6, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, null, &content_descriptors[0]);
+        content_write.descriptorCount = @intCast(content_descriptors.len);
         const writes = [_]c.VkWriteDescriptorSet{
             descriptorWrite(set, 0, c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &image_descriptor, null),
             descriptorWrite(set, 1, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, null, &sample_descriptor),
             descriptorWrite(set, 2, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, null, &source_descriptor),
             descriptorWrite(set, 4, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, null, &lut_descriptor),
             descriptorWrite(set, 5, c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &linear_descriptor, null),
-            descriptorWrite(set, 6, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, null, &content_descriptor),
+            content_write,
         };
         c.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
     }
@@ -3086,6 +3374,7 @@ fn growTargetBatches(self: *RealRenderer, target: *RealTarget, count: usize) !vo
     target.descriptor_pool = pool;
     target.descriptor_sets = sets;
     target.batch_capacity = count;
+    target.content_epoch = self.content_epoch;
     updateCaptureDescriptors(self, target);
 }
 
@@ -3284,13 +3573,6 @@ fn ensureSampledFrameCapacity(self: *RealRenderer, target: *RealTarget, sample_c
         self.cache = try allocator.realloc(self.cache, sample_count);
         @memset(self.cache[old_len..], .{});
     }
-    const alignment_slack = std.math.mul(
-        usize,
-        std.math.mul(usize, sample_count, render.upload_damage_rect_capacity) catch return error.CapacityExceeded,
-        self.copy_offset_alignment - 1,
-    ) catch return error.CapacityExceeded;
-    const staging_size = std.math.add(usize, self.max_source_bytes, alignment_slack) catch return error.CapacityExceeded;
-    try growTargetSource(self, target, staging_size);
     const batch_count = std.math.divCeil(usize, sample_count, self.max_samples) catch 0;
     try growTargetBatches(self, target, @max(batch_count, 1));
     if (target.retired_textures.len < sample_count)
@@ -3721,6 +4003,7 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, input: Fram
     if (frame.samples.len > self.max_samples) return error.CapacityExceeded;
     for (frame.sources) |surface| if (surface.source.native != null)
         return error.NativeSampledPathUnavailable;
+    try growTargetSource(self, target, frame.source_byte_count);
     @memcpy(@as([*]u8, @ptrCast(target.sample_map))[0 .. frame.samples.len * @sizeOf(Sample)], std.mem.sliceAsBytes(frame.samples));
     const source_map = @as([*]u8, @ptrCast(target.source_map))[0..frame.source_byte_count];
     var offset: usize = 0;
@@ -4573,9 +4856,17 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     if (has_blur and frame.samples.len > self.max_samples) return error.CapacityExceeded;
     const batch_count = try ensureSampledFrameCapacity(self, target, frame.samples.len);
     if (has_blur) try ensureBlurImage(self, target);
-    const batch = try prepareTextures(self, frame, target.source_buffer_size);
+    try refreshTargetContentDescriptors(self, target);
+    const batch = try prepareTextures(self, frame, self.staging_buffer_size);
     var prepared_owned = true;
     defer if (prepared_owned) cleanupPreparedTextures(self, batch.count);
+    // Staging grows to what frames actually stage, doubling to bound the
+    // number of rebuilds, and never past the configured maximum.
+    if (batch.staging_bytes > target.source_buffer_size)
+        try growTargetSource(self, target, @min(
+            self.staging_buffer_size,
+            @max(batch.staging_bytes, target.source_buffer_size *| 2),
+        ));
     const content_tokens = try allocator.alloc(u64, frame.samples.len);
     defer allocator.free(content_tokens);
     var content_token_count: usize = 0;
@@ -4897,9 +5188,14 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
                         .imageOffset = .{ .x = @intCast(upload.x), .y = @intCast(upload.y), .z = 0 },
                         .imageExtent = .{ .width = upload.width, .height = upload.height, .depth = 1 },
                     };
+                    const source_buffer = if (upload.direct) direct: {
+                        const location = contentLocation(self, upload.staging_offset);
+                        copy.bufferOffset = location.offset;
+                        break :direct location.buffer;
+                    } else target.source_buffer;
                     c.vkCmdCopyBufferToImage(
                         target.command_buffer,
-                        if (upload.direct) self.content_buffer else target.source_buffer,
+                        source_buffer,
                         prepared.texture.image,
                         c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                         1,
@@ -5845,7 +6141,7 @@ fn ensureBlurImage(self: *RealRenderer, target: *RealTarget) !void {
     }
     const sizes = [_]c.VkDescriptorPoolSize{
         .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 4 * 3 },
-        .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 4 * 6 },
+        .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = @intCast(4 * (5 + self.content_slot_backings.len)) },
         .{ .type = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 4 * (self.sampled_descriptors + 2) },
     };
     var pool_info: c.VkDescriptorPoolCreateInfo = .{
