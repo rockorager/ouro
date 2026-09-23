@@ -23,7 +23,6 @@ renderer=vulkan
 scanout=off
 duration_seconds=5
 selected_compositors=
-keywork_repo=${KEYWORK_REPO:-"$repo/../keywork"}
 
 usage() {
     cat <<'EOF'
@@ -39,8 +38,7 @@ usage: benchmark/run.sh [options]
   --renderer MODE         vulkan or pixman (default: vulkan)
   --scanout MODE          off or on (default: off)
   --duration SECONDS      lifecycle measurement window (default: 5)
-  --compositors LIST      comma-separated ouro,keywork,sway,hyprland selection
-  --keywork-repo PATH     Keywork source checkout (default: ../keywork)
+  --compositors LIST      comma-separated ouro,sway,hyprland selection
   --results DIR           output directory
   --drm-device PATH       DRM card used by all compositors (default: /dev/dri/card1)
   --output NAME           connector name (default: eDP-1)
@@ -64,7 +62,6 @@ while (($#)); do
         --scanout) scanout=$2; shift 2 ;;
         --duration) duration_seconds=$2; shift 2 ;;
         --compositors) selected_compositors=$2; shift 2 ;;
-        --keywork-repo) keywork_repo=$2; shift 2 ;;
         --results) results=$2; shift 2 ;;
         --drm-device) drm_device=$2; shift 2 ;;
         --output) output=$2; shift 2 ;;
@@ -208,9 +205,7 @@ if [[ $strace_enabled == on ]] && ! command -v strace >/dev/null; then
     exit 1
 fi
 
-if pgrep -x ouro >/dev/null || pgrep -x keywork-composi >/dev/null ||
-    pgrep -x sway >/dev/null || pgrep -x Hyprland >/dev/null
-then
+if pgrep -x ouro >/dev/null || pgrep -x sway >/dev/null || pgrep -x Hyprland >/dev/null; then
     echo "a compositor is already running; refusing to mix benchmark ownership" >&2
     exit 1
 fi
@@ -229,12 +224,11 @@ client_binary="$repo/zig-out/benchmark/ouro-benchmark-client"
 if [[ -n $selected_compositors ]]; then
     IFS=, read -r -a compositors <<<"$selected_compositors"
 else
-    compositors=(ouro keywork sway hyprland)
-    if [[ $renderer == pixman ]]; then compositors=(ouro keywork sway); fi
+    compositors=(ouro sway hyprland)
+    if [[ $renderer == pixman ]]; then compositors=(ouro sway); fi
 fi
 for compositor in "${compositors[@]}"; do
-    [[ $compositor == ouro || $compositor == keywork || $compositor == sway ||
-        $compositor == hyprland ]] || {
+    [[ $compositor == ouro || $compositor == sway || $compositor == hyprland ]] || {
         echo "unknown compositor: $compositor" >&2
         exit 2
     }
@@ -243,17 +237,6 @@ for compositor in "${compositors[@]}"; do
         exit 2
     fi
 done
-keywork_binary=
-if [[ ,$(IFS=,; printf '%s' "${compositors[*]}"), == *,keywork,* ]]; then
-    keywork_repo=$(realpath "$keywork_repo")
-    [[ -f $keywork_repo/build.zig ]] || {
-        echo "Keywork checkout is unavailable: $keywork_repo" >&2
-        exit 1
-    }
-    zig build -Doptimize=ReleaseFast install --summary all --build-file "$keywork_repo/build.zig"
-    keywork_binary="$keywork_repo/zig-out/bin/keywork-compositor"
-    [[ -x $keywork_binary ]]
-fi
 compositor_csv=$(IFS=,; printf '%s' "${compositors[*]}")
 
 {
@@ -268,15 +251,6 @@ compositor_csv=$(IFS=,; printf '%s' "${compositors[*]}")
     printf 'ouro_config_template_sha256=%s\n' "$(sha256sum "$repo/benchmark/ouro.json.in" | cut -d' ' -f1)"
     printf 'sway_config_template_sha256=%s\n' "$(sha256sum "$repo/benchmark/sway.conf.in" | cut -d' ' -f1)"
     printf 'hyprland_config_template_sha256=%s\n' "$(sha256sum "$repo/benchmark/hyprland.conf.in" | cut -d' ' -f1)"
-    printf 'keywork_config_template_sha256=%s\n' "$(sha256sum "$repo/benchmark/keywork.conf.in" | cut -d' ' -f1)"
-    if [[ -n $keywork_binary ]]; then
-        printf 'keywork_commit=%s\n' "$(git -C "$keywork_repo" rev-parse HEAD)"
-        printf 'keywork_origin_main=%s\n' "$(git -C "$keywork_repo" rev-parse origin/main 2>/dev/null || true)"
-        printf 'keywork_status_sha256=%s\n' "$(git -C "$keywork_repo" status --porcelain=v1 | sha256sum | cut -d' ' -f1)"
-        printf 'keywork_binary=%s\n' "$keywork_binary"
-        printf 'keywork_binary_sha256=%s\n' "$(sha256sum "$keywork_binary" | cut -d' ' -f1)"
-        printf 'keywork_version=%s\n' "$("$keywork_binary" --version | tr '\n' ' ')"
-    fi
     printf 'sway_version=%s\n' "$(sway --version | tr '\n' ' ')"
     if command -v Hyprland >/dev/null; then
         printf 'hyprland_version=%s\n' "$(Hyprland --version | head -1)"
@@ -306,9 +280,6 @@ compositor_csv=$(IFS=,; printf '%s' "${compositors[*]}")
     printf 'initial_vt=%s\n' "$initial_vt"
 } >"$results/metadata.env"
 git -C "$repo" status --porcelain=v1 >"$results/ouro-status.txt"
-if [[ -n $keywork_binary ]]; then
-    git -C "$keywork_repo" status --porcelain=v1 >"$results/keywork-status.txt"
-fi
 
 launcher_pid=
 compositor_pid=
@@ -450,7 +421,6 @@ render_configs() {
     cp "$repo/benchmark/ouro.json.in" "$directory/ouro.json"
     : >"$directory/sway.conf"
     : >"$directory/hyprland.conf"
-    : >"$directory/keywork.conf"
     for ((index = 0; index < output_count; index++)); do
         printf 'output %s mode %s@%sHz position %d 0 scale 1\n' \
             "${output_names[index]}" "${output_modes[index]}" \
@@ -458,15 +428,11 @@ render_configs() {
         printf 'monitor = %s,%s@%s,%dx0,1\n' \
             "${output_names[index]}" "${output_modes[index]}" \
             "${output_refreshes[index]}" "$x" >>"$directory/hyprland.conf"
-        printf '[output name="%s"]\nmode=%s@%sHz\nposition=%d,0\nscale=1\n\n' \
-            "${output_names[index]}" "${output_modes[index]}" \
-            "${output_refreshes[index]}" "$x" >>"$directory/keywork.conf"
         ((x += output_widths[index]))
     done
     cat "$repo/benchmark/sway.conf.in" >>"$directory/sway.conf"
     sed -e "s|@DIRECT_SCANOUT@|$([[ $scanout == on ]] && printf 1 || printf 0)|g" \
         "$repo/benchmark/hyprland.conf.in" >>"$directory/hyprland.conf"
-    cat "$repo/benchmark/keywork.conf.in" >>"$directory/keywork.conf"
 }
 
 run_case() {
@@ -500,18 +466,6 @@ run_case() {
                 >"$directory/compositor.log" 2>&1 &
             launcher_pid=$!
             ;;
-        keywork)
-            local keywork_renderer=vulkan
-            [[ $renderer == pixman ]] && keywork_renderer=cpu
-            seatd-launch -l error -- env XDG_RUNTIME_DIR="$runtime" LIBSEAT_BACKEND=seatd \
-                "$keywork_binary" --output drm --renderer "$keywork_renderer" \
-                --session standalone --drm-device "$drm_device" \
-                --scanout "$([[ $scanout == on ]] && printf enabled || printf disabled)" \
-                --xwayland disabled --animations disabled \
-                --config "$directory/keywork.conf" --log-level warning \
-                >"$directory/compositor.log" 2>&1 &
-            launcher_pid=$!
-            ;;
         sway)
             local -a sway_environment=(
                 XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=wayland-0
@@ -540,7 +494,6 @@ run_case() {
     sleep "$readiness_seconds"
     case "$compositor" in
         ouro) compositor_pid=$(find_compositor_pid ouro) ;;
-        keywork) compositor_pid=$(find_compositor_pid keywork-composi) ;;
         sway) compositor_pid=$(find_compositor_pid sway) ;;
         hyprland) compositor_pid=$(find_compositor_pid Hyprland) ;;
     esac
@@ -891,9 +844,7 @@ for definition in "${benchmark_workloads[@]}"; do
 done
 ((matched == 1)) || { echo "no workload matched the selection" >&2; exit 2; }
 
-if pgrep -x ouro >/dev/null || pgrep -x keywork-composi >/dev/null ||
-    pgrep -x sway >/dev/null || pgrep -x Hyprland >/dev/null
-then
+if pgrep -x ouro >/dev/null || pgrep -x sway >/dev/null || pgrep -x Hyprland >/dev/null; then
     echo "a compositor survived benchmark teardown" >&2
     exit 1
 fi

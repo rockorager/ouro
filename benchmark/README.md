@@ -1,10 +1,9 @@
 # Compositor benchmarks
 
 This opt-in hardware suite runs generated Wayland workloads against Ouro,
-Keywork, packaged Sway, and packaged Hyprland. Vulkan comparisons include all
-four. CPU-renderer comparisons include Ouro's Pixman renderer, Keywork's CPU
-renderer, and Sway's Pixman renderer because Hyprland has no supported CPU
-renderer. A comparison is valid only when every compositor declared in
+packaged Sway, and packaged Hyprland. Vulkan comparisons include all three.
+CPU-renderer comparisons include Ouro's Pixman renderer and Sway's Pixman
+renderer because Hyprland has no supported CPU renderer. A comparison is valid only when every compositor declared in
 `metadata.env` completes or explicitly reports unsupported for every requested
 run. The suite is not part of `zig build test` and never installs packages or
 changes persistent system configuration.
@@ -59,10 +58,9 @@ ordered by advertised logical position, so placement does not depend on each
 compositor's XDG toplevel policy. Before timing, every client requires the exact
 configured output count and validates its target's current mode and rounded
 refresh rate. The comparator layouts use the same left-to-right output order.
-Direct and overlay scanout are disabled for normal Keywork runs, and direct
-scanout is disabled for normal Sway and Hyprland runs, so those workloads
-exercise composition. `--renderer pixman` selects Ouro and Sway's Pixman paths
-and Keywork's CPU path; the default is Vulkan. The separate
+Direct scanout is disabled for normal Sway and Hyprland runs, so those
+workloads exercise composition. `--renderer pixman` selects Ouro and Sway's
+Pixman paths; the default is Vulkan. The separate
 `--suite scanout --scanout on` family only
 removes forced-composition policy for one fullscreen-sized DMA-BUF candidate.
 Eligibility, cadence, and low CPU are not proof that direct scanout occurred;
@@ -282,8 +280,7 @@ benchmark/run.sh --suite lifecycle --frames 100 --duration 10
 benchmark/run.sh --suite cpu --renderer pixman --runs 3
 benchmark/run.sh --suite scanout --scanout on --runs 3 # Diagnostic, not proof.
 benchmark/run.sh --workload shm-sparse --runs 3
-benchmark/run.sh --workload shm-sparse --compositors ouro,keywork \
-  --keywork-repo ../keywork
+benchmark/run.sh --workload shm-sparse --compositors ouro,sway
 benchmark/run.sh --workload shm-tiny --frames 600 \
   --drm-device /dev/dri/card0 --output DP-1 --mode 2560x1440 --refresh 144
 
@@ -291,17 +288,13 @@ benchmark/run.sh --workload shm-tiny --frames 600 \
 benchmark/run.sh --workload mixed-scale-8 --pacing presentation
 ```
 
-The runner builds Ouro, Keywork, and the benchmark client in ReleaseFast. Pass
-`--keywork-repo` (or `KEYWORK_REPO`) when the Keywork checkout is not the
-default sibling `../keywork`. Keywork runs in standalone session mode, which
-retains native DRM/session ownership without starting or stopping the user's
-systemd graphical-session targets; Xwayland is disabled. The runner refuses to
-run while another Ouro, Keywork, Sway, or Hyprland process or DRM holder exists. Raw logs,
+The runner builds Ouro and the benchmark client in ReleaseFast. It refuses to
+run while another Ouro, Sway, or Hyprland process or DRM holder exists. Raw logs,
 process snapshots, generated comparator configs, perf counters, metadata, and
 the aggregated `results.json` are written beneath `benchmark-results/`, which
 is intentionally ignored by Git.
 
-`--outputs` names physical connectors for Keywork, Sway, and Hyprland and
+`--outputs` names physical connectors for Sway and Hyprland and
 declares their expected modes. Ouro currently activates every eligible desktop
 connector and
 publishes implementation-defined output names, so benchmark clients match
