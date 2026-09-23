@@ -503,9 +503,10 @@ const RealRenderer = struct {
     content_slot_backings: []?u32,
     content_backings: []ContentBacking,
     content_backing_count: usize,
-    /// Incremented per committed backing. Targets rewrite their content
-    /// descriptors when their recorded epoch falls behind.
-    content_epoch: u64,
+    /// Incremented whenever a renderer-wide storage buffer bound by every
+    /// target changes: a committed content backing or a regrown LUT buffer.
+    /// Targets rewrite those descriptors when their recorded epoch lags.
+    shared_descriptor_epoch: u64,
     /// Valid, never-read storage buffer bound to uncommitted slots. It also
     /// fixes the memory type reported for content allocations.
     content_placeholder_buffer: c.VkBuffer,
@@ -516,9 +517,13 @@ const RealRenderer = struct {
     imported_images: []ImportedImage,
     imported_cursor: usize,
     pending_acquires: []PendingAcquire,
+    /// Holds `lut_capacity` LUTs and doubles on demand up to
+    /// `lut_hashes.len`, so idle compositors pay for the profiles in use
+    /// rather than the configured maximum.
     lut_buffer: c.VkBuffer,
     lut_memory: c.VkDeviceMemory,
     lut_map: *anyopaque,
+    lut_capacity: usize,
     lut_hashes: [][32]u8,
     lut_count: usize,
     resource_epoch: u64,
@@ -1154,10 +1159,10 @@ const RealTarget = struct {
     captured: Captures = .{},
     capture_encoding: CaptureEncoding = .desktop_gamma22,
     recorded_sampled_frame: RecordedSampledFrame = .{},
-    /// `RealRenderer.content_epoch` the binding-6 descriptors were written
-    /// for; a lagging value means newly committed content backings are not
-    /// yet visible to this target's shaders.
-    content_epoch: u64 = 0,
+    /// `RealRenderer.shared_descriptor_epoch` the LUT and content descriptors
+    /// were written for; a lagging value means a regrown LUT buffer or newly
+    /// committed content backings are not yet visible to this target's shaders.
+    shared_descriptor_epoch: u64 = 0,
     gpu_trace: GpuTrace,
 };
 
@@ -1790,7 +1795,8 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     errdefer allocator.free(self.lut_hashes);
     self.lut_count = 0;
     self.resource_epoch = 1;
-    _ = try createHostBuffer(self, lut_buffer_size, 0, &self.lut_buffer, &self.lut_memory, &self.lut_map);
+    self.lut_capacity = 1;
+    _ = try createHostBuffer(self, lutBufferSize(self.lut_capacity), 0, &self.lut_buffer, &self.lut_memory, &self.lut_map);
     errdefer destroyBuffer(self, self.lut_buffer, self.lut_memory);
     self.content_slot_backings = try allocator.alloc(?u32, content_slot_count);
     @memset(self.content_slot_backings, null);
@@ -1798,7 +1804,7 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     self.content_backings = try allocator.alloc(ContentBacking, content_slot_count);
     errdefer allocator.free(self.content_backings);
     self.content_backing_count = 0;
-    self.content_epoch = 1;
+    self.shared_descriptor_epoch = 1;
     // Content memory is committed per slot on first use. The placeholder
     // keeps every binding-6 descriptor valid and selects the memory type
     // content backings will use: cached when available, because partial
@@ -1843,9 +1849,43 @@ fn commitContentBacking(self: *RealRenderer, first_slot: u32, slot_count: u32) !
     self.content_backings[index] = backing;
     self.content_backing_count += 1;
     @memset(self.content_slot_backings[first_slot..][0..slot_count], index);
-    self.content_epoch +%= 1;
-    if (self.content_epoch == 0) self.content_epoch = 1;
+    bumpSharedDescriptorEpoch(self);
     return index;
+}
+
+fn bumpSharedDescriptorEpoch(self: *RealRenderer) void {
+    self.shared_descriptor_epoch +%= 1;
+    if (self.shared_descriptor_epoch == 0) self.shared_descriptor_epoch = 1;
+}
+
+fn lutBufferSize(capacity: usize) usize {
+    return capacity * icc.texel_count * @sizeOf([4]f32);
+}
+
+/// Replaces the LUT buffer with one holding `capacity` LUTs, carrying the
+/// cached LUTs over. Every target's descriptor sets still name the old
+/// buffer, so the device is drained before it is destroyed; the rewrite
+/// happens on each target's next draw. LUTs are cached only when an output
+/// gains a new color profile, so the stall is rare.
+fn growLutBuffer(self: *RealRenderer, capacity: usize) !void {
+    std.debug.assert(capacity > self.lut_capacity and capacity <= self.lut_hashes.len);
+    var buffer: c.VkBuffer = undefined;
+    var memory: c.VkDeviceMemory = undefined;
+    var map: *anyopaque = undefined;
+    _ = try createHostBuffer(self, lutBufferSize(capacity), 0, &buffer, &memory, &map);
+    const used = lutBufferSize(self.lut_count);
+    @memcpy(@as([*]u8, @ptrCast(map))[0..used], @as([*]const u8, @ptrCast(self.lut_map))[0..used]);
+    _ = c.vkDeviceWaitIdle(self.device);
+    destroyBuffer(self, self.lut_buffer, self.lut_memory);
+    self.lut_buffer = buffer;
+    self.lut_memory = memory;
+    self.lut_map = map;
+    self.lut_capacity = capacity;
+    bumpSharedDescriptorEpoch(self);
+}
+
+fn lutDescriptor(self: *const RealRenderer) c.VkDescriptorBufferInfo {
+    return .{ .buffer = self.lut_buffer, .offset = 0, .range = c.VK_WHOLE_SIZE };
 }
 
 const ContentLocation = struct { buffer: c.VkBuffer, offset: usize };
@@ -1878,23 +1918,28 @@ fn contentSlotDescriptor(self: *const RealRenderer, slot: usize) c.VkDescriptorB
     };
 }
 
-/// Points every content descriptor of a ready target at the current
-/// backings. Descriptor writes are only legal while no submission using
+/// Points a ready target's LUT and content descriptors at the current
+/// buffers. Descriptor writes are only legal while no submission using
 /// these sets is pending, and recorded command buffers consume descriptor
 /// contents at execution time, so the replayable recording is dropped.
-fn refreshTargetContentDescriptors(self: *RealRenderer, target: *RealTarget) !void {
-    if (target.content_epoch == self.content_epoch) return;
+fn refreshTargetSharedDescriptors(self: *RealRenderer, target: *RealTarget) !void {
+    if (target.shared_descriptor_epoch == self.shared_descriptor_epoch) return;
     std.debug.assert(target.state == .ready);
     const infos = try std.heap.c_allocator.alloc(c.VkDescriptorBufferInfo, self.content_slot_backings.len);
     defer std.heap.c_allocator.free(infos);
     for (infos, 0..) |*info, slot| info.* = contentSlotDescriptor(self, slot);
+    var lut_info = lutDescriptor(self);
     for (target.descriptor_sets) |set| {
-        var write = descriptorWrite(set, 6, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, null, &infos[0]);
-        write.descriptorCount = @intCast(infos.len);
-        c.vkUpdateDescriptorSets(self.device, 1, &write, 0, null);
+        var content_write = descriptorWrite(set, 6, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, null, &infos[0]);
+        content_write.descriptorCount = @intCast(infos.len);
+        const writes = [_]c.VkWriteDescriptorSet{
+            descriptorWrite(set, 4, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, null, &lut_info),
+            content_write,
+        };
+        c.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
     }
     target.recorded_sampled_frame.valid = false;
-    target.content_epoch = self.content_epoch;
+    target.shared_descriptor_epoch = self.shared_descriptor_epoch;
 }
 
 fn realDestroy(_: *anyopaque, renderer: Renderer) void {
@@ -1992,12 +2037,86 @@ fn realCacheLut(_: *anyopaque, renderer: Renderer, lut: *const icc.Lut) !u32 {
         if (std.mem.eql(u8, &hash, &lut.lut_hash)) return @intCast(slot);
     if (self.lut_count == self.lut_hashes.len) return error.ColorLutCapacityExceeded;
     const slot = self.lut_count;
+    if (slot == self.lut_capacity)
+        try growLutBuffer(self, @min(self.lut_hashes.len, self.lut_capacity * 2));
     const output = @as([*][4]f32, @ptrCast(@alignCast(self.lut_map)))[slot * icc.texel_count .. (slot + 1) * icc.texel_count];
     for (lut.rgba, output) |source, *destination|
         destination.* = .{ source[0], source[1], source[2], source[3] };
     self.lut_hashes[slot] = lut.lut_hash;
     self.lut_count += 1;
     return @intCast(slot);
+}
+
+/// Opens the first DRM card node backed by a Vulkan device and creates a real
+/// renderer on it, or skips. Read-only card opens never take DRM master.
+fn openTestRenderer(context: *u8, config: Config) !struct { fd: std.posix.fd_t, renderer: Renderer } {
+    for (0..4) |index| {
+        var path_buffer: [32]u8 = undefined;
+        const path = try std.fmt.bufPrintZ(&path_buffer, "/dev/dri/card{d}", .{index});
+        const opened = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(opened) != .SUCCESS) continue;
+        const fd: std.posix.fd_t = @intCast(opened);
+        const renderer = realCreate(context, fd, config) catch {
+            _ = linux.close(fd);
+            continue;
+        };
+        return .{ .fd = fd, .renderer = renderer };
+    }
+    return error.SkipZigTest;
+}
+
+test "render-vulkan: real LUT buffer doubles on demand and carries cached LUTs" {
+    var context: u8 = 0;
+    const opened = try openTestRenderer(&context, .{
+        .max_samples = 1,
+        .max_color_luts = 3,
+        .max_source_bytes = 4096,
+        .max_targets = 1,
+        .content_bytes = 4096,
+    });
+    defer _ = linux.close(opened.fd);
+    defer realDestroy(&context, opened.renderer);
+    const self: *RealRenderer = @ptrCast(@alignCast(opened.renderer));
+    try std.testing.expectEqual(@as(usize, 1), self.lut_capacity);
+
+    const allocator = std.testing.allocator;
+    var luts: [3]icc.Lut = undefined;
+    for (&luts, 0..) |*lut, index| {
+        const rgba = try allocator.alloc([4]f16, icc.texel_count);
+        for (rgba, 0..) |*texel, texel_index| {
+            const value: f16 = @floatFromInt((texel_index * 7 + index * 13) % 251);
+            texel.* = .{ value, value / 2, @floatFromInt(index), 1 };
+        }
+        lut.* = .{ .profile_hash = @splat(@intCast(index)), .lut_hash = @splat(@intCast(index + 1)), .rgba = rgba };
+    }
+    defer for (&luts) |*lut| lut.deinit(allocator);
+
+    const initial_epoch = self.shared_descriptor_epoch;
+    try std.testing.expectEqual(@as(u32, 0), try realCacheLut(&context, opened.renderer, &luts[0]));
+    try std.testing.expectEqual(@as(usize, 1), self.lut_capacity);
+    try std.testing.expectEqual(initial_epoch, self.shared_descriptor_epoch);
+    // A repeated LUT is served from the cache without growing.
+    try std.testing.expectEqual(@as(u32, 0), try realCacheLut(&context, opened.renderer, &luts[0]));
+    try std.testing.expectEqual(@as(u32, 1), try realCacheLut(&context, opened.renderer, &luts[1]));
+    try std.testing.expectEqual(@as(usize, 2), self.lut_capacity);
+    try std.testing.expect(self.shared_descriptor_epoch != initial_epoch);
+    const second_epoch = self.shared_descriptor_epoch;
+    // Doubling is clamped to the configured maximum.
+    try std.testing.expectEqual(@as(u32, 2), try realCacheLut(&context, opened.renderer, &luts[2]));
+    try std.testing.expectEqual(@as(usize, 3), self.lut_capacity);
+    try std.testing.expect(self.shared_descriptor_epoch != second_epoch);
+    try std.testing.expectError(error.ColorLutCapacityExceeded, realCacheLut(&context, opened.renderer, &.{
+        .profile_hash = @splat(9),
+        .lut_hash = @splat(9),
+        .rgba = luts[0].rgba,
+    }));
+
+    // Every slot survived the two buffer replacements with its own texels.
+    const texels = @as([*]const [4]f32, @ptrCast(@alignCast(self.lut_map)))[0 .. 3 * icc.texel_count];
+    for (luts, 0..) |lut, slot| {
+        for (lut.rgba, texels[slot * icc.texel_count ..][0..icc.texel_count]) |expected, actual|
+            try std.testing.expectEqual([4]f32{ expected[0], expected[1], expected[2], expected[3] }, actual);
+    }
 }
 
 fn realPacksSources(_: *anyopaque, renderer: Renderer) bool {
@@ -3348,7 +3467,7 @@ fn growTargetBatches(self: *RealRenderer, target: *RealTarget, count: usize) !vo
     var image_descriptor: c.VkDescriptorImageInfo = .{ .sampler = null, .imageView = target.view, .imageLayout = c.VK_IMAGE_LAYOUT_GENERAL };
     var linear_descriptor: c.VkDescriptorImageInfo = .{ .sampler = null, .imageView = target.linear_view, .imageLayout = c.VK_IMAGE_LAYOUT_GENERAL };
     var source_descriptor: c.VkDescriptorBufferInfo = .{ .buffer = target.source_buffer, .offset = 0, .range = @min(target.source_buffer_size, self.max_source_bytes) };
-    var lut_descriptor: c.VkDescriptorBufferInfo = .{ .buffer = self.lut_buffer, .offset = 0, .range = c.VK_WHOLE_SIZE };
+    var lut_descriptor = lutDescriptor(self);
     const content_descriptors = try allocator.alloc(c.VkDescriptorBufferInfo, self.content_slot_backings.len);
     defer allocator.free(content_descriptors);
     for (content_descriptors, 0..) |*info, slot| info.* = contentSlotDescriptor(self, slot);
@@ -3374,7 +3493,7 @@ fn growTargetBatches(self: *RealRenderer, target: *RealTarget, count: usize) !vo
     target.descriptor_pool = pool;
     target.descriptor_sets = sets;
     target.batch_capacity = count;
-    target.content_epoch = self.content_epoch;
+    target.shared_descriptor_epoch = self.shared_descriptor_epoch;
     updateCaptureDescriptors(self, target);
 }
 
@@ -4856,7 +4975,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     if (has_blur and frame.samples.len > self.max_samples) return error.CapacityExceeded;
     const batch_count = try ensureSampledFrameCapacity(self, target, frame.samples.len);
     if (has_blur) try ensureBlurImage(self, target);
-    try refreshTargetContentDescriptors(self, target);
+    try refreshTargetSharedDescriptors(self, target);
     const batch = try prepareTextures(self, frame, self.staging_buffer_size);
     var prepared_owned = true;
     defer if (prepared_owned) cleanupPreparedTextures(self, batch.count);
