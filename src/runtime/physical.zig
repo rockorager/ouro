@@ -10656,22 +10656,27 @@ pub fn Coordinator(comptime protocol: type) type {
             output_bounds: geometry.Rect,
             output_scale: geometry.OutputScale,
         ) !?damage.SurfaceState {
-            // Protocol cancellation may be backpressured. Hide the icon and
-            // damage its old bounds regardless of whether cancellation fit.
+            // The icon follows the pointer, so its position is derived here on
+            // every frame rather than published by client commits. Like the
+            // client cursor, the bounds this output last rendered live in
+            // per-output state: `layer.change.previous` is reset by every icon
+            // commit to the surface's own origin and is collapsed once the
+            // first output submits, so neither describes what this output
+            // showed. Damage the retained bounds unconditionally, whether the
+            // icon moved, was hidden, or protocol cancellation was
+            // backpressured, and force each sampled surface's current bounds.
+            if (physical.drag_icon_previous) |previous| {
+                try self.ensureFrameStorage(@max(sample_count.*, change_count.*) + 1);
+                self.frame_changes[change_count.*] = .{ .previous = try scaleSurfaceState(
+                    previous,
+                    output_bounds,
+                    output_scale,
+                ) };
+                self.frame_change_layers[change_count.*] = null;
+                change_count.* += 1;
+            }
             const visible_root = if (self.sessionLockActive()) null else self.drag_icon_root;
-            const root = visible_root orelse {
-                if (physical.drag_icon_previous) |previous| {
-                    try self.ensureFrameStorage(@max(sample_count.*, change_count.*) + 1);
-                    self.frame_changes[change_count.*] = .{ .previous = try scaleSurfaceState(
-                        previous,
-                        output_bounds,
-                        output_scale,
-                    ) };
-                    self.frame_change_layers[change_count.*] = null;
-                    change_count.* += 1;
-                }
-                return null;
-            };
+            const root = visible_root orelse return null;
             const pointer = self.interaction.cursor.position;
             const global_bounds = try self.globalOutputBounds();
             var combined: ?damage.SurfaceState = null;
@@ -10721,8 +10726,14 @@ pub fn Coordinator(comptime protocol: type) type {
                     output_scale,
                 );
                 self.frame_bindings[sample_count.*] = layer.binding.?;
+                // Keep the client's surface/buffer damage so the layer change
+                // still retires normally; the old bounds come from
+                // `drag_icon_previous` above, not from this layer.
+                var change = layer.change.?;
+                change.previous = null;
+                change.invalidate_bounds = true;
                 self.frame_changes[change_count.*] = try scaleChange(
-                    layer.change.?,
+                    change,
                     output_bounds,
                     output_scale,
                 );
@@ -10737,16 +10748,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 sample_count.* += 1;
                 change_count.* += 1;
             }
-            if (combined == null) if (physical.drag_icon_previous) |previous| {
-                try self.ensureFrameStorage(@max(sample_count.*, change_count.*) + 1);
-                self.frame_changes[change_count.*] = .{ .previous = try scaleSurfaceState(
-                    previous,
-                    output_bounds,
-                    output_scale,
-                ) };
-                self.frame_change_layers[change_count.*] = null;
-                change_count.* += 1;
-            };
             return combined;
         }
 
