@@ -91,8 +91,11 @@ pub const Monitor = struct {
         if (sameToken(self.cancel_token, token)) {
             try router.retire(token);
             self.cancel_token = null;
+            // -EALREADY: the poll already fired and its completion is
+            // pending task work; the target CQE still arrives on its own.
             if (result != 0 and result != -@as(i32, @intFromEnum(linux.E.NOENT)) and
-                result != -@as(i32, @intFromEnum(linux.E.CANCELED)))
+                result != -@as(i32, @intFromEnum(linux.E.CANCELED)) and
+                result != -@as(i32, @intFromEnum(linux.E.ALREADY)))
                 return error.UnexpectedCompletion;
             return;
         }

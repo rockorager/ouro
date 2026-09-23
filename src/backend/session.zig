@@ -305,8 +305,10 @@ pub const Session = struct {
             if (sameToken(cancel_token, token)) {
                 try router.retire(token);
                 self.cancel_token = null;
+                // -EALREADY: the poll already fired and its completion is
+                // pending task work; the target CQE still arrives on its own.
                 if (result != 0 and result != negativeErrno(.NOENT) and
-                    result != negativeErrno(.CANCELED))
+                    result != negativeErrno(.CANCELED) and result != negativeErrno(.ALREADY))
                     return error.UnexpectedCompletion;
                 return;
             }

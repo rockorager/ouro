@@ -391,8 +391,10 @@ pub const Backend = struct {
         if (self.cancel_token) |cancel| if (sameToken(cancel, token)) {
             try router.retire(token);
             self.cancel_token = null;
+            // -EALREADY: the poll already fired and its completion is
+            // pending task work; the target CQE still arrives on its own.
             if (result != 0 and result != negativeErrno(.NOENT) and
-                result != negativeErrno(.CANCELED))
+                result != negativeErrno(.CANCELED) and result != negativeErrno(.ALREADY))
                 return error.UnexpectedCompletion;
             return;
         };
@@ -1541,6 +1543,33 @@ test "input: target poll may complete before poll removal" {
     try backend.completeReadiness(&router, &ring, poll, negativeErrno(.CANCELED));
     try std.testing.expect(!backend.quiesceComplete());
     try backend.completeReadiness(&router, &ring, cancel, negativeErrno(.NOENT));
+    try std.testing.expect(backend.quiesceComplete());
+}
+
+test "input: poll removal racing a fired poll reports -EALREADY and drains" {
+    var seat_fake: FakeSeat = .{};
+    var input_fake: FakeInput = .{};
+    const backend = try testBackend(&seat_fake, &input_fake, 2);
+    defer destroyTestBackend(backend) catch unreachable;
+    var router = try completion.Router.init(std.testing.allocator, 2);
+    defer router.deinit(std.testing.allocator);
+    const poll = try router.acquire(.input_ready);
+    const cancel = try router.acquire(.input_ready);
+    backend.poll_token = poll;
+    backend.cancel_token = cancel;
+    backend.state = .quiescing;
+    backend.restricted_callback.close_fn(
+        backend.restricted_callback.userdata,
+        input_fake.opened_fd.?,
+    );
+    input_fake.opened_fd = null;
+    var ring: linux.IoUring = undefined;
+
+    // The kernel could not disarm the poll because it had already fired and
+    // its completion was pending; the target CQE then lands with readiness.
+    try backend.completeReadiness(&router, &ring, cancel, negativeErrno(.ALREADY));
+    try std.testing.expect(!backend.quiesceComplete());
+    try backend.completeReadiness(&router, &ring, poll, @intCast(linux.POLL.IN));
     try std.testing.expect(backend.quiesceComplete());
 }
 
