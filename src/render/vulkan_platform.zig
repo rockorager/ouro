@@ -299,7 +299,32 @@ const UploadAllocation = struct {
     offset: usize = 0,
     size: usize = 0,
     references: usize = 0,
+    /// Linear image aliasing this allocation, created on first composition
+    /// and destroyed with the allocation. Null after a failed attempt too,
+    /// so `image_failed` stops the renderer from retrying every frame.
+    image: ?ContentImage = null,
+    image_failed: bool = false,
 };
+
+/// A VK_IMAGE_TILING_LINEAR image bound to a content allocation's bytes in
+/// place. The composite shader samples it through the texture unit instead
+/// of loading arena words from a storage buffer, which costs several times
+/// more per output pixel. The store pads rows to the device's linear pitch
+/// so the image's row pitch equals the arena stride; the host keeps writing
+/// pixels through the arena mapping while the image stays in GENERAL layout.
+const ContentImage = struct {
+    image: c.VkImage,
+    view: c.VkImageView,
+    size: render.Size,
+    format: render.PixelFormat,
+    stride: u32,
+    /// Set once a submitted frame moved the image out of PREINITIALIZED.
+    layout_initialized: bool = false,
+};
+
+/// Content images need their allocation aligned to the linear image's memory
+/// alignment. Devices asking for more than this keep the storage-buffer path.
+const max_content_image_alignment: usize = 4096;
 
 /// Per-target staging buffer size at creation. Frames that stage more grow
 /// it geometrically up to the configured maximum.
@@ -508,6 +533,9 @@ const PreparedTexture = struct {
     native_token: ?u64 = null,
     imported_token: ?u64 = null,
     direct_external: bool = false,
+    /// `texture` is the content allocation's linear image: nothing is
+    /// uploaded, cached or retired for this source.
+    direct_content: bool = false,
 };
 
 const RealRenderer = struct {
@@ -558,6 +586,13 @@ const RealRenderer = struct {
     content_placeholder_buffer: c.VkBuffer,
     content_placeholder_memory: c.VkDeviceMemory,
     content_memory_type: u32,
+    /// Row pitch alignment of linear sampled images, reported to the content
+    /// store; 1 when content images are unavailable and rows stay packed.
+    content_row_alignment: u32,
+    /// Start alignment of content allocations: the copy offset alignment
+    /// raised to the linear image memory alignment when images are in use.
+    content_allocation_alignment: usize,
+    content_images_enabled: bool,
     content_allocations: []UploadAllocation,
     native_allocations: []NativeAllocation,
     imported_images: []ImportedImage,
@@ -586,9 +621,11 @@ const RealRenderer = struct {
     /// sized to the largest blurred target serves every target. Created on
     /// the first blurred frame.
     blur_scratch: ?BlurScratch,
-    /// Live imported targets and the per-target staging memory that
-    /// `MemoryReport` sums; targets are otherwise owned by their outputs.
-    target_count: usize,
+    /// Live imported targets. Outputs own them; the renderer only needs to
+    /// find in-flight frames whose fences have signalled so a commit can
+    /// release their content leases before the next draw would.
+    targets: std.ArrayList(*RealTarget),
+    /// Per-target staging memory that `MemoryReport` sums.
     target_staging_bytes: usize,
     resource_epoch: u64,
     gpu_clock: GpuClock,
@@ -696,7 +733,7 @@ const GpuTrace = struct {
     const WorkloadSample = struct {
         packed_sample: Sample,
         intersect_pixels: u64,
-        backing: enum { buffer, content, external, native, uploaded },
+        backing: enum { buffer, content, external, linear, native, uploaded },
     };
     const Phase = enum {
         start,
@@ -800,7 +837,7 @@ const GpuTrace = struct {
         self.query_count += 1;
     }
 
-    fn describe(self: *GpuTrace, frame: Frame, replay: bool, path: Path, ten_bit: bool) void {
+    fn describe(self: *GpuTrace, frame: Frame, prepared: []const PreparedTexture, replay: bool, path: Path, ten_bit: bool) void {
         self.sample_count = frame.samples.len;
         self.damage_rects = frame.render_damage.len;
         self.damage_pixels = 0;
@@ -823,7 +860,11 @@ const GpuTrace = struct {
             self.workload_samples[index] = .{
                 .packed_sample = sample,
                 .intersect_pixels = pixels,
-                .backing = if (path == .buffer) .buffer else if (sample.attributes[1] & direct_content_bit != 0)
+                .backing = if (path == .buffer)
+                    .buffer
+                else if (preparedIndex(prepared, frame.sources[index].sample.surface)) |prepared_index|
+                    if (prepared[prepared_index].direct_content) .linear else if (sample.attributes[1] & direct_content_bit != 0) .content else .uploaded
+                else if (sample.attributes[1] & direct_content_bit != 0)
                     .content
                 else if (frame.sources[index].source.native != null)
                     .native
@@ -983,7 +1024,7 @@ test "render-vulkan: GPU workload owns clipped sample and damage metadata" {
         .source_byte_count = 0,
         .render_damage = &damage,
         .output_lut_slot = 0,
-    }, false, .buffer, true);
+    }, &.{}, false, .buffer, true);
     samples[0].crop = @splat(0);
     samples[0].attributes[1] = 0;
     damage[0].width = 100;
@@ -1018,14 +1059,14 @@ test "render-vulkan: GPU workload truncates detail but preserves totals and repl
         .source_byte_count = 0,
         .render_damage = damage[0..64],
     };
-    trace.describe(frame, false, .buffer, false);
+    trace.describe(frame, &.{}, false, .buffer, false);
     try std.testing.expect(trace.workloadComplete());
     frame.samples = &samples;
-    trace.describe(frame, false, .buffer, false);
+    trace.describe(frame, &.{}, false, .buffer, false);
     try std.testing.expect(!trace.workloadComplete());
     frame.samples = samples[0..64];
     frame.render_damage = &damage;
-    trace.describe(frame, false, .buffer, false);
+    trace.describe(frame, &.{}, false, .buffer, false);
     try std.testing.expect(!trace.workloadComplete());
     try std.testing.expectEqual(@as(usize, 65), trace.damage_rects);
     try std.testing.expectEqual(@as(u64, 390), trace.damage_pixels);
@@ -1034,18 +1075,29 @@ test "render-vulkan: GPU workload truncates detail but preserves totals and repl
     trace.recordOpaqueCopy(63, .{ .x = 0, .y = 0, .width = 7, .height = 3 });
     trace.recordOpaqueCopy(63, damage[0]);
     trace.recordOpaqueCopy(64, damage[0]);
-    trace.describe(frame, true, .buffer, false);
+    trace.describe(frame, &.{}, true, .buffer, false);
     try std.testing.expectEqual(@as(u64, 27), trace.opaque_copy_pixels[63]);
     try std.testing.expectEqual(@as(u64, 0), trace.opaque_copy_pixels[0]);
     try std.testing.expect(trace.replay);
 }
 
 test "render-vulkan: GPU workload distinguishes sampled source backings" {
-    var samples = [_]Sample{std.mem.zeroes(Sample)} ** 4;
+    var samples = [_]Sample{std.mem.zeroes(Sample)} ** 5;
     samples[0].attributes[1] = direct_content_bit | bilinear_bit;
-    var sources = [_]render.SurfaceSample{testSurfaceSample(1, &.{}, .{})} ** 4;
+    samples[4].attributes[1] = direct_content_bit;
+    var sources: [5]render.SurfaceSample = undefined;
+    for (&sources, 0..) |*source, index| {
+        source.* = testSurfaceSample(1, &.{}, .{});
+        source.sample.surface = index + 1;
+    }
     sources[1].source.native = .{ .owner = &sources, .token = 1 };
     sources[2].source.external = @as(render.ExternalSource, undefined);
+    // The planner flags both arena sources; only the one the renderer bound
+    // as a linear image is reported as such.
+    var prepared = [_]PreparedTexture{std.mem.zeroes(PreparedTexture)} ** 2;
+    prepared[0].surface = 1;
+    prepared[1].surface = 5;
+    prepared[1].direct_content = true;
     var trace: GpuTrace = .{};
     trace.describe(.{
         .output = .{ .width = 1, .height = 1 },
@@ -1055,13 +1107,14 @@ test "render-vulkan: GPU workload distinguishes sampled source backings" {
         .sources = &sources,
         .source_byte_count = 0,
         .render_damage = &.{},
-    }, false, .sampled, false);
+    }, &prepared, false, .sampled, false);
     sources[1].source.native = null;
     sources[2].source.external = null;
     try std.testing.expectEqual(.content, trace.workload_samples[0].backing);
     try std.testing.expectEqual(.native, trace.workload_samples[1].backing);
     try std.testing.expectEqual(.external, trace.workload_samples[2].backing);
     try std.testing.expectEqual(.uploaded, trace.workload_samples[3].backing);
+    try std.testing.expectEqual(.linear, trace.workload_samples[4].backing);
 }
 
 test "render-vulkan: GPU trace owns only duplicate acquire descriptors" {
@@ -1517,13 +1570,15 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
             self.copy_offset_alignment - 1,
         ) catch return error.InvalidConfig,
     ) catch return error.InvalidConfig;
+    // Allocation alignment is only known once the device exists (see
+    // `probeContentImageLayout`), so reserve slack for the largest accepted.
     self.content_buffer_size = std.math.add(
         usize,
         config.content_bytes,
         std.math.mul(
             usize,
             config.content_allocations,
-            self.copy_offset_alignment - 1,
+            @max(self.copy_offset_alignment, max_content_image_alignment) - 1,
         ) catch return error.InvalidConfig,
     ) catch return error.InvalidConfig;
     // Bindings 1, 2, 4, 10, and 11 are single storage buffers; binding 6
@@ -1907,12 +1962,143 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         &placeholder_map,
     );
     errdefer destroyBuffer(self, self.content_placeholder_buffer, self.content_placeholder_memory);
+    probeContentImageLayout(self);
     self.linear_scratch = null;
     self.linear_placeholder = try createLinearImage(self, 1, 1);
     self.blur_scratch = null;
-    self.target_count = 0;
+    self.targets = .empty;
     self.target_staging_bytes = 0;
     return @ptrCast(self);
+}
+
+/// Learns the device's linear image row pitch and memory alignment from a
+/// one-pixel probe so content allocations can be bound as sampled images.
+/// Any surprise (odd pitch, huge alignment, memory type mismatch) leaves
+/// content images disabled and the arena packed; the storage-buffer path
+/// then samples it as before.
+fn probeContentImageLayout(self: *RealRenderer) void {
+    self.content_row_alignment = 1;
+    self.content_allocation_alignment = self.copy_offset_alignment;
+    self.content_images_enabled = false;
+    var image: c.VkImage = undefined;
+    const info = contentImageInfo(.{ .width = 1, .height = 1 }, .xrgb8888);
+    if (c.vkCreateImage(self.device, &info, null, &image) != c.VK_SUCCESS) return;
+    defer c.vkDestroyImage(self.device, image, null);
+    var requirements: c.VkMemoryRequirements = undefined;
+    c.vkGetImageMemoryRequirements(self.device, image, &requirements);
+    const layout = linearImageLayout(self, image);
+    const alignment: usize = @intCast(requirements.alignment);
+    if (layout.offset != 0 or layout.rowPitch == 0 or layout.rowPitch > std.math.maxInt(u32) or
+        !std.math.isPowerOfTwo(layout.rowPitch) or
+        alignment == 0 or !std.math.isPowerOfTwo(alignment) or alignment > max_content_image_alignment or
+        requirements.memoryTypeBits & (@as(u32, 1) << @intCast(self.content_memory_type)) == 0)
+        return;
+    self.content_row_alignment = @intCast(layout.rowPitch);
+    self.content_allocation_alignment = @max(self.copy_offset_alignment, alignment);
+    self.content_images_enabled = true;
+}
+
+fn linearImageLayout(self: *RealRenderer, image: c.VkImage) c.VkSubresourceLayout {
+    const subresource: c.VkImageSubresource = .{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .arrayLayer = 0 };
+    var layout: c.VkSubresourceLayout = undefined;
+    c.vkGetImageSubresourceLayout(self.device, image, &subresource, &layout);
+    return layout;
+}
+
+fn contentImageInfo(size: render.Size, format: render.PixelFormat) c.VkImageCreateInfo {
+    return .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = null,
+        .flags = 0,
+        .imageType = c.VK_IMAGE_TYPE_2D,
+        .format = sourceVkFormat(format),
+        .extent = .{ .width = size.width, .height = size.height, .depth = 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = c.VK_SAMPLE_COUNT_1_BIT,
+        .tiling = c.VK_IMAGE_TILING_LINEAR,
+        .usage = c.VK_IMAGE_USAGE_SAMPLED_BIT,
+        .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = null,
+        // Host writes through the arena mapping are only defined while the
+        // image is PREINITIALIZED or GENERAL; the first frame moves it to
+        // GENERAL and it never leaves.
+        .initialLayout = c.VK_IMAGE_LAYOUT_PREINITIALIZED,
+    };
+}
+
+/// Returns the allocation's linear image, creating it on first use. Null
+/// when the device cannot alias this allocation as a sampled image, in
+/// which case the shader keeps reading the arena through binding 6.
+fn contentImage(self: *RealRenderer, token: u64, size: render.Size, format: render.PixelFormat, stride: u32) ?*ContentImage {
+    if (!self.content_images_enabled or format.isVideo()) return null;
+    const allocation = contentAllocation(self, token) orelse return null;
+    if (allocation.image) |*image| {
+        // The store only reuses an allocation in place for identical geometry.
+        std.debug.assert(std.meta.eql(image.size, size) and image.format == format and image.stride == stride);
+        return image;
+    }
+    if (allocation.image_failed) return null;
+    allocation.image = createContentImage(self, allocation.*, size, format, stride) catch {
+        allocation.image_failed = true;
+        return null;
+    };
+    return &allocation.image.?;
+}
+
+fn createContentImage(self: *RealRenderer, allocation: UploadAllocation, size: render.Size, format: render.PixelFormat, stride: u32) !ContentImage {
+    var properties: c.VkFormatProperties = undefined;
+    c.vkGetPhysicalDeviceFormatProperties(self.physical_device, sourceVkFormat(format), &properties);
+    if (properties.linearTilingFeatures & c.VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT == 0)
+        return error.ContentImageUnsupported;
+    const location = contentLocation(self, allocation.offset);
+    const backing = self.content_backings[self.content_slot_backings[allocation.offset >> self.content_chunk_shift].?];
+    var image: c.VkImage = undefined;
+    const info = contentImageInfo(size, format);
+    try vk(c.vkCreateImage(self.device, &info, null, &image), error.CreateContentImageFailed);
+    errdefer c.vkDestroyImage(self.device, image, null);
+    var requirements: c.VkMemoryRequirements = undefined;
+    c.vkGetImageMemoryRequirements(self.device, image, &requirements);
+    const layout = linearImageLayout(self, image);
+    // The image must describe exactly the bytes the store wrote: same row
+    // pitch, first pixel at the allocation start, and nothing bound past
+    // the backing. Trailing driver padding may overlap the next allocation;
+    // no texel lives there, so the alias is harmless.
+    const bound_end = std.math.add(usize, location.offset, @intCast(requirements.size)) catch
+        return error.ContentImageUnsupported;
+    if (layout.offset != 0 or layout.rowPitch != stride or
+        location.offset % @as(usize, @intCast(requirements.alignment)) != 0 or
+        requirements.memoryTypeBits & (@as(u32, 1) << @intCast(self.content_memory_type)) == 0 or
+        bound_end > backing.size)
+        return error.ContentImageUnsupported;
+    try vk(c.vkBindImageMemory(self.device, image, backing.memory, location.offset), error.BindContentImageFailed);
+    var view_info: c.VkImageViewCreateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .pNext = null,
+        .flags = 0,
+        .image = image,
+        .viewType = c.VK_IMAGE_VIEW_TYPE_2D,
+        .format = sourceVkFormat(format),
+        .components = .{
+            .r = c.VK_COMPONENT_SWIZZLE_IDENTITY,
+            .g = c.VK_COMPONENT_SWIZZLE_IDENTITY,
+            .b = c.VK_COMPONENT_SWIZZLE_IDENTITY,
+            .a = c.VK_COMPONENT_SWIZZLE_IDENTITY,
+        },
+        .subresourceRange = colorRange(),
+    };
+    var view: c.VkImageView = undefined;
+    try vk(c.vkCreateImageView(self.device, &view_info, null, &view), error.CreateContentImageViewFailed);
+    return .{ .image = image, .view = view, .size = size, .format = format, .stride = stride };
+}
+
+fn destroyContentImage(self: *RealRenderer, image: ContentImage) void {
+    c.vkDestroyImageView(self.device, image.view, null);
+    c.vkDestroyImage(self.device, image.image, null);
+    // A recorded frame may still name the view; a new image could reuse the
+    // handle, so recorded command buffers must not match by handle alone.
+    bumpResourceEpoch(self);
 }
 
 const content_memory_preference: c.VkMemoryPropertyFlags = c.VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
@@ -2099,6 +2285,8 @@ fn realDestroy(_: *anyopaque, renderer: Renderer) void {
     for (self.cache) |entry| if (entry.occupied) destroyTexture(self, entry.texture);
     std.heap.c_allocator.free(self.prepared);
     std.heap.c_allocator.free(self.cache);
+    std.debug.assert(self.targets.items.len == 0);
+    self.targets.deinit(std.heap.c_allocator);
     if (self.sampler) |sampler| c.vkDestroySampler(self.device, sampler, null);
     if (self.blur_sampler) |sampler| c.vkDestroySampler(self.device, sampler, null);
     c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
@@ -2189,7 +2377,7 @@ fn realMemoryReport(_: *anyopaque, renderer: Renderer) MemoryReport {
             .native_bytes = native_bytes,
         },
         .targets = .{
-            .count = self.target_count,
+            .count = self.targets.items.len,
             .staging_bytes = self.target_staging_bytes,
         },
         .linear_scratch = if (self.linear_scratch) |scratch|
@@ -2221,6 +2409,7 @@ fn realContentProvider(_: *anyopaque, renderer: Renderer) ?render_content.Provid
             .type_index = self.content_memory_type,
             .property_flags = self.memory.memoryTypes[self.content_memory_type].propertyFlags,
         },
+        .row_alignment = self.content_row_alignment,
         .allocate_native_fn = allocateNative,
         .prepare_native_fn = prepareNative,
         .cancel_native_fn = cancelNative,
@@ -2318,6 +2507,125 @@ test "render-vulkan: real LUT buffer doubles on demand and carries cached LUTs" 
         for (lut.rgba, texels[slot * icc.texel_count ..][0..icc.texel_count]) |expected, actual|
             try std.testing.expectEqual([4]f32{ expected[0], expected[1], expected[2], expected[3] }, actual);
     }
+}
+
+test "render-vulkan: real content allocations alias a linear image with the arena stride" {
+    var context: u8 = 0;
+    const opened = try openTestRenderer(&context, .{
+        .max_samples = 1,
+        .max_color_luts = 1,
+        .max_source_bytes = 4096,
+        .max_targets = 1,
+        .content_bytes = 256 * 1024,
+    });
+    defer _ = linux.close(opened.fd);
+    defer realDestroy(&context, opened.renderer);
+    const self: *RealRenderer = @ptrCast(@alignCast(opened.renderer));
+    if (!self.content_images_enabled) return error.SkipZigTest;
+    try std.testing.expect(std.math.isPowerOfTwo(self.content_row_alignment));
+    try std.testing.expect(self.content_allocation_alignment >= self.copy_offset_alignment);
+
+    // The store pads rows to the provider's alignment, so a 3-pixel row
+    // lands on the device's linear pitch rather than 12 packed bytes.
+    const provider = realContentProvider(&context, opened.renderer).?;
+    try std.testing.expectEqual(self.content_row_alignment, provider.row_alignment);
+    const size: render.Size = .{ .width = 3, .height = 2 };
+    const layout: struct { stride: u32, length: usize } = .{
+        .stride = std.mem.alignForward(u32, 12, provider.row_alignment),
+        .length = @as(usize, std.mem.alignForward(u32, 12, provider.row_alignment)) * size.height,
+    };
+
+    var allocations: [2]render_content.Allocation = undefined;
+    for (&allocations) |*allocation| allocation.* = try allocateContent(self, layout.length);
+    defer for (allocations) |allocation| releaseContent(self, allocation.upload.?.token);
+    for (allocations) |allocation|
+        try std.testing.expectEqual(@as(usize, 0), allocation.upload.?.offset % self.content_allocation_alignment);
+
+    const token = allocations[0].upload.?.token;
+    const image = contentImage(self, token, size, .xrgb8888, layout.stride) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(layout.stride, image.stride);
+    try std.testing.expect(!image.layout_initialized);
+    try std.testing.expect(image.image != null and image.view != null);
+    // The alias is created once and describes the same bytes on every frame.
+    try std.testing.expectEqual(image, contentImage(self, token, size, .xrgb8888, layout.stride).?);
+    try std.testing.expectEqual(layout.stride, @as(u32, @intCast(linearImageLayout(self, image.image).rowPitch)));
+    // The second allocation has no image until a frame samples it.
+    try std.testing.expect(contentAllocation(self, allocations[1].upload.?.token).?.image == null);
+
+    // Releasing the last reference destroys the image with the allocation
+    // and retires recorded frames that may still name its view.
+    const epoch = self.resource_epoch;
+    releaseContent(self, token);
+    try std.testing.expect(contentAllocation(self, token) == null);
+    try std.testing.expect(self.resource_epoch != epoch);
+    allocations[0] = try allocateContent(self, layout.length);
+    try std.testing.expect(contentAllocation(self, allocations[0].upload.?.token).?.image == null);
+}
+
+test "render-vulkan: real signalled frames release content leases before the next draw" {
+    var context: u8 = 0;
+    const opened = try openTestRenderer(&context, .{
+        .max_samples = 1,
+        .max_color_luts = 1,
+        .max_source_bytes = 4096,
+        .max_targets = 2,
+        .content_bytes = 64 * 1024,
+    });
+    defer _ = linux.close(opened.fd);
+    defer realDestroy(&context, opened.renderer);
+    const self: *RealRenderer = @ptrCast(@alignCast(opened.renderer));
+    const allocation = try allocateContent(self, 64);
+    const token = allocation.upload.?.token;
+    defer releaseContent(self, token);
+    try std.testing.expect(!contentPinned(self, token));
+
+    // Two submitted frames lease the allocation: one still running, one
+    // whose fence has already signalled.
+    var fences: [2]c.VkFence = undefined;
+    for (&fences, [_]c.VkFenceCreateFlags{ 0, c.VK_FENCE_CREATE_SIGNALED_BIT }) |*fence, flags| {
+        const info: c.VkFenceCreateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .pNext = null, .flags = flags };
+        try vk(c.vkCreateFence(self.device, &info, null, fence), error.CreateFenceFailed);
+    }
+    defer for (fences) |fence| c.vkDestroyFence(self.device, fence, null);
+    var leases: [2][1]u64 = .{ .{token}, .{token} };
+    var targets: [2]RealTarget = undefined;
+    for (&targets, &leases, fences) |*target, *lease, fence| {
+        target.state = .in_flight;
+        target.fence = fence;
+        target.content_leases = lease;
+        target.content_lease_count = 1;
+        try retainContent(self, token);
+        try self.targets.append(std.heap.c_allocator, target);
+    }
+    defer self.targets.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 3), contentAllocation(self, token).?.references);
+
+    // The running frame keeps the allocation pinned; only the signalled
+    // frame's lease is released, without touching its state.
+    try std.testing.expect(contentPinned(self, token));
+    try std.testing.expectEqual(@as(usize, 2), contentAllocation(self, token).?.references);
+    try std.testing.expectEqual(@as(usize, 1), targets[0].content_lease_count);
+    try std.testing.expectEqual(@as(usize, 0), targets[1].content_lease_count);
+    try std.testing.expectEqual(TargetState.in_flight, targets[1].state);
+
+    // Once the remaining fence signals, a commit sees the allocation free.
+    try vk(c.vkResetFences(self.device, 1, &fences[0]), error.ResetFenceFailed);
+    var submit: c.VkSubmitInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .pNext = null,
+        .waitSemaphoreCount = 0,
+        .pWaitSemaphores = null,
+        .pWaitDstStageMask = null,
+        .commandBufferCount = 0,
+        .pCommandBuffers = null,
+        .signalSemaphoreCount = 0,
+        .pSignalSemaphores = null,
+    };
+    try vk(c.vkQueueSubmit(self.queue, 1, &submit, fences[0]), error.QueueSubmitFailed);
+    _ = c.vkWaitForFences(self.device, 1, &fences[0], c.VK_TRUE, std.math.maxInt(u64));
+    try std.testing.expect(!contentPinned(self, token));
+    try std.testing.expectEqual(@as(usize, 1), contentAllocation(self, token).?.references);
+    try std.testing.expectEqual(@as(usize, 0), targets[0].content_lease_count);
 }
 
 test "render-vulkan: real linear scratch is created on demand and grows to cover every target" {
@@ -2460,7 +2768,7 @@ fn allocateContent(context: *anyopaque, size: usize) !render_content.Allocation 
         self.content_slot_backings,
         self.content_backings[0..self.content_backing_count],
         size,
-        self.copy_offset_alignment,
+        self.content_allocation_alignment,
         self.content_buffer_size,
         self.content_chunk_shift,
         self.max_storage_range,
@@ -2470,12 +2778,14 @@ fn allocateContent(context: *anyopaque, size: usize) !render_content.Allocation 
     const location = contentLocation(self, offset);
     const backing = self.content_backings[self.content_slot_backings[offset >> self.content_chunk_shift].?];
     const allocation = &self.content_allocations[index];
+    std.debug.assert(allocation.image == null);
     allocation.generation +%= 1;
     if (allocation.generation == 0) allocation.generation = 1;
     allocation.active = true;
     allocation.offset = offset;
     allocation.size = size;
     allocation.references = 1;
+    allocation.image_failed = false;
     const token = (@as(u64, allocation.generation) << 32) | @as(u32, @intCast(index));
     return .{
         .bytes = backing.map.?[location.offset..][0..size],
@@ -2498,21 +2808,41 @@ fn retainContent(self: *RealRenderer, token: u64) !void {
         return error.ContentReferenceOverflow;
 }
 
+/// Drops one reference. The last reference is the store's own: every frame
+/// that sampled the allocation leased it until its fence signalled, so no
+/// submitted work can still read the image when it is destroyed here.
 fn releaseContent(self: *RealRenderer, token: u64) void {
     const allocation = contentAllocation(self, token) orelse unreachable;
     std.debug.assert(allocation.references != 0);
     allocation.references -= 1;
-    if (allocation.references == 0) allocation.active = false;
+    if (allocation.references != 0) return;
+    allocation.active = false;
+    if (allocation.image) |image| destroyContentImage(self, image);
+    allocation.image = null;
 }
 
 fn releaseContentOwner(context: *anyopaque, token: u64) void {
     releaseContent(@ptrCast(@alignCast(context)), token);
 }
 
+/// Reports whether a submitted frame may still read the allocation. A target
+/// normally releases its leases when its next frame is drawn, but a surface
+/// commit arrives after the previous frame's fence signals and before that
+/// draw; releasing completed leases first lets the commit patch its
+/// predecessor in place instead of copying the whole allocation.
 fn contentPinned(context: *anyopaque, token: u64) bool {
     const self: *RealRenderer = @ptrCast(@alignCast(context));
     const allocation = contentAllocation(self, token) orelse return false;
+    if (allocation.references > 1) releaseCompletedContentLeases(self);
     return allocation.references > 1;
+}
+
+fn releaseCompletedContentLeases(self: *RealRenderer) void {
+    for (self.targets.items) |target| {
+        if (target.state != .in_flight or target.content_lease_count == 0) continue;
+        if (c.vkGetFenceStatus(self.device, target.fence) != c.VK_SUCCESS) continue;
+        drainContentLeases(self, target);
+    }
 }
 
 fn nativeAllocation(self: *RealRenderer, token: u64) ?*NativeAllocation {
@@ -3430,10 +3760,10 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
     _ = try createHostBuffer(self, initial_staging, 0, &target.source_buffer, &target.source_memory, &target.source_map);
     target.source_buffer_size = initial_staging;
     errdefer destroyBuffer(self, target.source_buffer, target.source_memory);
-    self.target_count += 1;
+    try self.targets.append(allocator, target);
     self.target_staging_bytes += initial_staging;
     errdefer {
-        self.target_count -= 1;
+        _ = self.targets.pop();
         self.target_staging_bytes -= initial_staging;
     }
 
@@ -3494,7 +3824,8 @@ fn realDestroyTarget(_: *anyopaque, renderer: Renderer, target_value: Target) vo
     destroyTargetBatchResources(self, target);
     target.recorded_sampled_frame.deinit(std.heap.c_allocator);
     destroyBuffer(self, target.source_buffer, target.source_memory);
-    self.target_count -= 1;
+    const registered = std.mem.indexOfScalar(*RealTarget, self.targets.items, target) orelse unreachable;
+    _ = self.targets.swapRemove(registered);
     self.target_staging_bytes -= target.source_buffer_size;
     c.vkDestroyImageView(self.device, target.view, null);
     c.vkDestroyImage(self.device, target.image, null);
@@ -3828,6 +4159,36 @@ fn prepareTextures(self: *RealRenderer, frame: Frame, staging_capacity: usize) !
         if (surface.source.native) |backing| if (backing.owner != @as(*anyopaque, @ptrCast(self)))
             return error.ForeignNativeBacking;
         const direct_external = native == null and surface.source.external != null;
+        const direct_upload = if (surface.source.upload) |upload|
+            if (upload.owner == @as(*anyopaque, @ptrCast(self))) upload else null
+        else
+            null;
+        const content_image = if (native == null and !direct_external) if (direct_upload) |upload|
+            contentImage(self, upload.token, surface.source.size, surface.source.format, surface.source.stride)
+        else
+            null else null;
+        if (content_image) |image| {
+            self.prepared[count] = .{
+                .cache_index = std.math.maxInt(usize),
+                .source_index = source_index,
+                .texture = .{
+                    .image = image.image,
+                    .memory = null,
+                    .view = image.view,
+                    .size = surface.source.size,
+                    .initialized = image.layout_initialized,
+                },
+                .created = false,
+                .retire_previous = false,
+                .surface = surface.sample.surface,
+                .commit_sequence = surface.sample.commit_sequence,
+                .format = surface.source.format,
+                .content_token = direct_upload.?.token,
+                .direct_content = true,
+            };
+            count += 1;
+            continue;
+        }
         const direct_imported_token = if (direct_external) try importedImage(
             self,
             surface.source.external.?,
@@ -3869,10 +4230,6 @@ fn prepareTextures(self: *RealRenderer, frame: Frame, staging_capacity: usize) !
         else
             existing.?.texture;
         const prepared_index = count;
-        const direct_upload = if (surface.source.upload) |upload|
-            if (upload.owner == @as(*anyopaque, @ptrCast(self))) upload else null
-        else
-            null;
         const upload_damage = if (direct_external or
             (direct_upload != null and existing != null and compatible and existing.?.texture.initialized))
             render.UploadDamage{}
@@ -4359,8 +4716,12 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, input: Fram
             return error.CapacityExceeded;
         const end = std.math.add(usize, validated_bytes, length) catch
             return error.CapacityExceeded;
-        const source_offset = std.math.cast(u32, if (source.upload) |upload|
-            if (upload.owner == @as(*anyopaque, @ptrCast(self))) upload.offset else validated_bytes
+        const direct_content = if (source.upload) |upload|
+            upload.owner == @as(*anyopaque, @ptrCast(self))
+        else
+            false;
+        const source_offset = std.math.cast(u32, if (direct_content)
+            source.upload.?.offset
         else
             validated_bytes) orelse
             return error.CapacityExceeded;
@@ -4371,7 +4732,7 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, input: Fram
                 source_offset,
                 source.size.width,
                 source.size.height,
-                packed_stride,
+                if (direct_content) source.stride else packed_stride,
             }))
             return error.CapacityExceeded;
         validated_bytes = end;
@@ -4493,7 +4854,7 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, input: Fram
         target.fence_needs_reset = false;
     }
     if (trace_gpu) {
-        target.gpu_trace.describe(frame, false, .buffer, target.ten_bit);
+        target.gpu_trace.describe(frame, &.{}, false, .buffer, target.ten_bit);
         target.gpu_trace.beforeSubmit(self, capture_wait != null);
     }
     if (c.vkQueueSubmit(self.queue, 1, &submit, target.fence) != c.VK_SUCCESS) {
@@ -5300,8 +5661,10 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
         _ = linux.close(fd);
     };
 
+    // Uploads read the arena on the transfer queue and content images alias
+    // it for sampling: either way the allocation must outlive this frame.
     for (self.prepared[0..batch.count]) |prepared| {
-        if (prepared.upload_count == 0) continue;
+        if (prepared.upload_count == 0 and !prepared.direct_content) continue;
         const token = prepared.content_token orelse continue;
         var present = false;
         for (content_tokens[0..content_token_count]) |existing|
@@ -5409,6 +5772,14 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
         const partition = batchAt(frame.samples.len, self.max_samples, batch_index);
         const bytes = std.mem.sliceAsBytes(frame.samples[partition.first..][0..partition.count]);
         @memcpy(sample_map[sample_stride * batch_index ..][0..bytes.len], bytes);
+        // The planner flags renderer-owned content for arena loads; sources
+        // bound as content images are fetched like any other texture. Only
+        // the device copy changes, so replay still compares planner samples.
+        const mapped: [*]Sample = @ptrCast(@alignCast(sample_map[sample_stride * batch_index ..].ptr));
+        for (frame.sources[partition.first..][0..partition.count], 0..) |surface, index| {
+            const prepared = self.prepared[preparedIndex(self.prepared[0..batch.count], surface.sample.surface) orelse unreachable];
+            if (prepared.direct_content) mapped[index].attributes[1] &= ~direct_content_bit;
+        }
     }
     const staging = @as([*]u8, @ptrCast(target.source_map))[0..batch.staging_bytes];
     for (self.prepared[0..batch.count]) |prepared| {
@@ -5444,7 +5815,13 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
             var image_descriptors: [sampled_descriptor_capacity]c.VkDescriptorImageInfo = undefined;
             for (frame.sources[partition.first..][0..partition.count], 0..) |surface, source_index| {
                 const prepared = self.prepared[preparedIndex(prepared_batch, surface.sample.surface) orelse unreachable];
-                image_descriptors[source_index] = .{ .sampler = self.sampler.?, .imageView = prepared.texture.view, .imageLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                image_descriptors[source_index] = .{
+                    .sampler = self.sampler.?,
+                    .imageView = prepared.texture.view,
+                    // Content images stay GENERAL so the host may keep
+                    // writing pixels through the arena mapping.
+                    .imageLayout = if (prepared.direct_content) c.VK_IMAGE_LAYOUT_GENERAL else c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                };
             }
             for (partition.count..sampled_descriptor_capacity) |index| image_descriptors[index] = image_descriptors[0];
             for (frame.sources[partition.first..][0..partition.count], 0..) |surface, source_index| {
@@ -5620,6 +5997,41 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
             );
         }
         if (trace_gpu) target.gpu_trace.mark(target.command_buffer, .uploads);
+        var content_start: usize = 0;
+        while (content_start < batch.count) : (content_start += sampled_image_capacity) {
+            const content_batch = self.prepared[content_start..@min(content_start + sampled_image_capacity, batch.count)];
+            var barriers: [sampled_image_capacity]c.VkImageMemoryBarrier = undefined;
+            var barrier_count: usize = 0;
+            for (content_batch) |prepared| {
+                if (!prepared.direct_content or prepared.texture.initialized) continue;
+                barriers[barrier_count] = .{
+                    .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext = null,
+                    .srcAccessMask = c.VK_ACCESS_HOST_WRITE_BIT,
+                    .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT,
+                    .oldLayout = c.VK_IMAGE_LAYOUT_PREINITIALIZED,
+                    .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+                    .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+                    .image = prepared.texture.image,
+                    .subresourceRange = colorRange(),
+                };
+                barrier_count += 1;
+            }
+            if (barrier_count == 0) continue;
+            c.vkCmdPipelineBarrier(
+                target.command_buffer,
+                c.VK_PIPELINE_STAGE_HOST_BIT,
+                c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0,
+                0,
+                null,
+                0,
+                null,
+                @intCast(barrier_count),
+                &barriers,
+            );
+        }
         var target_barrier: c.VkImageMemoryBarrier = .{
             .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = null,
@@ -5800,7 +6212,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
         .pSignalSemaphores = &[_]c.VkSemaphore{ target.semaphore, target.source_semaphore },
     };
     if (trace_gpu) {
-        target.gpu_trace.describe(frame, replay, if (has_blur) .blur else if (batch_count > 1) .batched else .sampled, target.ten_bit);
+        target.gpu_trace.describe(frame, self.prepared[0..batch.count], replay, if (has_blur) .blur else if (batch_count > 1) .batched else .sampled, target.ten_bit);
         target.gpu_trace.beforeSubmit(self, frame.capture_destination != null);
     }
     if (c.vkQueueSubmit(self.queue, 1, &submit, target.fence) != c.VK_SUCCESS) {
@@ -5830,6 +6242,11 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     // Queue submission transfers ownership of every prepared object. Publish
     // those leases before any post-submit synchronization operation can fail.
     for (self.prepared[0..batch.count]) |prepared| {
+        if (prepared.direct_content) {
+            const allocation = contentAllocation(self, prepared.content_token.?) orelse unreachable;
+            allocation.image.?.layout_initialized = true;
+            continue;
+        }
         if (prepared.native_token != null or prepared.direct_external) continue;
         const cache = &self.cache[prepared.cache_index];
         if (prepared.retire_previous) {

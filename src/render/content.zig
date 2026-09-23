@@ -59,6 +59,10 @@ pub const Provider = struct {
     release_fn: *const fn (*anyopaque, u64) void,
     pinned_fn: *const fn (*anyopaque, u64) bool,
     memory_info: ?MemoryInfo = null,
+    /// Byte alignment of every row in a renderer-owned allocation. A backend
+    /// that samples allocations as linear images needs the device's pitch
+    /// alignment; 1 keeps rows packed.
+    row_alignment: u32 = 1,
     allocate_native_fn: ?*const fn (*anyopaque, render.Size, render.PixelFormat) anyerror!render.NativeBacking = null,
     prepare_native_fn: ?*const fn (*anyopaque, render.NativeBacking, render.SampleIdentity, render.ExternalSource) anyerror!void = null,
     cancel_native_fn: ?*const fn (*anyopaque, render.NativeBacking, render.SampleIdentity) void = null,
@@ -81,6 +85,8 @@ pub const Provider = struct {
 };
 
 const State = enum { free, prepared, published, replacing };
+
+const OwnedLayout = struct { stride: u32, length: usize };
 
 const Replacement = struct {
     identity: render.SampleIdentity,
@@ -157,16 +163,9 @@ pub const Store = struct {
     ) !Prepared {
         if (identity.surface == 0 or identity.commit_sequence == 0)
             return error.InvalidIdentity;
-        const packed_stride = std.math.mul(u32, source.size.width, source.format.bytesPerPixel()) catch
-            return error.InvalidSource;
-        if (source.size.width == 0 or source.size.height == 0 or
-            source.stride < packed_stride)
-            return error.InvalidSource;
-        const source_length = std.math.mul(usize, source.stride, source.size.height) catch
-            return error.InvalidSource;
-        const packed_length = std.math.mul(usize, packed_stride, source.size.height) catch
-            return error.InvalidSource;
-        if (source_length > source.bytes.len) return error.InvalidSource;
+        const layout = try self.ownedLayout(source);
+        const stride = layout.stride;
+        const length = layout.length;
 
         const predecessor_index = self.currentSlotIndex(identity.surface);
         const predecessor = if (predecessor_index) |index| &self.slots[index] else null;
@@ -182,22 +181,23 @@ pub const Store = struct {
                 return error.NonAdjacentCommit;
         }
         const compatible = if (predecessor) |slot|
-            std.meta.eql(slot.source.size, source.size) and slot.source.format == source.format
+            std.meta.eql(slot.source.size, source.size) and slot.source.format == source.format and
+                slot.source.bytes.len == length
         else
             false;
-        if (packed_length > self.byte_capacity - self.used_bytes)
+        if (length > self.byte_capacity - self.used_bytes)
             return error.ByteCapacityExceeded;
         if (trace) |t| t.emit(.{ .stage = "content-slot-begin" });
         const index = try self.claimSlot();
         if (trace) |t| t.emit(.{ .stage = "content-slot-end" });
         // Renderer-owned allocations can be sampled directly and still be
         // patched in place whenever no submitted frame pins the allocation.
-        if (trace) |t| t.emit(.{ .stage = "content-backing-begin", .bytes = packed_length });
-        const allocation = try self.allocateBytes(packed_length, true);
+        if (trace) |t| t.emit(.{ .stage = "content-backing-begin", .bytes = length });
+        const allocation = try self.allocateBytes(length, true);
         const bytes = allocation.bytes;
         errdefer self.releaseBytes(.{
             .size = source.size,
-            .stride = packed_stride,
+            .stride = stride,
             .format = source.format,
             .bytes = bytes,
             .upload = allocation.upload,
@@ -218,11 +218,11 @@ pub const Store = struct {
             @memcpy(bytes, self.slots[predecessor_index.?].source.bytes);
             if (trace) |t| t.emit(.{ .stage = "content-inherit-end" });
             if (trace) |t| t.emit(.{ .stage = "content-damage-begin" });
-            copyDamage(bytes, packed_stride, source, damage);
+            copyDamage(bytes, stride, source, damage);
             if (trace) |t| t.emit(.{ .stage = "content-damage-end" });
         } else {
             if (trace) |t| t.emit(.{ .stage = "content-full-copy-begin", .bytes = bytes.len });
-            copyFull(bytes, packed_stride, source);
+            copyFull(bytes, stride, source);
             if (trace) |t| t.emit(.{ .stage = "content-full-copy-end" });
         }
 
@@ -233,14 +233,14 @@ pub const Store = struct {
         slot.identity = identity;
         slot.source = .{
             .size = source.size,
-            .stride = packed_stride,
+            .stride = stride,
             .format = source.format,
             .bytes = bytes,
             .upload = allocation.upload,
         };
-        slot.accounted_bytes = packed_length;
+        slot.accounted_bytes = length;
         slot.current = false;
-        self.used_bytes += packed_length;
+        self.used_bytes += length;
         return .{ .index = @intCast(index), .generation = slot.generation };
     }
 
@@ -466,19 +466,9 @@ pub const Store = struct {
         if (identity.commit_sequence != next and !coversSource(damage, source.size))
             return error.NonAdjacentCommit;
 
-        const packed_stride = std.math.mul(u32, source.size.width, source.format.bytesPerPixel()) catch
-            return error.InvalidSource;
-        if (source.size.width == 0 or source.size.height == 0 or
-            source.stride < packed_stride)
-            return error.InvalidSource;
-        const source_length = std.math.mul(usize, source.stride, source.size.height) catch
-            return error.InvalidSource;
-        const packed_length = std.math.mul(usize, packed_stride, source.size.height) catch
-            return error.InvalidSource;
-        if (source_length > source.bytes.len) return error.InvalidSource;
-
+        const layout = try self.ownedLayout(source);
         if (!std.meta.eql(slot.source.size, source.size) or
-            slot.source.format != source.format or slot.source.bytes.len != packed_length)
+            slot.source.format != source.format or slot.source.bytes.len != layout.length)
         {
             if (trace) |t| t.emit(.{ .stage = "content-reuse-rejected-incompatible" });
             return self.prepareTraced(identity, source, damage, trace);
@@ -606,13 +596,13 @@ pub const Store = struct {
                 slot.state = .published;
                 return .{ .index = prepared.index, .generation = slot.generation };
             }
-            const packed_stride = slot.source.stride;
+            const stride = slot.source.stride;
             if (coversSource(replacement.damage, replacement.source.size)) {
-                copyFull(@constCast(slot.source.bytes), packed_stride, replacement.source);
+                copyFull(@constCast(slot.source.bytes), stride, replacement.source);
             } else {
                 copyDamage(
                     @constCast(slot.source.bytes),
-                    packed_stride,
+                    stride,
                     replacement.source,
                     replacement.damage,
                 );
@@ -721,6 +711,27 @@ pub const Store = struct {
         slot.* = .{ .generation = generation };
     }
 
+    /// Row stride and byte length of the renderer-owned copy of `source`:
+    /// rows hold exactly the visible pixels, padded to the provider's row
+    /// alignment so the backend can bind the allocation as a linear image.
+    fn ownedLayout(self: *const Store, source: render.Source) !OwnedLayout {
+        const row_bytes = std.math.mul(u32, source.size.width, source.format.bytesPerPixel()) catch
+            return error.InvalidSource;
+        if (source.size.width == 0 or source.size.height == 0 or
+            source.stride < row_bytes)
+            return error.InvalidSource;
+        const source_length = std.math.mul(usize, source.stride, source.size.height) catch
+            return error.InvalidSource;
+        if (source_length > source.bytes.len) return error.InvalidSource;
+        const alignment = if (self.provider) |provider| provider.row_alignment else 1;
+        if (alignment == 0 or !std.math.isPowerOfTwo(alignment)) return error.InvalidRowAlignment;
+        const stride = std.math.cast(u32, std.mem.alignForward(usize, row_bytes, alignment)) orelse
+            return error.InvalidSource;
+        const length = std.math.mul(usize, stride, source.size.height) catch
+            return error.InvalidSource;
+        return .{ .stride = stride, .length = length };
+    }
+
     fn allocateBytes(self: *Store, size: usize, native: bool) !Allocation {
         if (native) if (self.provider) |provider| return provider.allocate(size);
         const bytes = try self.allocator.alloc(u8, size);
@@ -768,17 +779,18 @@ fn validateRetainedShm(identity: render.SampleIdentity, source: render.Source) !
     return logical_bytes;
 }
 
-fn copyFull(destination: []u8, packed_stride: u32, source: render.Source) void {
-    if (source.stride == packed_stride) {
+fn copyFull(destination: []u8, destination_stride: u32, source: render.Source) void {
+    if (source.stride == destination_stride) {
         _ = libc.memcpy(destination.ptr, source.bytes.ptr, destination.len);
         return;
     }
+    const row_bytes = source.size.width * source.format.bytesPerPixel();
     for (0..source.size.height) |row| {
         const source_start = @as(usize, source.stride) * row;
-        const destination_start = @as(usize, packed_stride) * row;
+        const destination_start = @as(usize, destination_stride) * row;
         @memcpy(
-            destination[destination_start..][0..packed_stride],
-            source.bytes[source_start..][0..packed_stride],
+            destination[destination_start..][0..row_bytes],
+            source.bytes[source_start..][0..row_bytes],
         );
     }
 }
@@ -791,17 +803,17 @@ fn coversSource(damage: render.UploadDamage, size: render.Size) bool {
 
 fn copyDamage(
     destination: []u8,
-    packed_stride: u32,
+    destination_stride: u32,
     source: render.Source,
     damage: render.UploadDamage,
 ) void {
     for (damage.items()) |rect|
-        copyRect(destination, packed_stride, source, rect);
+        copyRect(destination, destination_stride, source, rect);
 }
 
 fn copyRect(
     destination: []u8,
-    packed_stride: u32,
+    destination_stride: u32,
     source: render.Source,
     damage: render.UploadRect,
 ) void {
@@ -814,7 +826,7 @@ fn copyRect(
     const byte_count = @as(usize, max_x - min_x) * source.format.bytesPerPixel();
     for (min_y..max_y) |row| {
         const source_start = @as(usize, source.stride) * row + byte_x;
-        const destination_start = @as(usize, packed_stride) * row + byte_x;
+        const destination_start = @as(usize, destination_stride) * row + byte_x;
         @memcpy(
             destination[destination_start..][0..byte_count],
             source.bytes[source_start..][0..byte_count],
@@ -1352,6 +1364,66 @@ test "render-content: GPU-pinned provider backing uses transactional copy-on-wri
     try std.testing.expectEqual(@as(u8, 0), backing.references[1]);
     TestProvider.release(&backing, old_token);
     try std.testing.expectEqual(@as(u8, 0), backing.references[0]);
+}
+
+test "render-content: provider row alignment pads owned rows and keeps damage in place" {
+    var backing: TestProvider = .{};
+    var provider = backing.provider();
+    provider.row_alignment = 16;
+    var store = try Store.initWithProvider(
+        std.testing.allocator,
+        .{ .version_capacity = 2, .byte_capacity = 64 },
+        provider,
+    );
+    defer store.deinit();
+    // Three xrgb8888 pixels per row need 12 bytes; the owned copy pads each
+    // row to 16 and accounts the padded length. Rows in the client buffer
+    // are 13 bytes apart so a whole-buffer memcpy would misplace row 1.
+    var first: [26]u8 = undefined;
+    for (&first, 0..) |*byte, index| byte.* = @intCast(index);
+    const old = store.publish(try store.prepare(
+        .{ .surface = 1, .commit_sequence = 1 },
+        testSource(&first, 3, 2, 13),
+        .{},
+    ));
+    const old_source = try store.resolve(old);
+    try std.testing.expectEqual(@as(u32, 16), old_source.stride);
+    try std.testing.expectEqual(@as(usize, 32), old_source.bytes.len);
+    try std.testing.expectEqual(@as(usize, 32), store.used_bytes);
+    try std.testing.expectEqualSlices(u8, first[0..12], old_source.bytes[0..12]);
+    try std.testing.expectEqualSlices(u8, first[13..25], old_source.bytes[16..28]);
+
+    // An in-place replacement patches the damaged pixel at the padded row.
+    var second: [26]u8 = @splat(0xaa);
+    const patched = store.publish(try store.prepareReplacing(
+        old,
+        .{ .surface = 1, .commit_sequence = 2 },
+        testSource(&second, 3, 2, 13),
+        testDamage(&.{.{ .min_x = 1, .min_y = 1, .max_x = 2, .max_y = 2 }}),
+    ));
+    const patched_source = try store.resolve(patched);
+    try std.testing.expectEqual(old_source.upload.?.token, patched_source.upload.?.token);
+    try std.testing.expectEqualSlices(u8, first[13..17], patched_source.bytes[16..20]);
+    try std.testing.expectEqualSlices(u8, &.{ 0xaa, 0xaa, 0xaa, 0xaa }, patched_source.bytes[20..24]);
+    try std.testing.expectEqualSlices(u8, first[21..25], patched_source.bytes[24..28]);
+
+    // A pinned predecessor is inherited into an equally padded allocation.
+    backing.retain(patched_source.upload.?.token);
+    defer TestProvider.release(&backing, patched_source.upload.?.token);
+    var third: [26]u8 = @splat(0x55);
+    const inherited = store.publish(try store.prepareReplacing(
+        patched,
+        .{ .surface = 1, .commit_sequence = 3 },
+        testSource(&third, 3, 2, 13),
+        testDamage(&.{.{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }}),
+    ));
+    const inherited_source = try store.resolve(inherited);
+    try std.testing.expect(inherited_source.upload.?.token != patched_source.upload.?.token);
+    try std.testing.expectEqual(@as(u32, 16), inherited_source.stride);
+    try std.testing.expectEqualSlices(u8, &.{ 0x55, 0x55, 0x55, 0x55 }, inherited_source.bytes[0..4]);
+    try std.testing.expectEqualSlices(u8, patched_source.bytes[4..32], inherited_source.bytes[4..32]);
+    store.release(patched);
+    store.release(inherited);
 }
 
 test "render-content: preparation trace separates allocation inheritance and patch without changing ownership" {

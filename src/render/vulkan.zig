@@ -354,13 +354,15 @@ pub const Renderer = struct {
             byte_count = std.math.add(usize, byte_count, length) catch
                 return error.SourceCapacityExceeded;
             if (byte_count > self.max_source_bytes) return error.SourceCapacityExceeded;
-            // Native samples retain their dimensions/stride in the packed ABI,
-            // but consume no bytes in the CPU source buffer.
-            validated.source.stride = packed_stride;
             const direct_content = if (source.source.upload) |upload|
                 upload.owner == self.implementation
             else
                 false;
+            // Native samples retain their dimensions/stride in the packed ABI,
+            // but consume no bytes in the CPU source buffer. Renderer-owned
+            // content keeps the arena's own row stride, which the backend may
+            // have padded to its linear image pitch.
+            validated.source.stride = if (direct_content) source.source.stride else packed_stride;
             const source_offset = if (direct_content)
                 std.math.cast(u32, source.source.upload.?.offset) orelse
                     return error.SourceCapacityExceeded
@@ -1234,13 +1236,17 @@ test "render-vulkan: direct upload sources do not consume fallback frame bytes" 
     defer renderer.deinit();
     var targets = try renderer.createTargets(1);
     defer renderer.destroyTargets(&targets);
-    const bytes = [_]u8{ 1, 2, 3, 4 };
+    // The arena pads rows to the device's linear pitch; the packed ABI must
+    // carry that stride so the shader steps over the padding.
+    const bytes = [_]u8{ 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     var samples = [_]render_types.SurfaceSample{ undefined, undefined };
     _ = testList(&bytes, &samples[0]);
+    samples[0].source.stride = 16;
     samples[0].source.upload = .{ .owner = &fake, .token = 1, .offset = 0 };
     samples[1] = samples[0];
     samples[1].sample.surface = 2;
     samples[1].source.upload.?.token = 2;
+    samples[1].source.upload.?.offset = 256;
     const list: render_types.List = .{
         .output = .{ .width = 1, .height = 1 },
         .output_format = .xrgb8888,
@@ -1264,8 +1270,9 @@ test "render-vulkan: direct upload sources do not consume fallback frame bytes" 
     );
     _ = linux.close(completion);
     try std.testing.expectEqual(@as(usize, 0), fake.last_byte_count);
-    try std.testing.expectEqual([4]u32{ 0, 1, 1, 4 }, fake.last_samples[0].source);
-    try std.testing.expectEqual([4]u32{ 0, 1, 1, 4 }, fake.last_samples[1].source);
+    try std.testing.expectEqual([4]u32{ 0, 1, 1, 16 }, fake.last_samples[0].source);
+    try std.testing.expectEqual([4]u32{ 256, 1, 1, 16 }, fake.last_samples[1].source);
+    try std.testing.expect(fake.last_samples[0].attributes[1] & vk.direct_content_bit != 0);
 }
 
 test "render-vulkan: post-submit completion export failure is terminal and classified" {
