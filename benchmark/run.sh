@@ -289,6 +289,14 @@ compositor_csv=$(IFS=,; printf '%s' "${compositors[*]}")
     printf 'gbm_version=%s\n' "$(pkg-config --modversion gbm)"
     printf 'libdrm_version=%s\n' "$(pkg-config --modversion libdrm)"
     printf 'kernel=%s\n' "$(uname -srmo)"
+    printf 'cpu_governor=%s\n' \
+        "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true)"
+    printf 'powercap_zones=%s\n' "$(
+        for zone in /sys/class/powercap/*; do
+            [[ -r $zone/energy_uj && -r $zone/name ]] || continue
+            printf '%s:%s,' "${zone##*/}" "$(<"$zone/name")"
+        done
+    )"
     printf 'drm_device=%s\noutput=%s\nmode=%s\nrefresh=%s\noutputs=%s\noutput_count=%s\n' \
         "$drm_device" "${output_names[0]}" "${output_modes[0]}" \
         "${output_refreshes[0]}" "$output_specs" "$output_count"
@@ -366,6 +374,7 @@ stop_strace() {
 
 snapshot() {
     local prefix=$1 pid=$2
+    date +%s%N >"$prefix.ns"
     awk '{print $14, $15}' "/proc/$pid/stat" >"$prefix.cpu"
     grep -E '^(VmRSS|VmHWM|voluntary_ctxt_switches|nonvoluntary_ctxt_switches):' \
         "/proc/$pid/status" >"$prefix.status"
@@ -376,6 +385,39 @@ snapshot() {
             awk '{print $1, $2, $14, $15}' "$task/stat" >>"$prefix.tasks"
         done
     fi
+    snapshot_fdinfo "$prefix.fdinfo" "$pid"
+    snapshot_rapl "$prefix.rapl"
+}
+
+# Copy every DRM fdinfo block owned by the compositor process. One DRM file may
+# be reachable through several duplicated descriptors, so report.py deduplicates
+# by drm-client-id rather than by fd. Engine and memory keys are driver-defined;
+# the raw blocks are retained so the report never has to guess.
+snapshot_fdinfo() {
+    local path=$1 pid=$2 fd content
+    local -a lines
+    : >"$path"
+    for fd in /proc/"$pid"/fdinfo/*; do
+        lines=()
+        { mapfile -t lines <"$fd"; } 2>/dev/null || continue
+        printf -v content '%s\n' "${lines[@]}"
+        [[ $content == *drm-client-id:* ]] || continue
+        printf 'fd: %s\n%s\n' "${fd##*/}" "$content" >>"$path"
+    done
+}
+
+# Record every powercap zone whose energy counter is readable. Zones nest
+# (package contains core/uncore/dram), so report.py never sums across zones.
+snapshot_rapl() {
+    local path=$1 zone energy name range
+    : >"$path"
+    for zone in /sys/class/powercap/*; do
+        [[ -r $zone/energy_uj && -r $zone/name ]] || continue
+        { read -r energy <"$zone/energy_uj"; } 2>/dev/null || continue
+        { read -r name <"$zone/name"; } 2>/dev/null || continue
+        { read -r range <"$zone/max_energy_range_uj"; } 2>/dev/null || range=0
+        printf '%s %s %s %s\n' "${zone##*/}" "$name" "$energy" "$range" >>"$path"
+    done
 }
 
 wait_for_socket() {

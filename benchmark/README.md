@@ -74,6 +74,29 @@ the selected SHM or DMA-BUF before every commit. Perf and `/proc` counters attac
 compositor, so client-side preparation is excluded while every compositor sees
 identical source bytes and damage.
 
+The `pre` and `gate` snapshots also copy the compositor's DRM fdinfo blocks and
+every readable powercap `energy_uj` zone, with a wall-clock timestamp per
+snapshot. GPU engine time is the sum of `drm-engine-*` deltas over unique
+`drm-client-id`s, so duplicated descriptors count once and the KMS and render
+node opens both count. It is per-process and driver-reported: i915/xe expose
+`render`, `copy`, and video engines, amdgpu exposes `gfx`, `compute`, and `dma`.
+Engines can run concurrently, so busy percent is engine time over the snapshot
+window and may exceed 100. A DRM client closed before the gate loses its time
+and marks the row `(incomplete)`. `GPU resident MiB` reads `drm-resident-*`, or
+the older `drm-memory-*`, at the gate; this is the GPU-side allocation that RSS
+excludes. Drivers without `drm-engine-*` keys report GPU as unavailable rather
+than zero.
+
+RAPL is system-wide, not per-process: it includes the benchmark clients, the
+display pipeline, and everything else on the host. Rows are comparable only
+because every compositor sees identical clients on an otherwise idle machine;
+subtract the `idle-no-client` row for the compositor's marginal cost. Zones
+nest, so the report never adds them: `package` is the primary figure, `uncore`
+approximates the integrated GPU on Intel client parts, and `psys` covers the
+whole platform where present. Reading `energy_uj` requires root on current
+kernels; unreadable zones are reported as unavailable. `metadata.env` records
+the CPU governor and the zones that were readable.
+
 No result is pixel-readback proof. A successful result proves exercised
 protocol, release, presentation, and compositor runtime behavior.
 
@@ -310,5 +333,13 @@ missed-refresh count, and the compositor process's gate RSS/HWM. Per-buffer cost
 is descriptive rather than a claim that each buffer has equal work. FPS at the
 output refresh limit is an acceptance and cadence result, not evidence that two
 compositors perform equal work. CPU excludes clients; RSS excludes helpers,
-kernel memory, and GPU allocations. Do not infer output page-flip rate, GPU
-execution time, power, or pixel correctness from these counters.
+kernel memory, and GPU allocations. Do not infer output page-flip rate or pixel
+correctness from these counters.
+
+Where the host exposes them, a second table per workload shows compositor GPU
+engine busy percent, engine milliseconds, engine time per presentation, GPU
+resident memory, watts per RAPL zone, and package millijoules per presentation.
+Engine time is driver-accounted context busy time, not shader wall time or GPU
+frequency; RAPL is whole-system energy. Both are absent, not zero, when the
+driver or kernel does not expose them, and the table is omitted for result
+trees recorded before these counters existed.

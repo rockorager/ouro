@@ -59,6 +59,158 @@ def parse_perf(path: Path) -> dict[str, float]:
     return values
 
 
+def parse_fdinfo(path: Path) -> dict[str, dict[str, Any]]:
+    """Parse DRM fdinfo blocks into one entry per unique DRM client.
+
+    Duplicated descriptors share a drm-client-id; the kernel documents that id as
+    unique per open DRM file, so it is the deduplication key. Engine busy time is
+    kept in nanoseconds; memory keys are normalised to KiB.
+    """
+    clients: dict[str, dict[str, Any]] = {}
+    if not path.exists():
+        return clients
+    for block in path.read_text().split("\n\n"):
+        fields: dict[str, str] = {}
+        for line in block.splitlines():
+            if ":" not in line or line.startswith("fd:"):
+                continue
+            key, value = line.split(":", 1)
+            fields[key.strip()] = value.strip()
+        if "drm-client-id" not in fields:
+            continue
+        identity = (
+            f"{fields.get('drm-driver', '')}/{fields.get('drm-pdev', '')}/"
+            f"{fields['drm-client-id']}"
+        )
+        if identity in clients:
+            continue
+        engines: dict[str, int] = {}
+        memory: dict[str, dict[str, int]] = {}
+        for key, value in fields.items():
+            if key.startswith("drm-engine-") and not key.startswith("drm-engine-capacity-"):
+                number, _, unit = value.partition(" ")
+                if unit != "ns":
+                    raise ValueError(f"{path}: unexpected engine unit in {key}: {value}")
+                engines[key.removeprefix("drm-engine-")] = int(number)
+                continue
+            for prefix in ("drm-memory-", "drm-total-", "drm-resident-"):
+                if key.startswith(prefix):
+                    number, _, unit = value.partition(" ")
+                    scale = {"KiB": 1, "MiB": 1024, "GiB": 1024 * 1024}.get(unit)
+                    if scale is None:
+                        raise ValueError(f"{path}: unexpected memory unit in {key}: {value}")
+                    memory.setdefault(prefix.strip("-").removeprefix("drm-"), {})[
+                        key.removeprefix(prefix)
+                    ] = int(number) * scale
+        clients[identity] = {
+            "driver": fields.get("drm-driver", ""),
+            "pdev": fields.get("drm-pdev", ""),
+            "engines": engines,
+            "memory": memory,
+        }
+    return clients
+
+
+def gpu_delta(pre_path: Path, gate_path: Path, window_ns: int | None) -> dict[str, Any] | None:
+    """Engine time consumed between the two snapshots, summed over DRM clients.
+
+    A client opened after the pre snapshot contributes its whole counter; a
+    client closed before the gate snapshot loses the time it consumed, which is
+    counted in closed_clients so a reader can tell the row is incomplete.
+    """
+    if not gate_path.exists():
+        return None
+    pre = parse_fdinfo(pre_path)
+    gate = parse_fdinfo(gate_path)
+    if not any(client["engines"] for client in gate.values()):
+        return None
+    engine_ns: dict[str, int] = {}
+    for identity, client in gate.items():
+        before = pre.get(identity, {}).get("engines", {})
+        for engine, value in client["engines"].items():
+            delta = value - before.get(engine, 0)
+            if delta < 0:
+                raise ValueError(f"{gate_path}: engine {engine} counter went backwards")
+            engine_ns[engine] = engine_ns.get(engine, 0) + delta
+    resident_kib: int | None = None
+    for client in gate.values():
+        # drm-resident-* is the documented key; drm-memory-* is the older alias
+        # some drivers still export with the same meaning.
+        regions = client["memory"].get("resident") or client["memory"].get("memory")
+        if regions:
+            resident_kib = (resident_kib or 0) + sum(regions.values())
+    total_ns = sum(engine_ns.values())
+    return {
+        "drivers": sorted({client["driver"] for client in gate.values()}),
+        "clients_pre": len(pre),
+        "clients_gate": len(gate),
+        "closed_clients": len(set(pre) - set(gate)),
+        "engine_ns": engine_ns,
+        "engine_total_ns": total_ns,
+        "busy_percent": (
+            total_ns * 100 / window_ns if window_ns else None
+        ),
+        "resident_kib": resident_kib,
+    }
+
+
+def parse_rapl(path: Path) -> dict[str, tuple[str, int, int]]:
+    """Map zone directory name to (zone name, energy_uj, max_energy_range_uj)."""
+    zones: dict[str, tuple[str, int, int]] = {}
+    if not path.exists():
+        return zones
+    for line in path.read_text().splitlines():
+        directory, name, energy, max_range = line.split()
+        zones[directory] = (name, int(energy), int(max_range))
+    return zones
+
+
+RAPL_ZONE_ORDER = ("package", "psys", "core", "uncore", "dram")
+
+
+def rapl_delta(pre_path: Path, gate_path: Path, window_ns: int | None) -> dict[str, Any] | None:
+    """Energy per powercap zone between the two snapshots, keyed by zone name.
+
+    Multi-socket packages (package-0, package-1) fold into one ``package`` key.
+    Zones nest, so the caller must never add zones together. RAPL is system-wide:
+    it includes the benchmark clients and every other process on the host.
+    """
+    pre = parse_rapl(pre_path)
+    gate = parse_rapl(gate_path)
+    if not gate:
+        return None
+    energy_uj: dict[str, int] = {}
+    for directory, (name, gate_energy, max_range) in gate.items():
+        if directory not in pre:
+            raise ValueError(f"{gate_path}: zone {directory} missing from pre snapshot")
+        delta = gate_energy - pre[directory][1]
+        if delta < 0:
+            if max_range <= 0:
+                raise ValueError(f"{gate_path}: zone {directory} wrapped without a range")
+            delta += max_range + 1
+        key = "package" if name.startswith("package") else name
+        energy_uj[key] = energy_uj.get(key, 0) + delta
+    return {
+        "energy_uj": energy_uj,
+        "watts": (
+            {key: value / window_ns * 1000 for key, value in energy_uj.items()}
+            if window_ns
+            else None
+        ),
+    }
+
+
+def snapshot_window_ns(directory: Path) -> int | None:
+    pre_path = directory / "pre.ns"
+    gate_path = directory / "gate.ns"
+    if not (pre_path.exists() and gate_path.exists()):
+        return None
+    window = int(gate_path.read_text()) - int(pre_path.read_text())
+    if window <= 0:
+        raise ValueError(f"{directory}: snapshot window is not positive")
+    return window
+
+
 def percentile(values: list[int], percent: int) -> float | None:
     if not values:
         return None
@@ -76,6 +228,9 @@ def run_record(directory: Path, workload: str, compositor: str, run: int) -> dic
     pre_status = parse_status(directory / "pre.status")
     gate_status = parse_status(directory / "gate.status")
     perf = parse_perf(directory / "perf.csv")
+    window_ns = snapshot_window_ns(directory)
+    gpu = gpu_delta(directory / "pre.fdinfo", directory / "gate.fdinfo", window_ns)
+    rapl = rapl_delta(directory / "pre.rapl", directory / "gate.rapl", window_ns)
     if kind in ("idle", "hold", "client-churn"):
         clients = []
         measured_ns = int(case["duration_seconds"]) * 1_000_000_000
@@ -140,6 +295,9 @@ def run_record(directory: Path, workload: str, compositor: str, run: int) -> dic
             "involuntary_context_switches": gate_status["nonvoluntary_ctxt_switches"]
             - pre_status["nonvoluntary_ctxt_switches"],
             "perf": perf,
+            "snapshot_window_ns": window_ns,
+            "gpu": gpu,
+            "rapl": rapl,
         }
     client_paths = [directory / f"client-{index}.log" for index in range(1, client_count + 1)]
     clients = [parse_client(path) for path in client_paths]
@@ -285,6 +443,9 @@ def run_record(directory: Path, workload: str, compositor: str, run: int) -> dic
         "involuntary_context_switches": gate_status["nonvoluntary_ctxt_switches"]
         - pre_status["nonvoluntary_ctxt_switches"],
         "perf": perf,
+        "snapshot_window_ns": window_ns,
+        "gpu": gpu,
+        "rapl": rapl,
     }
 
 
@@ -305,6 +466,52 @@ def perf_median(records: list[dict[str, Any]], field: str) -> float | None:
 def derived_perf_median(records: list[dict[str, Any]], function: Any) -> float | None:
     values = [function(record) for record in records if "task-clock" in record["perf"]]
     return float(statistics.median(values)) if values else None
+
+
+def gpu_median(records: list[dict[str, Any]], field: str) -> float | None:
+    values = [
+        record["gpu"][field]
+        for record in records
+        if record["gpu"] is not None and record["gpu"][field] is not None
+    ]
+    return float(statistics.median(values)) if values else None
+
+
+def rapl_watts_median(records: list[dict[str, Any]]) -> dict[str, float]:
+    zones = sorted(
+        {
+            zone
+            for record in records
+            if record["rapl"] is not None and record["rapl"]["watts"] is not None
+            for zone in record["rapl"]["watts"]
+        }
+    )
+    return {
+        zone: float(
+            statistics.median(
+                record["rapl"]["watts"][zone]
+                for record in records
+                if record["rapl"] is not None
+                and record["rapl"]["watts"] is not None
+                and zone in record["rapl"]["watts"]
+            )
+        )
+        for zone in zones
+    }
+
+
+def rapl_energy_median(records: list[dict[str, Any]], zone: str) -> float | None:
+    values = [
+        record["rapl"]["energy_uj"][zone]
+        for record in records
+        if record["rapl"] is not None and zone in record["rapl"]["energy_uj"]
+    ]
+    return float(statistics.median(values)) if values else None
+
+
+def zone_order(zones: set[str]) -> list[str]:
+    known = [zone for zone in RAPL_ZONE_ORDER if zone in zones]
+    return known + sorted(zones - set(RAPL_ZONE_ORDER))
 
 
 def fmt(value: float | None, divisor: float = 1.0, digits: int = 2) -> str:
@@ -377,6 +584,8 @@ def aggregate(
             task_clock_ms = perf_median(values, "task-clock")
             actual_window_ns = median(values, "actual_window_ns")
             buffers_per_frame = values[0]["buffers_per_frame"]
+            gpu_engine_ns = gpu_median(values, "engine_total_ns")
+            package_uj = rapl_energy_median(values, "package")
             summaries.append(
                 {
                     "workload": workload,
@@ -463,9 +672,92 @@ def aggregate(
                     ),
                     "context_switches_median": perf_median(values, "context-switches"),
                     "page_faults_median": perf_median(values, "page-faults"),
+                    "gpu_drivers": sorted(
+                        {
+                            driver
+                            for value in values
+                            if value["gpu"] is not None
+                            for driver in value["gpu"]["drivers"]
+                        }
+                    ),
+                    "gpu_engines": sorted(
+                        {
+                            engine
+                            for value in values
+                            if value["gpu"] is not None
+                            for engine, ns in value["gpu"]["engine_ns"].items()
+                            if ns > 0
+                        }
+                    ),
+                    "gpu_closed_clients_max": max(
+                        (value["gpu"]["closed_clients"] for value in values
+                         if value["gpu"] is not None),
+                        default=None,
+                    ),
+                    "gpu_engine_ms_median": (
+                        gpu_engine_ns / 1_000_000
+                        if gpu_engine_ns is not None
+                        else None
+                    ),
+                    "gpu_busy_percent_median": gpu_median(values, "busy_percent"),
+                    "gpu_us_per_presented": (
+                        gpu_engine_ns / 1000 / (frames * clients)
+                        if gpu_engine_ns is not None and kind == "paced" and frames * clients > 0
+                        else None
+                    ),
+                    "gpu_resident_kib_median": gpu_median(values, "resident_kib"),
+                    "rapl_watts_median": rapl_watts_median(values),
+                    "package_mj_per_presented": (
+                        package_uj / 1000 / (frames * clients)
+                        if package_uj is not None and kind == "paced" and frames * clients > 0
+                        else None
+                    ),
                 }
             )
     return summaries
+
+
+def print_gpu_energy(
+    workload_summaries: list[dict[str, Any]], compositors: tuple[str, ...], unit: str
+) -> None:
+    """Second table per workload: DRM engine time and RAPL energy.
+
+    Printed only when at least one supported row has either source; older
+    result trees without fdinfo/powercap snapshots keep their original output.
+    """
+    supported = [item for item in workload_summaries if item["status"] == "supported"]
+    has_gpu = any(item["gpu_busy_percent_median"] is not None for item in supported)
+    zones = zone_order({zone for item in supported for zone in item["rapl_watts_median"]})
+    if not has_gpu and not zones:
+        return
+    print()
+    header = "| Compositor | GPU busy % | GPU engine ms | GPU µs/" + unit + " | GPU resident MiB"
+    align = "|---|---:|---:|---:|---:"
+    for zone in zones:
+        header += f" | {zone} W"
+        align += "|---:"
+    header += " | package mJ/" + unit + " |"
+    align += "|---:|"
+    print(header)
+    print(align)
+    for compositor in compositors:
+        summary = next(item for item in workload_summaries if item["compositor"] == compositor)
+        if summary["status"] == "unsupported":
+            print(f"| {compositor} | — | — | — | —" + " | —" * len(zones) + " | — |")
+            continue
+        busy = fmt(summary["gpu_busy_percent_median"], digits=1)
+        if summary["gpu_closed_clients_max"]:
+            busy += " (incomplete)"
+        row = (
+            f"| {compositor} | {busy} | "
+            f"{fmt(summary['gpu_engine_ms_median'], digits=1)} | "
+            f"{fmt(summary['gpu_us_per_presented'])} | "
+            f"{fmt(summary['gpu_resident_kib_median'], 1024, 1)}"
+        )
+        for zone in zones:
+            row += f" | {fmt(summary['rapl_watts_median'].get(zone))}"
+        row += f" | {fmt(summary['package_mj_per_presented'])} |"
+        print(row)
 
 
 def print_markdown(summaries: list[dict[str, Any]], compositors: tuple[str, ...]) -> None:
@@ -509,6 +801,7 @@ def print_markdown(summaries: list[dict[str, Any]], compositors: tuple[str, ...]
                     f"{fmt(summary['rss_kib_median'], 1024, 1)} | "
                     f"{fmt(summary['hwm_kib_median'], 1024, 1)} |"
                 )
+            print_gpu_energy(workload_summaries, compositors, "operation")
             continue
         callback_only = workload_summaries[0].get("pacing") == "callback-only"
         cadence_label = "Callback Hz" if callback_only else "Surface FPS"
@@ -552,6 +845,9 @@ def print_markdown(summaries: list[dict[str, Any]], compositors: tuple[str, ...]
                 f"{fmt(summary['rss_kib_median'], 1024, 1)} |"
                 f" {fmt(summary['hwm_kib_median'], 1024, 1)} |"
             )
+        print_gpu_energy(
+            workload_summaries, compositors, "callback" if callback_only else "presented"
+        )
 
 
 def main() -> int:
