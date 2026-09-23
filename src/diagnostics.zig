@@ -125,6 +125,10 @@ pub const Recorder = struct {
     read: std.atomic.Value(usize) = .init(0),
     dropped: std.atomic.Value(u64) = .init(0),
     stopping: std.atomic.Value(bool) = .init(false),
+    /// Futex word: 1 while the reporting thread sleeps with an empty queue.
+    /// The producer clears it and wakes the sleeper, so an idle compositor
+    /// costs the recorder no timer wakeups at all.
+    parked: std.atomic.Value(u32) = .init(0),
     thread: ?std.Thread = null,
     /// Borrowed sink, defaulting to the existing session log. Never closed here.
     output_fd: linux.fd_t = 2,
@@ -137,7 +141,8 @@ pub const Recorder = struct {
     /// Stop only after the producer is finished. Joining may wait for the log
     /// sink, but never occurs in the compositor's active event loop.
     pub fn stop(self: *Recorder) void {
-        self.stopping.store(true, .release);
+        self.stopping.store(true, .seq_cst);
+        self.wake();
         if (self.thread) |thread| thread.join();
         self.thread = null;
     }
@@ -167,7 +172,30 @@ pub const Recorder = struct {
             return;
         }
         self.queue[tail % queue_capacity] = event;
-        self.written.store(tail +% 1, .release);
+        self.written.store(tail +% 1, .seq_cst);
+        self.wake();
+    }
+
+    /// One uncontended atomic swap on the producer path; the syscall happens
+    /// only when the reporting thread is actually parked.
+    fn wake(self: *Recorder) void {
+        if (self.parked.swap(0, .seq_cst) == 0) return;
+        _ = linux.futex_3arg(&self.parked.raw, .{ .cmd = .WAKE, .private = true }, 1);
+    }
+
+    /// Park until the producer publishes, stop is requested, or the pending
+    /// report falls due. Returns immediately if either already happened.
+    fn park(self: *Recorder, timeout_ns: ?u64) void {
+        self.parked.store(1, .seq_cst);
+        defer self.parked.store(0, .seq_cst);
+        if (self.stopping.load(.seq_cst) or
+            self.read.load(.monotonic) != self.written.load(.seq_cst)) return;
+        var timeout: linux.timespec = undefined;
+        if (timeout_ns) |ns| timeout = .{
+            .sec = @intCast(ns / std.time.ns_per_s),
+            .nsec = @intCast(ns % std.time.ns_per_s),
+        };
+        _ = linux.futex_4arg(&self.parked.raw, .{ .cmd = .WAIT, .private = true }, 1, if (timeout_ns != null) &timeout else null);
     }
 
     /// Single consumer; also permits deterministic analysis without a worker.
@@ -188,21 +216,28 @@ pub const Recorder = struct {
         var analyzer: Analyzer = .{};
         while (true) {
             // Bound each drain even when the producer stays busy.
+            var drained = false;
             for (0..queue_capacity) |_| {
                 analyzer.add(self.take() orelse break);
+                drained = true;
             }
             const now = clock(c.CLOCK_MONOTONIC) orelse 0;
             const dropped = self.dropped.load(.monotonic);
             if (analyzer.due(now, dropped)) analyzer.report(self.output_fd, now, dropped);
-            if (self.stopping.load(.acquire) and
-                self.read.load(.monotonic) == self.written.load(.acquire))
+            if (self.stopping.load(.seq_cst) and
+                self.read.load(.monotonic) == self.written.load(.seq_cst))
             {
                 if (analyzer.pending or dropped != analyzer.reported_dropped)
                     analyzer.report(self.output_fd, now, dropped);
                 return;
             }
-            const delay: linux.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
-            _ = linux.nanosleep(&delay, null);
+            if (drained) {
+                // Batch a busy producer instead of waking per record.
+                const delay: linux.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+                _ = linux.nanosleep(&delay, null);
+                continue;
+            }
+            self.park(analyzer.remaining(now, dropped));
         }
     }
 };
@@ -269,10 +304,15 @@ pub const Analyzer = struct {
     }
 
     pub fn due(self: *const Analyzer, now: u64, dropped: u64) bool {
-        if (!self.pending and dropped == self.reported_dropped) return false;
-        if (self.last_report_ns) |last| return now -| last >= report_interval_ns;
+        return (self.remaining(now, dropped) orelse return false) == 0;
+    }
+
+    /// Nanoseconds until the next report, or null when nothing is pending.
+    pub fn remaining(self: *const Analyzer, now: u64, dropped: u64) ?u64 {
+        if (!self.pending and dropped == self.reported_dropped) return null;
+        if (self.last_report_ns) |last| return (last + report_interval_ns) -| now;
         // Allow post-incident context to arrive before the first report.
-        return now -| self.first_pending_ns >= std.time.ns_per_s;
+        return (self.first_pending_ns + std.time.ns_per_s) -| now;
     }
 
     fn report(self: *Analyzer, fd: linux.fd_t, now: u64, dropped: u64) void {
@@ -337,6 +377,32 @@ test "flight recorder bounds stalled-consumer storage and resumes without overwr
     try std.testing.expectEqual(7, recorder.take().?.start_ns);
 }
 
+test "idle recorder parks without timer wakeups and is woken by records and stop" {
+    var recorder: Recorder = .{ .output_fd = -1 };
+    try recorder.start();
+    try waitFor(&recorder, .parked);
+    // Nothing is pending, so the parked thread has no timeout to wake on;
+    // only the producer's futex wake can make it drain this record.
+    recorder.record(.{ .kind = .commit, .start_ns = 1, .end_ns = 2 });
+    try waitFor(&recorder, .drained);
+    try waitFor(&recorder, .parked);
+    recorder.stop(); // must wake the parked thread rather than hang
+    try std.testing.expect(recorder.thread == null);
+}
+
+fn waitFor(recorder: *Recorder, condition: enum { parked, drained }) !void {
+    for (0..2000) |_| {
+        const done = switch (condition) {
+            .parked => recorder.parked.load(.seq_cst) == 1,
+            .drained => recorder.read.load(.seq_cst) == recorder.written.load(.seq_cst),
+        };
+        if (done) return;
+        const delay: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = linux.nanosleep(&delay, null);
+    }
+    return error.RecorderThreadStalled;
+}
+
 test "automatic budgets detect imperceptible work and preserve before and after context" {
     var analyzer: Analyzer = .{};
     for (0..40) |i| analyzer.add(.{ .kind = .commit, .start_ns = i, .end_ns = i + 1 });
@@ -357,13 +423,16 @@ test "automatic budgets detect imperceptible work and preserve before and after 
     try std.testing.expectEqual(1, summary.slow);
     try std.testing.expectEqual(1, summary.histogram[5]);
     try std.testing.expect(!analyzer.due(slow.end_ns, 0));
+    try std.testing.expectEqual(std.time.ns_per_s, analyzer.remaining(slow.end_ns, 0).?);
     try std.testing.expect(analyzer.due(slow.end_ns + std.time.ns_per_s, 0));
     analyzer.last_report_ns = slow.end_ns;
     try std.testing.expect(!analyzer.due(slow.end_ns + 29 * std.time.ns_per_s, 0));
+    try std.testing.expectEqual(std.time.ns_per_s, analyzer.remaining(slow.end_ns + 29 * std.time.ns_per_s, 0).?);
     try std.testing.expect(analyzer.due(slow.end_ns + 30 * std.time.ns_per_s, 0));
     const reported_at = slow.end_ns + 30 * std.time.ns_per_s;
     analyzer.report(-1, reported_at, 0);
     try std.testing.expect(!analyzer.due(reported_at + report_interval_ns, 0));
+    try std.testing.expect(analyzer.remaining(reported_at, 0) == null); // nothing pending: park forever
     analyzer.add(slow); // repeated incidents count, but cannot flood the sink
     try std.testing.expectEqual(2, analyzer.summaries[@intFromEnum(Kind.content_inherit)].slow);
     try std.testing.expect(!analyzer.due(reported_at + std.time.ns_per_s, 0));
