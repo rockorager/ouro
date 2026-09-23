@@ -264,6 +264,21 @@ pub const RenderDevice = struct {
         };
     }
 
+    /// Writes the `get-memory` control result: the CPU-side content store
+    /// plus the renderer's own device memory when it accounts for it.
+    pub fn writeMemoryReport(self: *const RenderDevice, writer: *std.Io.Writer) !void {
+        const renderer = if (self.renderer) |*value| value else null;
+        const report = .{
+            .renderer = self.rendererKind(),
+            .content_store = .{ .allocated_bytes = self.content.allocatedBytes() },
+            .vulkan = if (renderer) |value| switch (value.*) {
+                .vulkan => |*vulkan_renderer| vulkan_renderer.memoryReport(),
+                .pixman => null,
+            } else null,
+        };
+        try std.json.Stringify.value(report, .{}, writer);
+    }
+
     pub fn matches(self: *const RenderDevice, card: *const drm.Card) bool {
         return std.mem.eql(u8, self.card.stablePath(), card.stablePath());
     }
@@ -277,6 +292,27 @@ pub const RenderDevice = struct {
         allocator.destroy(self);
     }
 };
+
+test "drm-output: memory report names the renderer and omits device memory without one" {
+    var device: RenderDevice = .{
+        .allocator = std.testing.allocator,
+        .card = undefined,
+        .content = try render_content.Store.init(std.testing.allocator, .{ .version_capacity = 4, .byte_capacity = 1 << 20 }),
+        .renderer = null,
+    };
+    defer device.content.deinit();
+    var storage: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&storage);
+    try device.writeMemoryReport(&writer);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.buffered(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(std.json.Value.null, parsed.value.object.get("renderer").?);
+    try std.testing.expectEqual(std.json.Value.null, parsed.value.object.get("vulkan").?);
+    try std.testing.expectEqual(
+        @as(i64, @intCast(device.content.allocatedBytes())),
+        parsed.value.object.get("content_store").?.object.get("allocated_bytes").?.integer,
+    );
+}
 
 pub const ImportedSource = struct {
     access: union(enum) {

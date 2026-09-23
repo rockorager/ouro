@@ -83,6 +83,13 @@ fn writeTools(writer: *std.Io.Writer) !void {
         \\,"outputSchema":{"type":"object","required":["windows","outputs","workspaces","focused"],"properties":{"windows":{"type":"array"},"outputs":{"type":"array"},"workspaces":{"type":"array"},"focused":{"type":["object","null"]}}}},
     );
     try writer.writeAll(
+        \\{"name":"get-memory","description":"Read the renderer's device memory by purpose: retained shm content, cached textures, per-output staging and blur images, the linear scratch image, LUTs, and imported client dmabufs. Byte counts cover only compositor-owned allocations.","inputSchema":
+    );
+    try writer.writeAll(empty_schema);
+    try writer.writeAll(
+        \\,"outputSchema":{"type":"object","required":["renderer","content_store"],"properties":{"renderer":{"type":["string","null"]},"content_store":{"type":"object"},"vulkan":{"type":["object","null"]}}}},
+    );
+    try writer.writeAll(
         \\{"name":"reload-config","description":"Request a reload of --config files. In ourosettings mode settings update automatically and this tool returns an error.","inputSchema":
     );
     try writer.writeAll(empty_schema);
@@ -96,15 +103,20 @@ pub fn writeDescriptor(writer: *std.Io.Writer) !void {
     try writer.writeByte('}');
 }
 
-pub const Command = union(enum) { action: config.Action, get_state, reload_config };
+pub const Command = union(enum) { action: config.Action, get_state, get_memory, reload_config };
 
 /// Returned variable-length action data belongs to the caller's arena.
 pub fn decode(allocator: std.mem.Allocator, name: []const u8, arguments: std.json.Value) !Command {
     if (arguments != .object) return error.InvalidArguments;
-    if (std.mem.eql(u8, name, "get-state") or std.mem.eql(u8, name, "reload-config")) {
+    const argumentless = [_]struct { name: []const u8, command: Command }{
+        .{ .name = "get-state", .command = .get_state },
+        .{ .name = "get-memory", .command = .get_memory },
+        .{ .name = "reload-config", .command = .reload_config },
+    };
+    for (argumentless) |entry| if (std.mem.eql(u8, name, entry.name)) {
         if (arguments.object.count() != 0) return error.InvalidArguments;
-        return if (std.mem.eql(u8, name, "get-state")) .get_state else .reload_config;
-    }
+        return entry.command;
+    };
     const declaration = for (actions) |action| {
         if (std.mem.eql(u8, name, action.name)) break action;
     } else return error.UnknownTool;
@@ -233,7 +245,11 @@ test "MCP control catalog shares declarations and validates asymmetric arguments
     try writeCatalog(&out.writer);
     const catalog = try std.json.parseFromSlice(std.json.Value, a, out.written(), .{});
     const tools = catalog.value.object.get("tools").?.array.items;
-    try std.testing.expectEqual(actions.len + 2, tools.len);
+    try std.testing.expectEqual(actions.len + 3, tools.len);
+    try std.testing.expectEqualStrings("get-state", tools[actions.len].object.get("name").?.string);
+    try std.testing.expectEqualStrings("get-memory", tools[actions.len + 1].object.get("name").?.string);
+    try std.testing.expectEqualStrings("reload-config", tools[actions.len + 2].object.get("name").?.string);
+    try std.testing.expectEqual(Command.get_memory, try decode(a, "get-memory", .{ .object = .empty }));
     for (actions, tools[0..actions.len]) |action, tool| {
         try std.testing.expectEqualStrings(action.name, tool.object.get("name").?.string);
         const source = switch (action.action) {

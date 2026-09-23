@@ -326,14 +326,20 @@ authorization**. Existing socket paths are never unlinked on startup.
 | `close`, `toggle-fullscreen`, `toggle-maximized`, `toggle-floating`, `exit` | `{}` |
 | `run` | `{"argv": ["application", "argument"]}` |
 | `call` | `{"address": "unix:/absolute/path", "method": "tool-name", "arguments": {}}` |
-| `get-state`, `reload-config` | `{}` |
+| `get-state`, `get-memory`, `reload-config` | `{}` |
 
 Controls use the same typed dispatch as keybindings at a turn boundary. Their
 success result means **accepted**, not that a client has repainted, closed, or
 completed a remote call. `get-state` returns `structuredContent` with window
 IDs (index and generation), titles, app IDs, logical state/workspace membership,
 published geometry, output IDs/bounds/work areas, and active or occupied
-workspaces. `reload-config` requests an asynchronous file reload; it returns a
+workspaces. `get-memory` returns the renderer's device memory by purpose:
+committed retained-content slots and the versions still alive in them, cached
+and native textures, per-output staging and blur images, the shared linear
+scratch image, LUTs, and imported client dmabufs (counted in pixels, since
+clients own that memory). Compare it with the process's `/proc/<pid>/fdinfo`
+to see what the kernel attributes to Ouro beyond the compositor's own
+allocations. `reload-config` requests an asynchronous file reload; it returns a
 tool error in settings mode, where updates already arrive automatically.
 Structured tool results also include the identical serialized JSON in a text
 content block, so content-only MCP hosts can read state and acknowledgments.

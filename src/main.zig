@@ -406,7 +406,7 @@ pub fn main(init: std.process.Init) !void {
                 // Large snapshot buffers are transient heap allocations, not
                 // part of the compositor stack or every action acknowledgment.
                 var small_response: [4096]u8 = undefined;
-                const response_storage = if (command == .get_state)
+                const response_storage = if (command == .get_state or command == .get_memory)
                     try arena.allocator().alloc(u8, ouro.mcp_server.maximum_frame_size - 2048)
                 else
                     &small_response;
@@ -528,6 +528,14 @@ fn executeControl(
             defer allocator.free(state_storage);
             var state = std.Io.Writer.fixed(state_storage);
             try coordinator.desktop.writeControlState(&state);
+            try ouro.control.writeStateResult(writer, state.buffered());
+            return false;
+        },
+        .get_memory => {
+            const device = coordinator.render_device orelse return error.RendererUnavailable;
+            var state_storage: [8192]u8 = undefined;
+            var state = std.Io.Writer.fixed(&state_storage);
+            try device.writeMemoryReport(&state);
             try ouro.control.writeStateResult(writer, state.buffered());
             return false;
         },

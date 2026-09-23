@@ -213,6 +213,10 @@ pub const Renderer = struct {
         return self.platform.supportsTarget(self.implementation, allocation);
     }
 
+    pub fn memoryReport(self: *const Renderer) ?vk.MemoryReport {
+        return self.platform.memoryReport(self.implementation);
+    }
+
     /// Success returns a new sync_file FD owned by the caller. Ordinary failure
     /// leaves the R10 image discardable. `CompletionExportFailedAfterSubmit`
     /// is different: GPU work owns the image, so R14 must retain it, terminally

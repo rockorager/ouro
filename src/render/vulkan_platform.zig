@@ -117,6 +117,7 @@ pub const Platform = struct {
         packs_sources: *const fn (*anyopaque, Renderer) bool,
         cache_lut: *const fn (*anyopaque, Renderer, *const icc.Lut) anyerror!u32,
         supports_precise_capture: ?*const fn (*anyopaque, Renderer, render.Size) bool = null,
+        memory_report: ?*const fn (*anyopaque, Renderer) MemoryReport = null,
     };
 
     pub fn create(self: Platform, fd: std.posix.fd_t, config: Config) !Renderer {
@@ -189,6 +190,45 @@ pub const Platform = struct {
         const supports = self.vtable.supports_precise_capture orelse return false;
         return supports(self.context, renderer, size);
     }
+    /// Renderer-owned device memory by purpose, or null when the platform
+    /// does not account for it (test doubles).
+    pub fn memoryReport(self: Platform, renderer: Renderer) ?MemoryReport {
+        const report = self.vtable.memory_report orelse return null;
+        return report(self.context, renderer);
+    }
+};
+
+/// Snapshot of the device memory the renderer holds, grouped by what holds
+/// it. Everything except `imported_dmabufs` is memory the compositor itself
+/// allocated; imported dmabufs are client-owned and only shared into the
+/// device, so they are reported as pixel counts rather than bytes.
+pub const MemoryReport = struct {
+    content: struct {
+        /// Virtual arena size; only `committed_bytes` are backed by memory.
+        capacity_bytes: usize,
+        slot_bytes: usize,
+        committed_slots: usize,
+        committed_bytes: usize,
+        /// Content versions clients or in-flight frames still reference.
+        live_allocations: usize,
+        live_bytes: usize,
+    },
+    textures: struct {
+        /// Device-local copies of sampled shm content, keyed by surface.
+        cached_count: usize,
+        cached_bytes: usize,
+        /// Device-local images uploaded straight from client buffers.
+        native_count: usize,
+        native_bytes: usize,
+    },
+    targets: struct {
+        count: usize,
+        staging_bytes: usize,
+        blur_bytes: usize,
+    },
+    linear_scratch: ?struct { width: u32, height: u32, bytes: usize },
+    lut: struct { capacity: usize, count: usize, bytes: usize },
+    imported_dmabufs: struct { count: usize, pixels: u64 },
 };
 
 var real_context: u8 = 0;
@@ -212,6 +252,7 @@ const real_vtable: Platform.VTable = .{
     .packs_sources = realPacksSources,
     .cache_lut = realCacheLut,
     .supports_precise_capture = realSupportsPreciseCapture,
+    .memory_report = realMemoryReport,
 };
 
 const device_extensions = [_][*:0]const u8{
@@ -237,6 +278,8 @@ const Texture = struct {
     memory: c.VkDeviceMemory,
     view: c.VkImageView,
     size: render.Size,
+    /// Device memory bound to the image; zero for test doubles.
+    bytes: usize = 0,
     initialized: bool = false,
 };
 
@@ -536,6 +579,11 @@ const RealRenderer = struct {
     /// 1×1 image bound at binding 5 until the scratch exists, because the
     /// composite shader statically references it.
     linear_placeholder: LinearImage,
+    /// Live imported targets and the per-target device memory that
+    /// `MemoryReport` sums; targets are otherwise owned by their outputs.
+    target_count: usize,
+    target_staging_bytes: usize,
+    target_blur_bytes: usize,
     resource_epoch: u64,
     gpu_clock: GpuClock,
 };
@@ -546,6 +594,7 @@ const LinearImage = struct {
     view: c.VkImageView,
     width: u32,
     height: u32,
+    bytes: usize,
 };
 
 const GpuClock = struct {
@@ -1135,6 +1184,7 @@ const RealTarget = struct {
     blur_descriptor_pool: c.VkDescriptorPool,
     blur_descriptor_sets: [4]c.VkDescriptorSet,
     blur_initialized_layout: bool = false,
+    blur_bytes: usize = 0,
     sample_buffer: c.VkBuffer,
     sample_memory: c.VkDeviceMemory,
     sample_map: *anyopaque,
@@ -1837,6 +1887,9 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     errdefer destroyBuffer(self, self.content_placeholder_buffer, self.content_placeholder_memory);
     self.linear_scratch = null;
     self.linear_placeholder = try createLinearImage(self, 1, 1);
+    self.target_count = 0;
+    self.target_staging_bytes = 0;
+    self.target_blur_bytes = 0;
     return @ptrCast(self);
 }
 
@@ -2056,6 +2109,75 @@ fn realSupportsPreciseCapture(_: *anyopaque, renderer: Renderer, size: render.Si
     var properties: c.VkPhysicalDeviceProperties = undefined;
     c.vkGetPhysicalDeviceProperties(self.physical_device, &properties);
     return bytes != 0 and bytes <= properties.limits.maxStorageBufferRange;
+}
+
+fn realMemoryReport(_: *anyopaque, renderer: Renderer) MemoryReport {
+    const self: *RealRenderer = @ptrCast(@alignCast(renderer));
+    var committed_slots: usize = 0;
+    var committed_bytes: usize = 0;
+    for (self.content_backings[0..self.content_backing_count]) |backing| {
+        committed_slots += backing.slot_count;
+        committed_bytes += backing.size;
+    }
+    var live_allocations: usize = 0;
+    var live_bytes: usize = 0;
+    for (self.content_allocations) |allocation| {
+        if (!allocation.active) continue;
+        live_allocations += 1;
+        live_bytes += allocation.size;
+    }
+    var cached_count: usize = 0;
+    var cached_bytes: usize = 0;
+    for (self.cache) |entry| {
+        if (!entry.occupied) continue;
+        cached_count += 1;
+        cached_bytes += entry.texture.bytes;
+    }
+    var native_count: usize = 0;
+    var native_bytes: usize = 0;
+    for (self.native_allocations) |allocation| {
+        if (!allocation.active) continue;
+        native_count += 1;
+        native_bytes += allocation.texture.bytes;
+    }
+    var imported_count: usize = 0;
+    var imported_pixels: u64 = 0;
+    for (self.imported_images) |image| {
+        if (!image.occupied) continue;
+        imported_count += 1;
+        imported_pixels += @as(u64, image.size.width) * image.size.height;
+    }
+    return .{
+        .content = .{
+            .capacity_bytes = self.content_buffer_size,
+            .slot_bytes = @as(usize, 1) << self.content_chunk_shift,
+            .committed_slots = committed_slots,
+            .committed_bytes = committed_bytes,
+            .live_allocations = live_allocations,
+            .live_bytes = live_bytes,
+        },
+        .textures = .{
+            .cached_count = cached_count,
+            .cached_bytes = cached_bytes,
+            .native_count = native_count,
+            .native_bytes = native_bytes,
+        },
+        .targets = .{
+            .count = self.target_count,
+            .staging_bytes = self.target_staging_bytes,
+            .blur_bytes = self.target_blur_bytes,
+        },
+        .linear_scratch = if (self.linear_scratch) |scratch|
+            .{ .width = scratch.width, .height = scratch.height, .bytes = scratch.bytes }
+        else
+            null,
+        .lut = .{
+            .capacity = self.lut_capacity,
+            .count = self.lut_count,
+            .bytes = lutBufferSize(self.lut_capacity),
+        },
+        .imported_dmabufs = .{ .count = imported_count, .pixels = imported_pixels },
+    };
 }
 
 fn realContentProvider(_: *anyopaque, renderer: Renderer) ?render_content.Provider {
@@ -3241,6 +3363,12 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
     _ = try createHostBuffer(self, initial_staging, 0, &target.source_buffer, &target.source_memory, &target.source_map);
     target.source_buffer_size = initial_staging;
     errdefer destroyBuffer(self, target.source_buffer, target.source_memory);
+    self.target_count += 1;
+    self.target_staging_bytes += initial_staging;
+    errdefer {
+        self.target_count -= 1;
+        self.target_staging_bytes -= initial_staging;
+    }
 
     try growTargetBatches(self, target, 1);
     errdefer destroyTargetBatchResources(self, target);
@@ -3299,6 +3427,8 @@ fn realDestroyTarget(_: *anyopaque, renderer: Renderer, target_value: Target) vo
     destroyTargetBatchResources(self, target);
     target.recorded_sampled_frame.deinit(std.heap.c_allocator);
     destroyBuffer(self, target.source_buffer, target.source_memory);
+    self.target_count -= 1;
+    self.target_staging_bytes -= target.source_buffer_size;
     c.vkDestroyImageView(self.device, target.view, null);
     c.vkDestroyImage(self.device, target.image, null);
     c.vkFreeMemory(self.device, target.image_memory, null);
@@ -3590,6 +3720,7 @@ fn growTargetSource(self: *RealRenderer, target: *RealTarget, size: usize) !void
     target.source_buffer = buffer;
     target.source_memory = memory;
     target.source_map = map;
+    self.target_staging_bytes += size - target.source_buffer_size;
     target.source_buffer_size = size;
     growTargetBatches(self, target, old_batches) catch |err| {
         // The old descriptors referenced the destroyed source buffer and cannot
@@ -6305,7 +6436,7 @@ fn createLinearImage(self: *RealRenderer, width: u32, height: u32) !LinearImage 
         .subresourceRange = colorRange(),
     };
     try vk(c.vkCreateImageView(self.device, &view_info, null, &view), error.CreateLinearImageViewFailed);
-    return .{ .image = image, .memory = memory, .view = view, .width = width, .height = height };
+    return .{ .image = image, .memory = memory, .view = view, .width = width, .height = height, .bytes = requirements.size };
 }
 
 fn destroyLinearImage(self: *RealRenderer, linear: LinearImage) void {
@@ -6351,6 +6482,8 @@ fn ensureBlurImage(self: *RealRenderer, target: *RealTarget) !void {
     };
     var sets: [4]c.VkDescriptorSet = undefined;
     try vk(c.vkAllocateDescriptorSets(self.device, &allocation, &sets), error.AllocateDescriptorSetFailed);
+    self.target_blur_bytes += half_image.bytes + quarter_image.bytes;
+    target.blur_bytes = half_image.bytes + quarter_image.bytes;
     target.blur_image = half_image.image;
     target.blur_memory = half_image.memory;
     target.blur_view = half_image.view;
@@ -6397,6 +6530,8 @@ fn destroyBlurImage(self: *RealRenderer, target: *RealTarget) void {
     target.blur_image = null;
     target.blur_memory = null;
     target.blur_initialized_layout = false;
+    self.target_blur_bytes -= target.blur_bytes;
+    target.blur_bytes = 0;
 }
 
 fn sourceVkFormat(format: render.PixelFormat) c.VkFormat {
@@ -6454,6 +6589,7 @@ fn createTexture(self: *RealRenderer, size: render.Size, format: render.PixelFor
     errdefer c.vkDestroyImage(self.device, texture.image, null);
     var requirements: c.VkMemoryRequirements = undefined;
     c.vkGetImageMemoryRequirements(self.device, texture.image, &requirements);
+    texture.bytes = requirements.size;
     var allocation: c.VkMemoryAllocateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .pNext = null,
