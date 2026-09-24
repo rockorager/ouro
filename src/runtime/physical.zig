@@ -9048,13 +9048,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 sample.clip = if (sample.visual != null) sample.destination else clipToOutput(sample.destination, output_bounds) catch unreachable orelse sample.destination;
                 if (!std.meta.eql(sample.destination, layer.sample.?.destination) or !std.meta.eql(sample.visual, layer.sample.?.visual))
                     self.output_associations_dirty = true;
-                const previous = layer.change.?.current;
                 layer.sample = sample;
-                layer.change = .{
-                    .previous = previous,
-                    .current = damage.SurfaceState.fromSample(sample, natural_size),
-                    .invalidate_bounds = true,
-                };
+                layer.change = geometryChange(layer.change.?, damage.SurfaceState.fromSample(sample, natural_size));
             };
             if (self.cursor_layer.active) self.cursor_layer.change.?.invalidate_bounds = true;
             return visibility_changed;
@@ -10855,13 +10850,8 @@ pub fn Coordinator(comptime protocol: type) type {
             if (!std.meta.eql(sample.destination, layer.sample.?.destination) or !std.meta.eql(sample.visual, layer.sample.?.visual))
                 self.output_associations_dirty = true;
             const natural_size = layer.change.?.current.?.surface_size;
-            const previous = layer.change.?.current;
             layer.sample = sample;
-            layer.change = .{
-                .previous = previous,
-                .current = damage.SurfaceState.fromSample(sample, natural_size),
-                .invalidate_bounds = true,
-            };
+            layer.change = geometryChange(layer.change.?, damage.SurfaceState.fromSample(sample, natural_size));
             return true;
         }
 
@@ -15225,6 +15215,54 @@ fn scaleSample(
     result.clip = try scaleSurfaceClip(result.clip, result.scale_origin, output, scale);
     result.scale_origin = null;
     return result;
+}
+
+/// Replaces a layer's geometry while it may still have an unrendered change.
+/// A change is collapsed to `previous == current` only once every output has
+/// rendered it, so `pending.previous` is the last state any output showed.
+/// Using `pending.current` instead would drop those rendered bounds whenever
+/// geometry moves twice between frames, leaving a ghost of the first position.
+fn geometryChange(pending: damage.Change, current: damage.SurfaceState) damage.Change {
+    return .{
+        .previous = pending.previous,
+        .current = current,
+        .invalidate_bounds = true,
+    };
+}
+
+test "physical: repeated geometry changes between frames keep the rendered bounds" {
+    const sample: render.SurfaceSample = .{
+        .sample = .{ .surface = 1, .commit_sequence = 1 },
+        .presentation = .{ .slot = 0, .generation = 1 },
+        .source = .{ .size = .{ .width = 10, .height = 10 }, .stride = 40, .format = .xrgb8888, .bytes = &.{} },
+        .crop = render.SourceRect.pixels(0, 0, 10, 10),
+        .destination = .{ .x = 0, .y = 0, .width = 10, .height = 10 },
+        .clip = .{ .x = 0, .y = 0, .width = 10, .height = 10 },
+    };
+    const size: render.Size = .{ .width = 10, .height = 10 };
+    const rendered = damage.SurfaceState.fromSample(sample, size);
+    var moved = sample;
+    moved.destination.x = 100;
+    const first = damage.SurfaceState.fromSample(moved, size);
+    moved.destination.x = 200;
+    const second = damage.SurfaceState.fromSample(moved, size);
+
+    // A never-rendered layer has nothing to retire.
+    const mapped = geometryChange(.{ .current = rendered }, first);
+    try std.testing.expect(mapped.previous == null);
+    try std.testing.expectEqual(first, mapped.current.?);
+    try std.testing.expect(mapped.invalidate_bounds);
+
+    // Once applied, the rendered state is both previous and current.
+    const applied: damage.Change = .{ .previous = rendered, .current = rendered };
+    const once = geometryChange(applied, first);
+    try std.testing.expectEqual(rendered, once.previous.?);
+
+    // A second move before the frame keeps the rendered bounds, not the
+    // intermediate position that no output ever showed.
+    const twice = geometryChange(once, second);
+    try std.testing.expectEqual(rendered, twice.previous.?);
+    try std.testing.expectEqual(second, twice.current.?);
 }
 
 /// Shrinks logical geometry about the window's visual anchor before output
