@@ -5276,11 +5276,11 @@ test "desktop: peripheral center holds one window and sides form aspect-preservi
     try std.testing.expectEqual(peripheral.Region.left, desktop.policy.tileRegion(third));
     try std.testing.expectEqual(peripheral_center, try drawnRect(&desktop, fourth));
 
-    // Left area {-190,50,234,580} holds two 488x580 windows: one column of
-    // 284-tall cells, scale 234/488, each drawn 234x278 and centered in its
-    // cell. The lone right window is centered vertically in its band.
-    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 53, .width = 234, .height = 278 }, try drawnRect(&desktop, first));
-    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 349, .width = 234, .height = 278 }, try drawnRect(&desktop, third));
+    // Left area {-190,50,234,580} holds two 488x580 windows stacked at scale
+    // 234/488, each drawn 234x278, packed with the 12px gap and centered as
+    // a block. The lone right window is centered vertically in its band.
+    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 56, .width = 234, .height = 278 }, try drawnRect(&desktop, first));
+    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 346, .width = 234, .height = 278 }, try drawnRect(&desktop, third));
     try std.testing.expectEqual(geometry.Rect{ .x = 556, .y = 201, .width = 234, .height = 278 }, try drawnRect(&desktop, second));
 
     // Swapping exchanges the focused side window with the center window in
@@ -5294,7 +5294,7 @@ test "desktop: peripheral center holds one window and sides form aspect-preservi
     try std.testing.expect(desktop.takeSceneChanged());
     try std.testing.expectEqual(peripheral_center, try drawnRect(&desktop, second));
     try std.testing.expectEqual(geometry.Rect{ .x = 556, .y = 201, .width = 234, .height = 278 }, try drawnRect(&desktop, fourth));
-    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 53, .width = 234, .height = 278 }, try drawnRect(&desktop, first));
+    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 56, .width = 234, .height = 278 }, try drawnRect(&desktop, first));
     // Swapping the center window with itself changes nothing.
     try desktop.swapFocusedToCenter();
     try std.testing.expectEqual(@as(usize, 0), desktop.pendingCommands());
@@ -5307,8 +5307,8 @@ test "desktop: peripheral center holds one window and sides form aspect-preservi
     _ = desktop.takeDestroyedSurface();
     try settleDesktop(&desktop, &shell);
     try std.testing.expectEqual(peripheral_center, try drawnRect(&desktop, fourth));
-    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 53, .width = 234, .height = 278 }, try drawnRect(&desktop, first));
-    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 349, .width = 234, .height = 278 }, try drawnRect(&desktop, third));
+    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 56, .width = 234, .height = 278 }, try drawnRect(&desktop, first));
+    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 346, .width = 234, .height = 278 }, try drawnRect(&desktop, third));
 
     // Floating the center promotes the next most recently focused side
     // window; the remaining left window regrows to fill its band.

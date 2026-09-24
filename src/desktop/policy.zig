@@ -953,7 +953,7 @@ pub fn Policy(
                             if (placement_len >= policy.placements.len) return error.Exhausted;
                             policy.placements[placement_len] = .{ .id = id, .rect = center };
                             placement_len += 1;
-                            policy.assignVisual(try policy.resolve(id), if (grid) |cells| cells.visual(index, center) else null);
+                            policy.assignVisual(try policy.resolve(id), if (grid) |cells| cells.visual(index) else null);
                             index += 1;
                         }
                     }
