@@ -45,6 +45,7 @@ pub const drm = @import("backend/drm/manager.zig");
 pub const drm_framebuffer = @import("backend/drm/framebuffer.zig");
 pub const drm_atomic = @import("backend/drm/atomic.zig");
 pub const drm_output = @import("backend/drm/output.zig");
+pub const backend_headless = @import("backend/headless.zig");
 pub const render = @import("render/types.zig");
 pub const render_content = @import("render/content.zig");
 pub const icc = @import("render/icc.zig");
@@ -161,6 +162,7 @@ test {
     _ = drm_framebuffer;
     _ = drm_atomic;
     _ = drm_output;
+    _ = backend_headless;
     _ = render;
     _ = render_content;
     _ = icc;

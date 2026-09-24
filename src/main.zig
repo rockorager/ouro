@@ -25,6 +25,9 @@ const Options = struct {
     mcp_socket: ?[]const u8 = null,
     managed_session: bool = false,
     headless: bool = false,
+    headless_outputs: [ouro.backend_headless.max_outputs]ouro.backend_headless.OutputSpec = undefined,
+    headless_output_count: usize = 0,
+    headless_frame_dump: ?[]const u8 = null,
     disable_hdr: bool = false,
     trace_pacing: bool = false,
     hardware_cursor: bool = true,
@@ -33,7 +36,7 @@ const Options = struct {
 pub fn main(init: std.process.Init) !void {
     // Reuse small allocations instead of mapping a page for every commit.
     const allocator = std.heap.smp_allocator;
-    const options = parseOptions(init.minimal.args) catch |err| {
+    var options = parseOptions(init.minimal.args) catch |err| {
         usage();
         return err;
     };
@@ -58,9 +61,32 @@ pub fn main(init: std.process.Init) !void {
         try std.Io.File.stdout().writeStreamingAll(init.io, "\n");
         return;
     }
-    if (options.headless and (options.drm_device == null or options.managed_session)) {
+    if (options.headless and options.managed_session) {
         usage();
         return error.InvalidHeadlessOptions;
+    }
+    // `--headless` alone runs an in-process virtual card; with `--drm-device`
+    // it drives a real (typically vkms) device without libseat or input.
+    const virtual_card = options.headless and options.drm_device == null;
+    if (!virtual_card and (options.headless_output_count != 0 or options.headless_frame_dump != null)) {
+        usage();
+        return error.InvalidHeadlessOptions;
+    }
+    if (virtual_card and options.renderer != .pixman) {
+        if (options.renderer == .vulkan) {
+            std.log.err("the virtual headless card has no GBM device; use --renderer=pixman", .{});
+            return error.InvalidHeadlessOptions;
+        }
+        options.renderer = .pixman;
+    }
+    var headless_backend: ?*ouro.backend_headless.Backend = null;
+    defer if (headless_backend) |backend| backend.destroy();
+    if (virtual_card) {
+        const default_output: [1]ouro.backend_headless.OutputSpec = .{.{ .width = 1920, .height = 1080 }};
+        headless_backend = try ouro.backend_headless.Backend.create(allocator, .{
+            .outputs = if (options.headless_output_count == 0) &default_output else options.headless_outputs[0..options.headless_output_count],
+            .frame_dump_path = options.headless_frame_dump,
+        });
     }
     const managed_socket = if (options.socket == null and options.managed_session)
         try std.fmt.allocPrint(
@@ -142,12 +168,14 @@ pub fn main(init: std.process.Init) !void {
     try ouro.control.writeCatalog(&catalog.writer);
     var control = try ouro.mcp_server.Server.init(allocator, control_path, catalog.written());
     defer control.deinit();
-    const dri_result = linux.open("/dev/dri", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
-    if (linux.errno(dri_result) != .SUCCESS) {
-        std.log.err("DRM smoke unavailable: /dev/dri is absent or inaccessible", .{});
-        return error.DrmHardwareUnavailable;
+    if (!virtual_card) {
+        const dri_result = linux.open("/dev/dri", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+        if (linux.errno(dri_result) != .SUCCESS) {
+            std.log.err("DRM smoke unavailable: /dev/dri is absent or inaccessible", .{});
+            return error.DrmHardwareUnavailable;
+        }
+        _ = linux.close(@intCast(dri_result));
     }
-    _ = linux.close(@intCast(dri_result));
 
     wayring.unix_socket.unlink(socket) catch {};
     defer wayring.unix_socket.unlink(socket) catch {};
@@ -162,11 +190,23 @@ pub fn main(init: std.process.Init) !void {
         try wayring.unix_socket.listen(socket, 128),
         compositorConfig(),
     );
-    const coordinator = Runtime.create(allocator, root, .{
+    const platforms: Runtime.Platforms = if (headless_backend) |backend| .{
+        .session = backend.sessionPlatform(),
+        .input = null,
+        .hotplug = null,
+        .drm = backend.drmPlatform(),
+        .gamma = backend.gammaPlatform(),
+        .output = .{
+            .gbm = backend.gbmPlatform(),
+            .framebuffer = backend.framebufferPlatform(),
+            .atomic = backend.atomicPlatform(),
+        },
+    } else .{
         .session = if (options.headless) ouro.backend_platform.headless else ouro.backend_platform.real,
         .input = if (options.headless) null else ouro.input_platform.real,
         .hotplug = if (options.headless) null else ouro.drm_hotplug.real,
-    }, .{
+    };
+    const coordinator = Runtime.create(allocator, root, platforms, .{
         .router_capacity = 20,
         .timer_capacity = 6,
         .device_capacity = 36,
@@ -602,6 +642,14 @@ fn parseOptions(args: std.process.Args) !Options {
             options.managed_session = true;
         } else if (std.mem.eql(u8, argument, "--headless")) {
             options.headless = true;
+        } else if (std.mem.startsWith(u8, argument, "--headless-output=")) {
+            if (options.headless_output_count == options.headless_outputs.len) return error.TooManyHeadlessOutputs;
+            options.headless_outputs[options.headless_output_count] = ouro.backend_headless.OutputSpec.parse(argument["--headless-output=".len..]) catch
+                return error.InvalidHeadlessOutput;
+            options.headless_output_count += 1;
+        } else if (std.mem.startsWith(u8, argument, "--headless-frame-dump=")) {
+            options.headless_frame_dump = argument["--headless-frame-dump=".len..];
+            if (options.headless_frame_dump.?.len == 0) return error.InvalidHeadlessFrameDump;
         } else if (std.mem.eql(u8, argument, "--disable-hdr")) {
             options.disable_hdr = true;
         } else if (std.mem.eql(u8, argument, "--trace-pacing")) {
@@ -617,7 +665,7 @@ fn parseOptions(args: std.process.Args) !Options {
 
 fn usage() void {
     std.debug.print(
-        \\usage: ouro [--socket=PATH] [--renderer=auto|pixman|vulkan] [--drm-device=PATH] [--config=PATH] [--managed-session] [--headless]
+        \\usage: ouro [--socket=PATH] [--renderer=auto|pixman|vulkan] [--drm-device=PATH] [--config=PATH] [--managed-session] [--headless] [--headless-output=WxH[@HZ]]... [--headless-frame-dump=PATH]
         \\
         \\  auto    try Vulkan, then fall back to Pixman at startup
         \\  pixman  require the CPU Pixman renderer
@@ -633,7 +681,10 @@ fn usage() void {
         \\  --export-mcp-descriptor  print installed discovery JSON and exit (no display/settings needed)
         \\  --mcp-socket   override $XDG_RUNTIME_DIR/ouro.mcp.sock; parent must be private
         \\  --managed-session  publish and bind the systemd graphical session lifecycle
-        \\  --headless     bypass libseat and input for an explicitly selected virtual DRM device
+        \\  --headless     run without libseat or input; with --drm-device drive that (virtual) DRM
+        \\                 card, otherwise scan out an in-process virtual card with Pixman
+        \\  --headless-output=WxH[@HZ]  add a virtual output (repeatable, up to 4; default 1920x1080@60)
+        \\  --headless-frame-dump=PATH  write each presented frame of the first virtual output as PPM
         \\  SIGHUP        reload --config sources; ourosettings updates arrive automatically
         \\
     , .{});
