@@ -37,6 +37,7 @@ const damage = @import("../scene/damage.zig");
 const scene_visibility = @import("../scene/visibility.zig");
 const geometry = @import("../scene/geometry.zig");
 const hit_test = @import("../scene/hit_test.zig");
+const peripheral = @import("../scene/peripheral.zig");
 const presentation = @import("../presentation.zig");
 const core_surface = @import("../protocol/core_surface.zig");
 const protocol_subcompositor = @import("../protocol/subcompositor.zig");
@@ -667,6 +668,18 @@ pub fn Coordinator(comptime protocol: type) type {
                 point: geometry.Point,
             ) !bool {
                 return scene.coordinator.adapter.inputContains(surface, point);
+            }
+
+            /// Peripheral shrink draws a window smaller than its logical
+            /// geometry. Hit the window where it is drawn and hand its tree
+            /// the logical point so clients see unscaled coordinates.
+            pub fn logicalPoint(
+                scene: *InputScene,
+                window: Desktop.SceneWindow,
+                point: geometry.Point,
+            ) ?geometry.Point {
+                const visual = scene.coordinator.windowVisual(window) orelse return point;
+                return peripheral.logicalPoint(visual, window.geometry, point);
             }
         };
         const ProtocolReady = struct {
@@ -2104,7 +2117,12 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.input) |input| {
                 try self.applyInputConfiguration(input, candidate);
             }
+            const previous_peripheral = self.desktop.policy.peripheral;
             try self.desktop.installPolicySnapshot(policy);
+            // Shrink settings change how existing layers are drawn without
+            // moving any window, so a reflow alone would leave them stale.
+            if (!std.meta.eql(previous_peripheral, self.desktop.policy.peripheral))
+                try self.desktopSceneChanged();
             try self.installKeyConsumerSnapshot(key_consumer);
             self.settings.deinit();
             self.settings = candidate.*;
@@ -9011,6 +9029,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     sample.destination = layer.sample.?.destination;
                 } else {
                     sample.scale_origin = surfaceScaleOrigin(self, scene, layer.content_origin);
+                    sample.visual = self.windowVisual(scene.root);
                     layer.window_geometry = scene.root.geometry;
                 }
                 // Keep offscreen content so exposure can resume a suspended
@@ -9496,6 +9515,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .destination = destination,
                 .clip = visible_clip,
                 .scale_origin = if (surface_scene) |scene| surfaceScaleOrigin(self, scene, content_origin) else null,
+                .visual = if (surface_scene) |scene| self.windowVisual(scene.root) else null,
                 .transform = inverseSurfaceTransform(content.surface.transform),
                 .color_description = content.surface.color_description,
                 .color_representation = content.surface.color_representation,
@@ -9672,6 +9692,7 @@ pub fn Coordinator(comptime protocol: type) type {
             sample.destination = destination;
             sample.clip = visible_clip;
             sample.scale_origin = if (surface_scene) |scene| surfaceScaleOrigin(self, scene, content_origin) else null;
+            sample.visual = if (surface_scene) |scene| self.windowVisual(scene.root) else null;
             sample.transform = inverseSurfaceTransform(content.surface.transform);
             sample.color_description = content.surface.color_description;
             sample.color_representation = content.surface.color_representation;
@@ -10810,11 +10831,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 sample.destination = layer.sample.?.destination;
             } else {
                 sample.scale_origin = surfaceScaleOrigin(self, scene, layer.content_origin);
+                sample.visual = self.windowVisual(scene.root);
                 layer.window_geometry = scene.root.geometry;
             }
             sample.clip = try clipToOutput(sample.destination, output_bounds) orelse return false;
             if (std.meta.eql(sample.destination, layer.sample.?.destination) and
                 std.meta.eql(sample.scale_origin, layer.sample.?.scale_origin) and
+                std.meta.eql(sample.visual, layer.sample.?.visual) and
                 std.meta.eql(sample.clip, layer.sample.?.clip)) return true;
             if (!std.meta.eql(sample.destination, layer.sample.?.destination))
                 self.output_associations_dirty = true;
@@ -12319,8 +12342,42 @@ pub fn Coordinator(comptime protocol: type) type {
             global: Interaction.GlobalFixedPoint,
         ) ?SeatAdapter.Point {
             const scene = self.surfaceScene(id) orelse return null;
-            const point = fixedPointForScene(scene, global) orelse return null;
+            const logical = if (self.windowVisual(scene.root)) |visual| Interaction.GlobalFixedPoint{
+                // Grabbed pointer delivery bypasses hit testing; undo the
+                // shrink here so the client keeps receiving logical
+                // coordinates while dragging inside a drawn-smaller window.
+                // The mapping is linear, so 1/256 fixed units unmap directly.
+                .x = visual.unmapCoordinate(global.x, @as(i64, visual.anchor.x) * 256),
+                .y = visual.unmapCoordinate(global.y, @as(i64, visual.anchor.y) * 256),
+            } else global;
+            const point = fixedPointForScene(scene, logical) orelse return null;
             return .{ .x = point.x, .y = point.y };
+        }
+
+        /// Visual-only shrink for a desktop window, or null when it is drawn
+        /// at its natural size. Popups share their toplevel's id, so a menu
+        /// shrinks about the same anchor as the window that opened it.
+        fn windowVisual(self: *Self, window: Desktop.SceneWindow) ?render.VisualTransform {
+            const settings = self.desktop.policy.peripheral;
+            if (!settings.enabled or !window.managed) return null;
+            const toplevel = self.desktop.scene(window.id) catch return null;
+            const bounds = self.peripheralBounds(toplevel.geometry) orelse return null;
+            return peripheral.transform(settings, toplevel.geometry, bounds);
+        }
+
+        /// The output whose logical area contains the window center, or the
+        /// whole layout when no output does.
+        fn peripheralBounds(self: *const Self, window: geometry.Rect) ?geometry.Rect {
+            const center: geometry.Point = .{
+                .x = @intCast(@divFloor(@as(i64, window.x) * 2 + window.width, 2)),
+                .y = @intCast(@divFloor(@as(i64, window.y) * 2 + window.height, 2)),
+            };
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (!physical.hasLayout()) continue;
+                const bounds = self.outputBoundsFor(physical) catch continue;
+                if (bounds.contains(center)) return bounds;
+            }
+            return self.globalOutputBounds() catch null;
         }
 
         fn layerShellScene(self: *Self, id: Adapter.SurfaceId) ?Desktop.SceneWindow {
@@ -14643,6 +14700,50 @@ test "physical: fractional XDG tiles keep client pixel sizes and historical dama
     try std.testing.expect(removal.current == null);
 }
 
+test "physical: peripheral visual shrink maps geometry before output scaling" {
+    const output: geometry.Rect = .{ .x = 0, .y = 0, .width = 4000, .height = 1000 };
+    const scale = try geometry.OutputScale.init(240);
+    const destination: render.Rect = .{ .x = 3000, .y = 200, .width = 1000, .height = 400 };
+    // Half-size shrink about the window center; the child sits 100 pixels in.
+    const visual: render.VisualTransform = .{ .anchor = .{ .x = 3500, .y = 400 }, .scale = render.fixed_one / 2 };
+    const child: render.Rect = .{ .x = 3100, .y = 300, .width = 200, .height = 100 };
+    const sample: render.SurfaceSample = .{
+        .sample = .{ .surface = 1, .commit_sequence = 1 },
+        .presentation = .{ .slot = 0, .generation = 1 },
+        .source = .{ .size = .{ .width = 200, .height = 100 }, .stride = 800, .format = .xrgb8888, .bytes = &.{} },
+        .crop = render.SourceRect.pixels(0, 0, 200, 100),
+        .destination = child,
+        .clip = child,
+        .scale_origin = .{ .x = destination.x, .y = destination.y },
+        .visual = visual,
+    };
+    const physical = try scaleSample(sample, output, scale);
+    // Logical child after shrink: {3300, 350, 100, 50}; at 2x: {6600, 700, 200, 100}.
+    try std.testing.expectEqual(render.Rect{ .x = 6600, .y = 700, .width = 200, .height = 100 }, physical.destination);
+    try std.testing.expectEqual(physical.destination, physical.clip);
+    try std.testing.expect(physical.scale_origin == null);
+    try std.testing.expect(physical.visual == null);
+    // The crop is untouched: the client's pixels are downsampled, not re-cropped.
+    try std.testing.expectEqual(sample.crop, physical.crop);
+
+    // A window that stops shrinking damages its old drawn rectangle and its
+    // new natural one: each state carries its own mapping.
+    const previous = damage.SurfaceState.fromSample(sample, .{ .width = 200, .height = 100 });
+    var natural = sample;
+    natural.visual = null;
+    const current = damage.SurfaceState.fromSample(natural, .{ .width = 200, .height = 100 });
+    const change = try scaleChange(.{ .previous = previous, .current = current }, output, scale);
+    try std.testing.expectEqual(render.Rect{ .x = 6600, .y = 700, .width = 200, .height = 100 }, change.previous.?.destination);
+    try std.testing.expectEqual(render.Rect{ .x = 6200, .y = 600, .width = 400, .height = 200 }, change.current.?.destination);
+    try std.testing.expect(change.previous.?.visual == null and change.current.?.visual == null);
+
+    // An identity transform is a no-op rather than a rounding hazard.
+    var identity = sample;
+    identity.visual = .{ .anchor = visual.anchor, .scale = render.fixed_one };
+    const unchanged = try scaleSample(identity, output, scale);
+    try std.testing.expectEqual(render.Rect{ .x = 6200, .y = 600, .width = 400, .height = 200 }, unchanged.destination);
+}
+
 test "physical: snapped trees keep child adjacency and output clipping" {
     const output: geometry.Rect = .{ .x = 0, .y = 0, .width = 6, .height = 6 };
     const scale = try geometry.OutputScale.init(150);
@@ -15091,10 +15192,23 @@ fn scaleSample(
     scale: geometry.OutputScale,
 ) !render.SurfaceSample {
     var result = sample_value;
+    try applyVisual(&result);
     result.destination = try scaleSurfaceRect(result.destination, result.scale_origin, output, scale);
     result.clip = try scaleSurfaceClip(result.clip, result.scale_origin, output, scale);
     result.scale_origin = null;
     return result;
+}
+
+/// Shrinks logical geometry about the window's visual anchor before output
+/// scaling. Destination, clip, and the snapped tree origin move together so
+/// subsurfaces of one window stay adjacent after both transforms.
+fn applyVisual(state: anytype) !void {
+    const visual = state.visual orelse return;
+    state.visual = null;
+    if (visual.identity()) return;
+    state.destination = try visual.mapRect(state.destination);
+    state.clip = try visual.mapRect(state.clip);
+    if (state.scale_origin) |origin| state.scale_origin = try visual.mapPoint(origin);
 }
 
 fn scaleSurfaceRect(
@@ -15154,6 +15268,7 @@ fn scaleSurfaceState(
     scale: geometry.OutputScale,
 ) !damage.SurfaceState {
     var result = state;
+    try applyVisual(&result);
     result.destination = try scaleSurfaceRect(result.destination, result.scale_origin, output, scale);
     result.clip = try scaleSurfaceClip(result.clip, result.scale_origin, output, scale);
     result.scale_origin = null;

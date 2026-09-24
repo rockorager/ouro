@@ -77,6 +77,13 @@ pub const General = struct {
     focus_follows_mouse: bool = false,
     inner_gap: u32 = 12,
     outer_gap: u32 = 12,
+    /// Render windows smaller toward the left and right output edges. Clients
+    /// are never told; only presentation and input mapping change.
+    peripheral_shrink: bool = false,
+    /// Width of the full-size central band, in percent of the output width.
+    peripheral_center_percent: u32 = 50,
+    /// Visual scale at the output edges, in percent.
+    peripheral_min_scale_percent: u32 = 30,
 };
 pub const Setting = engine_settings.Setting;
 pub const InputType = engine_settings.InputType;
@@ -964,4 +971,20 @@ test "rule ranges strict fields and partial merge removals" {
     });
     defer snapshot.deinit();
     try std.testing.expect(snapshot.input_rules[0].match.name == null);
+}
+
+test "peripheral: general settings parse and default off" {
+    var defaults = try parseSource(std.testing.allocator, "{}");
+    defer defaults.deinit();
+    try std.testing.expect(!defaults.general.peripheral_shrink);
+    try std.testing.expectEqual(@as(u32, 50), defaults.general.peripheral_center_percent);
+    try std.testing.expectEqual(@as(u32, 30), defaults.general.peripheral_min_scale_percent);
+
+    var enabled = try parseSource(std.testing.allocator,
+        \\{"general":{"peripheral_shrink":true,"peripheral_center_percent":40,"peripheral_min_scale_percent":20}}
+    );
+    defer enabled.deinit();
+    try std.testing.expect(enabled.general.peripheral_shrink);
+    try std.testing.expectEqual(@as(u32, 40), enabled.general.peripheral_center_percent);
+    try std.testing.expectEqual(@as(u32, 20), enabled.general.peripheral_min_scale_percent);
 }

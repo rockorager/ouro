@@ -27,6 +27,11 @@ pub fn Prepared(comptime Runtime: type) type {
                     .focus_follows_mouse = snapshot.general.focus_follows_mouse,
                     .inner_gap = snapshot.general.inner_gap,
                     .outer_gap = snapshot.general.outer_gap,
+                    .peripheral = .{
+                        .enabled = snapshot.general.peripheral_shrink,
+                        .center_percent = snapshot.general.peripheral_center_percent,
+                        .min_scale_percent = snapshot.general.peripheral_min_scale_percent,
+                    },
                 },
             };
         }

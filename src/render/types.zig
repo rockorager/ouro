@@ -248,6 +248,63 @@ pub const UploadDamage = struct {
 
 pub const Filter = enum { nearest, adaptive };
 
+/// Visual-only uniform scale of a whole surface tree about a logical anchor,
+/// applied before output scaling. The client is never told about it: its
+/// configured size, buffer, and input coordinates stay in logical geometry,
+/// only the rendered destination shrinks. `scale` is 16.16 fixed point.
+pub const VisualTransform = struct {
+    anchor: Point,
+    scale: i32,
+
+    pub fn identity(transform: VisualTransform) bool {
+        return transform.scale == fixed_one;
+    }
+
+    /// Maps one logical edge; every edge uses the same rounding so adjacent
+    /// rectangles remain adjacent after the transform.
+    pub fn mapCoordinate(transform: VisualTransform, value: i64, anchor: i64) i64 {
+        const relative = value - anchor;
+        return anchor + @divFloor(relative * transform.scale + fixed_one / 2, fixed_one);
+    }
+
+    pub fn mapPoint(transform: VisualTransform, point: Point) !Point {
+        return .{
+            .x = std.math.cast(i32, transform.mapCoordinate(point.x, transform.anchor.x)) orelse
+                return error.InvalidDestination,
+            .y = std.math.cast(i32, transform.mapCoordinate(point.y, transform.anchor.y)) orelse
+                return error.InvalidDestination,
+        };
+    }
+
+    /// Maps a logical rectangle. A rectangle never collapses below one pixel.
+    pub fn mapRect(transform: VisualTransform, rect: Rect) !Rect {
+        const left = transform.mapCoordinate(rect.x, transform.anchor.x);
+        const top = transform.mapCoordinate(rect.y, transform.anchor.y);
+        const right = transform.mapCoordinate(@as(i64, rect.x) + rect.width, transform.anchor.x);
+        const bottom = transform.mapCoordinate(@as(i64, rect.y) + rect.height, transform.anchor.y);
+        return .{
+            .x = std.math.cast(i32, left) orelse return error.InvalidDestination,
+            .y = std.math.cast(i32, top) orelse return error.InvalidDestination,
+            .width = std.math.cast(u32, @max(1, right - left)) orelse return error.InvalidDestination,
+            .height = std.math.cast(u32, @max(1, bottom - top)) orelse return error.InvalidDestination,
+        };
+    }
+
+    /// Inverse of `mapCoordinate` for input: a rendered coordinate back to
+    /// the logical coordinate the client expects. Rounds to nearest.
+    pub fn unmapCoordinate(transform: VisualTransform, value: i64, anchor: i64) i64 {
+        const relative = value - anchor;
+        return anchor + @divFloor(relative * fixed_one + @divFloor(transform.scale, 2), transform.scale);
+    }
+
+    pub fn unmapPoint(transform: VisualTransform, point: Point) ?Point {
+        return .{
+            .x = std.math.cast(i32, transform.unmapCoordinate(point.x, transform.anchor.x)) orelse return null,
+            .y = std.math.cast(i32, transform.unmapCoordinate(point.y, transform.anchor.y)) orelse return null,
+        };
+    }
+};
+
 /// An aligned 1:1 mapping needs no reconstruction, even when rotated.
 pub fn pixelAligned(crop: SourceRect, destination: Size, transform: Transform) bool {
     const swap = switch (transform) {
@@ -270,6 +327,9 @@ pub const SurfaceSample = struct {
     /// Logical surface-tree origin snapped before output scaling. Cleared
     /// when destination and clip have been converted to physical pixels.
     scale_origin: ?Point = null,
+    /// Visual-only shrink of the owning window tree, in logical coordinates.
+    /// Cleared together with `scale_origin` once geometry is physical.
+    visual: ?VisualTransform = null,
     transform: Transform = .normal,
     /// Vulkan selects reconstruction from the source mapping; Pixman uses
     /// bilinear. Both preserve aligned 1:1 pixels without filtering.

@@ -3525,6 +3525,225 @@ test "shell-input: last window removal clears every reused scanout image" {
     }
 }
 
+test "shell-input: peripheral shrink draws side windows smaller and keeps input logical" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-peripheral-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    // A 64x16 output with two 16x8 windows tiled side by side. The central
+    // band covers a quarter of the width, so the left window (center x=8,
+    // 24 logical pixels past the band edge at 24 with 24 more to the output
+    // edge) renders at exactly half size; the right window (center x=40)
+    // sits on the band edge and keeps its size.
+    const window_pixels = [_]u8{ 0x10, 0x80, 0xc0, 0xff } ** (16 * 8);
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    fixture.first_mode_width = 64;
+    fixture.mode_height = 16;
+    var root_config = physical_fixture.compositorConfig();
+    root_config.reactor.receive_buffer_size = 8192;
+    root_config.reactor.receive_buffer_count = 8;
+    root_config.reactor.receive_control_capacity = 512;
+    root_config.runtime.object_capacity = 32;
+    root_config.runtime.object_quota = 32;
+    root_config.runtime.actor.received_fd_budget = 2;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
+    var config = physical_fixture.coordinatorConfig();
+    config.shm.pool_capacity = 2;
+    config.shm.buffer_capacity = 2;
+    config.surface.surface_capacity = 2;
+    config.surface.frame_callback_capacity = 2;
+    config.surface.content_update_capacity = 3;
+    config.surface.dependency_capacity = 2;
+    config.surface.attachment_capacity = 2;
+    config.surface.copy_capacity = 2;
+    config.surface.max_copy_bytes = window_pixels.len;
+    config.output.max_samples = 3;
+    config.output.max_source_bytes = window_pixels.len * 2;
+    config.output.max_source_width = 16;
+    config.output.max_source_height = 8;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    coordinator.scene_windows = try allocator.realloc(coordinator.scene_windows, 1);
+    coordinator.foreign_toplevels = try allocator.realloc(coordinator.foreign_toplevels, 1);
+    coordinator.desktop.policy.inner_gap = 0;
+    coordinator.desktop.policy.outer_gap = 0;
+    coordinator.desktop.policy.peripheral = .{ .enabled = true, .center_percent = 25, .min_scale_percent = 25 };
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+
+    var client_reactor: wayring.io_uring.Reactor = undefined;
+    try client_reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var client = try ClientConnection.attach(
+        allocator,
+        &client_reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 },
+        .{ .max_objects = 32, .max_client_ids = 31 },
+    );
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: MultiHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+        .cycle_count = 1,
+        .bind_seat = true,
+        .source_pixels = &window_pixels,
+        .buffer_width = 16,
+        .buffer_height = 8,
+        .buffer_stride = 64,
+    };
+    try submitMultiClient(&client_reactor, &driver, &handler);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..512) |_| {
+        _ = try drainMultiClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.frame_done == 2 and handler.buffer_releases == 2 and coordinator.stats.presented > 0) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.frame_done);
+
+    const windows = try coordinator.desktop.sceneSnapshot(coordinator.scene_windows);
+    try std.testing.expectEqual(@as(usize, 2), windows.len);
+    const left = try coordinator.desktop.scene(windows[0].id);
+    const right = try coordinator.desktop.scene(windows[1].id);
+    try std.testing.expectEqual(ouro.scene_geometry.Rect{ .x = 0, .y = 0, .width = 16, .height = 8 }, left.geometry);
+    try std.testing.expectEqual(ouro.scene_geometry.Rect{ .x = 32, .y = 0, .width = 16, .height = 8 }, right.geometry);
+
+    // Render: the left window occupies {4,2,8,4} on screen, the right one
+    // its full logical rectangle; everything else in the top-left tile is
+    // black. Wait for a frame in which the left window is drawn shrunken.
+    var presented = coordinator.stats.presented;
+    var shrunken_frame = false;
+    for (0..512) |_| {
+        _ = try drainMultiClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        const output = coordinator.primaryKmsOutput().?;
+        if (coordinator.stats.presented > presented and output.kms_output.current != null) {
+            presented = coordinator.stats.presented;
+            const image = fixture.dumb_bytes[output.kms_output.current.?.slot];
+            if (std.mem.eql(u8, &window_pixels[0..4].*, image[3 * 256 + 5 * 4 ..][0..4]) and
+                std.mem.eql(u8, &.{ 0, 0, 0, 0xff }, image[0..4]))
+            {
+                shrunken_frame = true;
+                break;
+            }
+            try output.request(.damage, 1);
+        }
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(shrunken_frame);
+    {
+        const output = coordinator.primaryKmsOutput().?;
+        const image = fixture.dumb_bytes[output.kms_output.current.?.slot];
+        for (0..16) |y| for (0..64) |x| {
+            const in_left = x >= 4 and x < 12 and y >= 2 and y < 6;
+            const in_right = x >= 32 and x < 48 and y < 8;
+            const expected: []const u8 = if (in_left or in_right) window_pixels[0..4] else &.{ 0, 0, 0, 0xff };
+            std.testing.expectEqualSlices(u8, expected, image[y * 256 + x * 4 ..][0..4]) catch |err| {
+                std.debug.print("pixel mismatch at x={d} y={d}\n", .{ x, y });
+                return err;
+            };
+        };
+    }
+
+    // Input: a pointer over drawn pixel (5,3) targets the left window and the
+    // client sees logical local (2,2); logical-but-undrawn pixel (1,1) misses it.
+    const device: ouro.input_backend.DeviceId = .{ .slot = 0, .generation = 1, .seat_generation = 1 };
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{
+        .device = device,
+        .info = .{ .capabilities = .{ .pointer = true } },
+    } }));
+    for (0..128) |_| {
+        _ = try drainMultiClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.pointer != null) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(handler.pointer != null);
+    const left_surface = (try coordinator.adapter.surfaceHandle(left.surface)).id;
+    const right_surface = (try coordinator.adapter.surfaceHandle(right.surface)).id;
+
+    const Step = struct { point: ouro.scene_geometry.Point, surface: ?u32, local: ?struct { x: i32, y: i32 } };
+    const steps = [_]Step{
+        .{ .point = .{ .x = 5, .y = 3 }, .surface = left_surface, .local = .{ .x = 2 * 256, .y = 2 * 256 } },
+        .{ .point = .{ .x = 1, .y = 1 }, .surface = null, .local = null },
+        .{ .point = .{ .x = 11, .y = 5 }, .surface = left_surface, .local = .{ .x = 14 * 256, .y = 6 * 256 } },
+        .{ .point = .{ .x = 35, .y = 6 }, .surface = right_surface, .local = .{ .x = 3 * 256, .y = 6 * 256 } },
+    };
+    for (steps, 0..) |step, index| {
+        const delta = coordinator.interaction.motionToPoint(step.point);
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_motion = .{
+            .device = device,
+            .time_usec = (index + 1) * 1_000,
+            .dx = delta.dx,
+            .dy = delta.dy,
+        } }));
+        const focus = coordinator.seat_adapter.pointerState().focus;
+        if (step.surface) |surface| {
+            try std.testing.expectEqual(surface, (try coordinator.adapter.surfaceHandle(focus.?.surface)).id);
+        } else try std.testing.expect(focus == null);
+        for (0..128) |_| {
+            _ = try drainMultiClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (handler.pointer_surface == step.surface and (step.local == null or
+                std.meta.eql(handler.pointer_position, .{ .x = step.local.?.x, .y = step.local.?.y }))) break;
+            if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+                try waitForEither(&root.ring, client_reactor.ring);
+        }
+        try std.testing.expectEqual(step.surface, handler.pointer_surface);
+        if (step.local) |local| {
+            try std.testing.expectEqual(local.x, handler.pointer_position.?.x);
+            try std.testing.expectEqual(local.y, handler.pointer_position.?.y);
+        }
+    }
+
+    // Clicking the shrunken window gives it keyboard focus.
+    try std.testing.expectEqual(windows[1].id, coordinator.desktop.focused().?);
+    const delta = coordinator.interaction.motionToPoint(.{ .x = 6, .y = 4 });
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_motion = .{
+        .device = device,
+        .time_usec = 10_000,
+        .dx = delta.dx,
+        .dy = delta.dy,
+    } }));
+    for ([_]bool{ true, false }, 0..) |pressed, index| {
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{
+            .device = device,
+            .time_usec = 11_000 + index * 1_000,
+            .button = 272,
+            .pressed = pressed,
+        } }));
+    }
+    try std.testing.expectEqual(windows[0].id, coordinator.desktop.focused().?);
+    try std.testing.expectEqual(left.surface, coordinator.seat_adapter.keyboard_focus.?.surface);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..512) |_| {
+        const cp = try drainMultiClient(&client_reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and cp.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    client_reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "shell-input: fullscreen covers top bars but preserves overlays and restores bar input" {
     try fullscreenLayer(false);
     try fullscreenLayer(true);
@@ -7309,6 +7528,16 @@ const MultiHandler = struct {
     surface_count: usize = 2,
     cycle_count: usize = two_toplevel_cycle_count,
     source_pixels: []const u8 = &pixels,
+    /// Buffer dimensions for ordinary toplevel maps; `source_pixels` must
+    /// hold `buffer_stride * buffer_height` bytes.
+    buffer_width: u32 = 3,
+    buffer_height: u32 = 2,
+    buffer_stride: u32 = 16,
+    /// Last wl_pointer enter/motion target and surface-local position in
+    /// 24.8 fixed point, as the client would see them.
+    pointer_surface: ?u32 = null,
+    pointer_position: ?struct { x: i32, y: i32 } = null,
+    pointer_enters: usize = 0,
     subsurface_mode: bool = false,
     cursor_mode: bool = false,
     layer_mode: bool = false,
@@ -7316,6 +7545,9 @@ const MultiHandler = struct {
     layer_shell: ?wayring.objects.Handle = null,
     layer_surface: ?wayring.objects.Handle = null,
     activation_mode: bool = false,
+    /// Bind wl_seat (and its pointer/keyboard) without activation or
+    /// subsurface behaviour.
+    bind_seat: bool = false,
     metadata_commit_after_attach: bool = false,
     activation_requested: bool = false,
     activation_done: usize = 0,
@@ -7469,6 +7701,13 @@ const MultiHandler = struct {
                 .button => |value| if (self.activation_mode and !self.activation_requested and
                     value.state.value == protocol.wl_pointer.button_state.pressed.value)
                     try self.requestActivation(value.serial),
+                .enter => |value| {
+                    self.pointer_enters += 1;
+                    self.pointer_surface = value.surface;
+                    self.pointer_position = .{ .x = value.surface_x, .y = value.surface_y };
+                },
+                .leave => self.pointer_surface = null,
+                .motion => |value| self.pointer_position = .{ .x = value.surface_x, .y = value.surface_y },
                 else => {},
             }
         } else if (target.object.interface == &protocol.xdg_activation_token_v1.info) {
@@ -7576,7 +7815,7 @@ const MultiHandler = struct {
             )).id;
         if (self.decoration_mode and std.mem.eql(u8, value.interface, protocol.zxdg_decoration_manager_v1.info.name))
             self.decoration_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zxdg_decoration_manager_v1.info, @min(value.version, 2), null);
-        if ((self.activation_mode or self.subsurface_mode) and std.mem.eql(u8, value.interface, protocol.wl_seat.info.name))
+        if ((self.activation_mode or self.subsurface_mode or self.bind_seat) and std.mem.eql(u8, value.interface, protocol.wl_seat.info.name))
             self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_seat.info, @min(value.version, 9), null);
         if (self.activation_mode and std.mem.eql(u8, value.interface, protocol.xdg_activation_v1.info.name))
             self.activation = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_activation_v1.info, 1, null);
@@ -7715,9 +7954,9 @@ const MultiHandler = struct {
             pool.id,
             .{
                 .offset = 16,
-                .width = 3,
-                .height = if (self.layer_mode and index == 1) 1 else if (self.fractional_mode) @intCast((self.preferred_scales[index] + 60) / 120) else 2,
-                .stride = 16,
+                .width = @intCast(self.buffer_width),
+                .height = if (self.layer_mode and index == 1) 1 else if (self.fractional_mode) @intCast((self.preferred_scales[index] + 60) / 120) else @intCast(self.buffer_height),
+                .stride = @intCast(self.buffer_stride),
                 .format = .argb8888,
             },
         )).id;
@@ -7731,7 +7970,7 @@ const MultiHandler = struct {
             .attach = .{ .buffer = self.buffers[index].?.id, .x = 0, .y = 0 },
         });
         try protocol.wl_surface.encodeRequest(self.queue, self.surfaces[index].?.id, .{
-            .damage_buffer = .{ .x = 0, .y = 0, .width = 3, .height = 2 },
+            .damage_buffer = .{ .x = 0, .y = 0, .width = @intCast(self.buffer_width), .height = @intCast(self.buffer_height) },
         });
         if (self.opaque_on_map) {
             const region = (try protocol.wl_compositor.construct_create_region(

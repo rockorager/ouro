@@ -5243,8 +5243,8 @@ pub const Fixture = struct {
     fn createDumb(
         context: *anyopaque,
         _: linux.fd_t,
-        _: u32,
-        _: u32,
+        width: u32,
+        height: u32,
         _: u32,
     ) !ouro.drm_framebuffer.DumbBuffer {
         const self: *Fixture = @ptrCast(@alignCast(context));
@@ -5253,12 +5253,17 @@ pub const Fixture = struct {
             self.bo_count += 1;
             return error.CreateDumbBufferFailed;
         }
+        // Historical modes are at most 4 pixels wide and keep the 16-byte
+        // stride their pixel expectations were written against; wider modes
+        // are tightly packed and must still fit one page.
+        const stride: u32 = @max(16, width * 4);
+        if (@as(usize, stride) * height > self.dumb_bytes[0].len) return error.CreateDumbBufferFailed;
         const index = self.dumb_count;
         self.dumb_count += 1;
         self.bo_count += 1;
         return .{
             .handle = @intCast(index + 1),
-            .stride = 16,
+            .stride = stride,
             .bytes = &self.dumb_bytes[index],
         };
     }

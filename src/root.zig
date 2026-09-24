@@ -106,6 +106,7 @@ pub const image_capture_source = @import("protocol/image_capture_source.zig");
 pub const image_copy_capture = @import("protocol/image_copy_capture.zig");
 pub const scene_geometry = @import("scene/geometry.zig");
 pub const scene_hit_test = @import("scene/hit_test.zig");
+pub const scene_peripheral = @import("scene/peripheral.zig");
 pub const scene_cursor = @import("scene/cursor.zig");
 pub const scene_theme_cursor = @import("scene/theme_cursor.zig");
 pub const scene_drop_preview = @import("scene/drop_preview.zig");
@@ -216,6 +217,7 @@ test {
     _ = image_copy_capture;
     _ = scene_geometry;
     _ = scene_hit_test;
+    _ = scene_peripheral;
     _ = scene_cursor;
     _ = scene_theme_cursor;
     _ = scene_drop_preview;

@@ -519,6 +519,17 @@ pub fn build(b: *std.Build) void {
     );
     interaction_test_step.dependOn(&run_interaction_tests.step);
 
+    const peripheral_tests = b.addTest(.{
+        .root_module = ouro,
+        .filters = &.{"peripheral:"},
+    });
+    const run_peripheral_tests = b.addRunArtifact(peripheral_tests);
+    const peripheral_test_step = b.step(
+        "test-peripheral",
+        "Run peripheral shrink transform tests",
+    );
+    peripheral_test_step.dependOn(&run_peripheral_tests.step);
+
     const drm_tests = b.addTest(.{
         .root_module = ouro,
         .filters = &.{"drm:"},

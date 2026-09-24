@@ -61,10 +61,16 @@ pub fn topmost(
 /// Returns the topmost committed surface across rooted subsurface trees.
 /// `scene.order` supplies each tree in renderer back-to-front order and
 /// `scene.placement` supplies child offsets relative to the root surface.
+///
+/// A scene may declare `logicalPoint(window, point) ?geometry.Point` when it
+/// draws windows through a visual-only transform. It returns the logical
+/// point the pointer covers inside that window's tree, or null when the
+/// pointer misses the window as drawn; windows without a transform return
+/// the point unchanged.
 pub fn topmostTree(
     comptime Window: type,
     windows: []const Window,
-    point: geometry.Point,
+    pointer: geometry.Point,
     scene: anytype,
 ) ?Hit(Window) {
     var window_index = windows.len;
@@ -72,6 +78,10 @@ pub fn topmostTree(
         window_index -= 1;
         const window = windows[window_index];
         if (!window.visible or !window.content_ready) continue;
+        const point = if (@hasDecl(Unpointed(@TypeOf(scene)), "logicalPoint"))
+            scene.logicalPoint(window, pointer) orelse continue
+        else
+            pointer;
         const surfaces = scene.order(window.surface) catch continue;
         var surface_index = surfaces.len;
         while (surface_index != 0) {
@@ -123,6 +133,13 @@ pub fn topmostTree(
         }
     }
     return null;
+}
+
+fn Unpointed(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .pointer => |pointer| pointer.child,
+        else => T,
+    };
 }
 
 fn alignedOrigin(target: i32, geometry_offset: i32) i32 {
@@ -275,4 +292,69 @@ test "interaction: subsurface hit test follows stacking placement and input regi
     ).?;
     try std.testing.expectEqual(above, offset_child.surface);
     try std.testing.expectEqual(geometry.Point{ .x = 1, .y = 1 }, offset_child.local);
+}
+
+test "interaction: hit test honours a scene's visual-only window transform" {
+    const root = TestId{ .index = 1, .generation = 1 };
+    const Scene = struct {
+        order_storage: [1]TestId = .{root},
+
+        pub fn order(self: *@This(), _: TestId) ![]const TestId {
+            return &self.order_storage;
+        }
+
+        pub fn placement(_: *@This(), _: TestId) !geometry.Point {
+            return error.NotSubsurface;
+        }
+
+        pub fn inputContains(_: *@This(), _: TestId, _: geometry.Point) !bool {
+            return true;
+        }
+
+        /// Windows at x >= 100 are drawn at half size about their center.
+        pub fn logicalPoint(_: *@This(), window: TestWindow, point: geometry.Point) ?geometry.Point {
+            if (window.geometry.x < 100) return point;
+            const center_x = window.geometry.x + @divTrunc(window.geometry.width, 2);
+            const center_y = window.geometry.y + @divTrunc(window.geometry.height, 2);
+            const drawn: geometry.Rect = .{
+                .x = center_x - @divTrunc(window.geometry.width, 4),
+                .y = center_y - @divTrunc(window.geometry.height, 4),
+                .width = @divTrunc(window.geometry.width, 2),
+                .height = @divTrunc(window.geometry.height, 2),
+            };
+            if (!drawn.contains(point)) return null;
+            return .{
+                .x = center_x + (point.x - center_x) * 2,
+                .y = center_y + (point.y - center_y) * 2,
+            };
+        }
+    };
+    const behind = TestWindow{
+        .id = .{ .index = 1, .generation = 1 },
+        .surface = root,
+        .geometry = .{ .x = 0, .y = 0, .width = 400, .height = 400 },
+        .visible = true,
+        .content_ready = true,
+    };
+    const shrunk = TestWindow{
+        .id = .{ .index = 2, .generation = 1 },
+        .surface = root,
+        .geometry = .{ .x = 200, .y = 100, .width = 100, .height = 100 },
+        .surface_offset = .{ .x = 5, .y = 0 },
+        .visible = true,
+        .content_ready = true,
+    };
+    var scene = Scene{};
+
+    // Drawn at {225, 125, 50, 50}. Inside the logical geometry but outside
+    // the drawn rectangle falls through to the window behind.
+    const miss = topmostTree(TestWindow, &.{ behind, shrunk }, .{ .x = 210, .y = 110 }, &scene).?;
+    try std.testing.expectEqual(behind.id, miss.toplevel);
+    try std.testing.expectEqual(geometry.Point{ .x = 210, .y = 110 }, miss.local);
+
+    // Inside the drawn rectangle the hit maps back to logical coordinates:
+    // 10 drawn pixels right of the drawn origin is 20 logical pixels.
+    const hit = topmostTree(TestWindow, &.{ behind, shrunk }, .{ .x = 235, .y = 130 }, &scene).?;
+    try std.testing.expectEqual(shrunk.id, hit.toplevel);
+    try std.testing.expectEqual(geometry.Point{ .x = 25, .y = 10 }, hit.local);
 }

@@ -7,6 +7,7 @@
 const std = @import("std");
 const geometry = @import("../scene/geometry.zig");
 const layout = @import("layout.zig");
+const peripheral = @import("../scene/peripheral.zig");
 const workspace = @import("workspace.zig");
 
 const workspace_count = 10;
@@ -46,6 +47,7 @@ pub fn Policy(
             focus_follows_mouse: bool = false,
             inner_gap: u32 = 12,
             outer_gap: u32 = 12,
+            peripheral: peripheral.Settings = .{},
 
             pub fn deinit(_: *Snapshot) void {}
         };
@@ -100,6 +102,7 @@ pub fn Policy(
         focus_follows_mouse: bool = false,
         inner_gap: u32 = 0,
         outer_gap: u32 = 0,
+        peripheral: peripheral.Settings = .{},
         workspace_revision: u64 = 1,
 
         pub fn init(allocator: std.mem.Allocator, capacity: usize, output_capacity: usize) !Self {
@@ -552,6 +555,7 @@ pub fn Policy(
         }
 
         pub fn validateSnapshot(policy: *const Self, view: anytype, snapshot: *const Snapshot) !void {
+            try snapshot.peripheral.validate();
             try policy.validateLayoutWithGaps(
                 policy.layoutCount(),
                 view,
@@ -590,10 +594,12 @@ pub fn Policy(
 
         pub fn installSnapshot(policy: *Self, snapshot: *Snapshot) bool {
             const changed = policy.focus_follows_mouse != snapshot.focus_follows_mouse or
-                policy.inner_gap != snapshot.inner_gap or policy.outer_gap != snapshot.outer_gap;
+                policy.inner_gap != snapshot.inner_gap or policy.outer_gap != snapshot.outer_gap or
+                !std.meta.eql(policy.peripheral, snapshot.peripheral);
             policy.focus_follows_mouse = snapshot.focus_follows_mouse;
             policy.inner_gap = snapshot.inner_gap;
             policy.outer_gap = snapshot.outer_gap;
+            policy.peripheral = snapshot.peripheral;
             snapshot.* = undefined;
             return changed;
         }
