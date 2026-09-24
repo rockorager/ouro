@@ -1,10 +1,10 @@
 //! Peripheral shrink: windows near the sides of a wide output are rendered
 //! smaller, as if the sides were peripheral vision. Windows inside a central
-//! band keep their full size; beyond it, the visual scale falls linearly with
-//! the window's horizontal distance from the band until the output edge, where
+//! band keep their full size; beyond it, the visual scale decays exponentially
+//! with horizontal distance from the band until the output edge, where
 //! it reaches `min_scale_percent`. The window shrinks about its own center, so
-//! its logical geometry, configured size, and buffer never change: this is a
-//! render-and-input transform, not a layout.
+//! its logical geometry, configured size, and buffer never change during the
+//! transform. Tiled windows use separate center/side layout regions below.
 
 const std = @import("std");
 const geometry = @import("geometry.zig");
@@ -23,6 +23,45 @@ pub const Settings = struct {
             return error.InvalidPeripheralScale;
     }
 };
+
+pub const Region = enum { center, left, right };
+
+/// Reserved tiling bands inside the work area. Outer gaps belong to the output;
+/// inner gaps separate the bands, including when a side band is empty.
+pub const Regions = struct {
+    areas: [3]geometry.Rect,
+    center_start: i32,
+    center_end: i32,
+
+    pub fn at(regions: Regions, point: geometry.Point) Region {
+        return if (point.x < regions.center_start) .left else if (point.x >= regions.center_end) .right else .center;
+    }
+};
+
+pub fn tileRegions(settings: Settings, bounds: geometry.Rect, inner: u32, outer: u32) ?Regions {
+    if (!settings.enabled or settings.center_percent == 0 or settings.center_percent >= 100) return null;
+    const center_width = @divTrunc(@as(i64, bounds.width) * settings.center_percent, 100);
+    const left_width = @divTrunc(bounds.width - center_width, 2);
+    const center_start = @as(i64, bounds.x) + left_width;
+    const center_end = center_start + center_width;
+    const before = @divTrunc(inner, 2);
+    const after = inner - before;
+    const starts = [3]i64{ center_start + after, @as(i64, bounds.x) + outer, center_end + after };
+    const ends = [3]i64{ center_end - before, center_start - before, @as(i64, bounds.x) + bounds.width - outer };
+    const height = @as(i64, bounds.height) - @as(i64, outer) * 2;
+    if (height <= 0) return null;
+    var areas: [3]geometry.Rect = undefined;
+    for (starts, ends, &areas) |start, end, *area| {
+        if (end <= start) return null;
+        area.* = .{
+            .x = @intCast(start),
+            .y = @intCast(@as(i64, bounds.y) + outer),
+            .width = @intCast(end - start),
+            .height = @intCast(height),
+        };
+    }
+    return .{ .areas = areas, .center_start = @intCast(center_start), .center_end = @intCast(center_end) };
+}
 
 /// Returns the visual transform for a window occupying `window` on an output
 /// whose logical extent is `bounds`, or null when the window renders at its
@@ -45,7 +84,12 @@ pub fn transform(
     if (falloff2 <= 0) return null;
     const progress = @min(@as(i64, @intCast(distance2)) - half_band2, falloff2);
     const min_scale = @divTrunc(@as(i64, render.fixed_one) * @as(i64, settings.min_scale_percent), 100);
-    const scale = render.fixed_one - @divTrunc((render.fixed_one - min_scale) * progress, falloff2);
+    const t = @as(f64, @floatFromInt(progress)) / @as(f64, @floatFromInt(falloff2));
+    // Four half-lives: shrink quickly after leaving center, then taper off.
+    // Normalize the decay so the center is exactly 1 and the edge exactly min.
+    const remaining = (@exp2(-4.0 * t) - 0.0625) / 0.9375;
+    const scale: i64 = @intFromFloat(@round(@as(f64, @floatFromInt(min_scale)) +
+        @as(f64, @floatFromInt(render.fixed_one - min_scale)) * remaining));
     return .{
         .anchor = .{
             .x = @intCast(@divFloor(window_center2, 2)),
@@ -53,6 +97,25 @@ pub fn transform(
         },
         .scale = @intCast(@max(min_scale, scale)),
     };
+}
+
+/// A dragged floating window stays visibly on its cursor-selected output even
+/// when its logical center has crossed the boundary. Keep the shrink computed
+/// above (including its minimum) and translate the drawn rectangle back inside.
+pub fn boundedTransform(settings: Settings, window: geometry.Rect, bounds: geometry.Rect) ?render.VisualTransform {
+    if (!settings.enabled) return null;
+    var visual = transform(settings, window, bounds) orelse render.VisualTransform{
+        .anchor = .{ .x = window.x, .y = window.y },
+        .scale = render.fixed_one,
+    };
+    const drawn = renderedRect(visual, window) orelse return null;
+    const x = std.math.clamp(@as(i64, drawn.x), bounds.x, @as(i64, bounds.x) + @max(0, bounds.width - drawn.width));
+    const y = std.math.clamp(@as(i64, drawn.y), bounds.y, @as(i64, bounds.y) + @max(0, bounds.height - drawn.height));
+    visual.translation = .{
+        .x = std.math.cast(i32, x - drawn.x) orelse return null,
+        .y = std.math.cast(i32, y - drawn.y) orelse return null,
+    };
+    return if (visual.identity()) null else visual;
 }
 
 /// The logical rectangle `rect` as drawn through `visual`.
@@ -108,21 +171,24 @@ test "peripheral: windows inside the central band keep their size" {
     try std.testing.expect(transform(.{}, .{ .x = 0, .y = 0, .width = 10, .height = 10 }, bounds) == null);
 }
 
-test "peripheral: scale falls linearly to the minimum at the output edge" {
+test "peripheral: exponential decay shrinks fast then approaches the edge minimum" {
     const settings: Settings = .{ .enabled = true, .center_percent = 50, .min_scale_percent = 25 };
     const bounds: geometry.Rect = .{ .x = 0, .y = 0, .width = 4000, .height = 1000 };
-    // Falloff spans centers from 3000 to 4000. A center at 3500 is halfway:
-    // scale = 1 - 0.5 * (1 - 0.25) = 0.625.
+    // Four half-lives produce 60%, 40%, 30%, 25% at quarter intervals:
+    // successive reductions are 40, 20, 10, and 5 percentage points.
+    for ([_]i32{ 3250, 3500, 3750, 4000 }, [_]i32{ 39322, 26214, 19661, 16384 }) |center, expected| {
+        try std.testing.expectEqual(expected, transform(settings, .{ .x = center - 500, .y = 200, .width = 1000, .height = 400 }, bounds).?.scale);
+    }
     const half = transform(settings, .{ .x = 3000, .y = 200, .width = 1000, .height = 400 }, bounds).?;
     try std.testing.expectEqual(@as(i32, 3500), half.anchor.x);
     try std.testing.expectEqual(@as(i32, 400), half.anchor.y);
-    try std.testing.expectEqual(@as(i32, 40960), half.scale);
+    try std.testing.expectEqual(@as(i32, 26214), half.scale);
     const mapped = try half.mapRect(.{ .x = 3000, .y = 200, .width = 1000, .height = 400 });
-    try std.testing.expectEqual(render.Rect{ .x = 3188, .y = 275, .width = 625, .height = 250 }, mapped);
+    try std.testing.expectEqual(render.Rect{ .x = 3300, .y = 320, .width = 400, .height = 160 }, mapped);
 
     // The left side mirrors the right, and centers past the edge clamp.
     const left = transform(settings, .{ .x = 0, .y = 200, .width = 1000, .height = 400 }, bounds).?;
-    try std.testing.expectEqual(@as(i32, 40960), left.scale);
+    try std.testing.expectEqual(@as(i32, 26214), left.scale);
     const beyond = transform(settings, .{ .x = -2000, .y = 0, .width = 1000, .height = 400 }, bounds).?;
     try std.testing.expectEqual(@as(i32, 16384), beyond.scale);
     const edge = transform(settings, .{ .x = 3500, .y = 0, .width = 1000, .height = 400 }, bounds).?;
@@ -166,22 +232,59 @@ test "peripheral: pointer over the drawn window maps into logical space" {
     const bounds: geometry.Rect = .{ .x = 0, .y = 0, .width = 4000, .height = 1000 };
     const window: geometry.Rect = .{ .x = 3000, .y = 200, .width = 1000, .height = 400 };
     const visual = transform(settings, window, bounds).?;
-    // Drawn at {3188, 275, 625, 250}: the logical area outside that is a miss
+    // Drawn at {3300, 320, 400, 160}: the logical area outside that is a miss
     // even though it lies inside the window's logical geometry.
     try std.testing.expect(logicalPoint(visual, window, .{ .x = 3100, .y = 300 }) == null);
-    try std.testing.expect(logicalPoint(visual, window, .{ .x = 3187, .y = 300 }) == null);
-    try std.testing.expect(logicalPoint(visual, window, .{ .x = 3813, .y = 300 }) == null);
-    // The drawn top-left pixel covers logical columns 3000.8..3002.4 and rows
-    // 200..201.6, so it maps to the nearest logical pixel inside the window.
-    try std.testing.expectEqual(geometry.Point{ .x = 3001, .y = 200 }, logicalPoint(visual, window, .{ .x = 3188, .y = 275 }).?);
-    // The center stays put; a drawn pixel 100 to the right is 160 logical pixels.
+    try std.testing.expect(logicalPoint(visual, window, .{ .x = 3299, .y = 400 }) == null);
+    try std.testing.expect(logicalPoint(visual, window, .{ .x = 3700, .y = 400 }) == null);
+    try std.testing.expectEqual(geometry.Point{ .x = 3000, .y = 200 }, logicalPoint(visual, window, .{ .x = 3300, .y = 320 }).?);
+    // The center stays put; a drawn pixel 100 to the right is 250 logical pixels.
     try std.testing.expectEqual(geometry.Point{ .x = 3500, .y = 400 }, logicalPoint(visual, window, .{ .x = 3500, .y = 400 }).?);
-    try std.testing.expectEqual(geometry.Point{ .x = 3660, .y = 400 }, logicalPoint(visual, window, .{ .x = 3600, .y = 400 }).?);
-    // The last drawn pixel stays inside the window (drawn row 524 covers
-    // logical rows 598.4..600 and rounds to 598).
-    try std.testing.expectEqual(geometry.Point{ .x = 3999, .y = 598 }, logicalPoint(visual, window, .{ .x = 3812, .y = 524 }).?);
+    try std.testing.expectEqual(geometry.Point{ .x = 3750, .y = 400 }, logicalPoint(visual, window, .{ .x = 3600, .y = 400 }).?);
+    // The last drawn pixel remains inside the window after rounding.
+    try std.testing.expectEqual(geometry.Point{ .x = 3998, .y = 598 }, logicalPoint(visual, window, .{ .x = 3699, .y = 479 }).?);
     // One past the drawn bottom-right corner is a miss.
-    try std.testing.expect(logicalPoint(visual, window, .{ .x = 3812, .y = 525 }) == null);
+    try std.testing.expect(logicalPoint(visual, window, .{ .x = 3699, .y = 480 }) == null);
+}
+
+test "peripheral: reserved bands keep odd gaps and offset boundaries exact" {
+    const bounds: geometry.Rect = .{ .x = -700, .y = 40, .width = 1003, .height = 403 };
+    const regions = tileRegions(.{ .enabled = true, .center_percent = 40 }, bounds, 11, 7).?;
+    try std.testing.expectEqual(geometry.Rect{ .x = -393, .y = 47, .width = 390, .height = 389 }, regions.areas[0]);
+    try std.testing.expectEqual(geometry.Rect{ .x = -693, .y = 47, .width = 289, .height = 389 }, regions.areas[1]);
+    try std.testing.expectEqual(geometry.Rect{ .x = 8, .y = 47, .width = 288, .height = 389 }, regions.areas[2]);
+    try std.testing.expectEqual(Region.left, regions.at(.{ .x = -400, .y = 100 }));
+    try std.testing.expectEqual(Region.center, regions.at(.{ .x = -399, .y = 100 }));
+    try std.testing.expectEqual(Region.center, regions.at(.{ .x = 1, .y = 100 }));
+    try std.testing.expectEqual(Region.right, regions.at(.{ .x = 2, .y = 100 }));
+    try std.testing.expect(tileRegions(.{}, bounds, 11, 7) == null);
+    try std.testing.expect(tileRegions(.{ .enabled = true, .center_percent = 100 }, bounds, 11, 7) == null);
+    try std.testing.expect(tileRegions(.{ .enabled = true, .center_percent = 0 }, bounds, 11, 7) == null);
+    try std.testing.expect(tileRegions(.{ .enabled = true }, .{ .x = 0, .y = 0, .width = 3, .height = 5 }, 12, 12) == null);
+}
+
+test "peripheral: minimum-size window stays inside its selected monitor with invertible input" {
+    const settings: Settings = .{ .enabled = true, .min_scale_percent = 25 };
+    const bounds: geometry.Rect = .{ .x = -500, .y = 50, .width = 500, .height = 400 };
+    // Both logical centers have crossed x=0, but the cursor still owns the
+    // left monitor. The drawn window stops at its edge at the same minimum.
+    for ([_]i32{ -50, 50 }) |x| {
+        const window: geometry.Rect = .{ .x = x, .y = 100, .width = 200, .height = 120 };
+        const visual = boundedTransform(settings, window, bounds).?;
+        try std.testing.expectEqual(@as(i32, 16384), visual.scale);
+        try std.testing.expectEqual(geometry.Rect{ .x = -50, .y = 145, .width = 50, .height = 30 }, renderedRect(visual, window).?);
+        try std.testing.expectEqual(geometry.Point{ .x = x + 100, .y = 160 }, logicalPoint(visual, window, .{ .x = -25, .y = 160 }).?);
+        try std.testing.expect(logicalPoint(visual, window, .{ .x = 0, .y = 160 }) == null);
+    }
+    // Selecting the other monitor changes the scale/bounds, not the configured
+    // client geometry. Its top edge remains contained on the destination.
+    const window: geometry.Rect = .{ .x = -50, .y = -120, .width = 200, .height = 120 };
+    const right = boundedTransform(settings, window, .{ .x = 0, .y = 0, .width = 800, .height = 600 }).?;
+    try std.testing.expect(right.scale > 16384);
+    const drawn = renderedRect(right, window).?;
+    try std.testing.expectEqual(@as(i32, 20), drawn.x);
+    try std.testing.expectEqual(@as(i32, 0), drawn.y);
+    try std.testing.expect(!right.identity());
 }
 
 test "peripheral: settings reject impossible percentages" {

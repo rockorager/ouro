@@ -196,7 +196,17 @@ tiled window. Tiled drops swap with a window's center or split beside its
 left/right/top/bottom edge; dropping at an output's left/right edge inserts at
 the outside of the layout. Crossing outputs moves the tile to the destination's
 active workspace. Tiled layout changes on release after at least 8 logical
-pixels of motion; dragging a tile never makes it floating.
+pixels of motion unless peripheral shrink mode is enabled.
+
+With `peripheral_shrink` enabled, tiles fill the central band with the configured
+gaps. Super-left-drag detaches a tile at its current size and moves it with the
+pointer. Release at the side to leave it floating, or release with the cursor
+in the center to snap it back into tiling. New windows start in the center.
+`peripheral_center_percent` controls the center width;
+`peripheral_min_scale_percent` sets the minimum visual scale. Shrink follows an
+exponential decay: fast just outside the center, then slower near the edge.
+The client size stays unchanged. During a drag, the window stays within its
+output until the cursor itself crosses to another monitor.
 
 Left-drag a floating window's edge or corner, or a tiled split boundary
 (including the gap), to resize without a modifier. Handles extend 8 logical

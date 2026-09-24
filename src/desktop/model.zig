@@ -99,6 +99,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             kind: InteractiveKind,
         };
         pub const InteractiveGeometry = struct {
+            kind: InteractiveKind = .move,
             rect: geometry.Rect,
             min_width: i32,
             min_height: i32,
@@ -717,6 +718,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             } else null;
             try desktop.reflow();
             return .{
+                .kind = if (request.kind == .reorder and !tiled) .move else request.kind,
                 .rect = if (state.mode == .tiled) current_geometry else state.floating,
                 .min_width = if (tiled) 1 else @max(slot.min_width, 1),
                 .min_height = if (tiled) 1 else @max(slot.min_height, 1),
@@ -785,11 +787,22 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             if (try desktop.policy.finishReorder(id, point, PolicyView{ .context = desktop })) try desktop.reflow();
         }
 
-        pub fn updateInteractive(desktop: *Self, id: ToplevelId, rect: geometry.Rect) !void {
+        pub fn finishMove(desktop: *Self, id: ToplevelId, point: geometry.Point) !void {
+            _ = try desktop.resolveIndex(id);
+            try desktop.requireCommandCapacity(desktop.live);
+            if (try desktop.policy.finishMove(id, point, PolicyView{ .context = desktop })) try desktop.reflow();
+        }
+
+        pub fn updateInteractive(desktop: *Self, id: ToplevelId, rect: geometry.Rect, pointer: ?geometry.Point) !void {
             try rect.validate();
             _ = try desktop.resolveIndex(id);
             try desktop.requireCommandCapacity(1);
-            if (try desktop.policy.updateInteractive(id, rect)) try desktop.reflow();
+            if (try desktop.policy.updateInteractive(id, rect, pointer)) {
+                try desktop.reflow();
+                // Cursor-selected output/visual bounds can change even when
+                // the client's logical rectangle stays exactly the same.
+                desktop.scene_changed = true;
+            }
         }
 
         pub fn updateToplevelDrag(
@@ -807,7 +820,10 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                 start,
                 current,
                 desktop.work_area,
-            )) try desktop.reflow();
+            )) {
+                try desktop.reflow();
+                desktop.scene_changed = true;
+            }
         }
 
         pub fn endInteractive(desktop: *Self, id: ToplevelId) !void {
@@ -1093,8 +1109,9 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             try rect.validate();
             _ = try desktop.resolveIndex(id);
             try desktop.requireCommandCapacity(1);
-            if (!try desktop.policy.setFloatingGeometry(id, rect)) return;
+            if (!try desktop.policy.setFloatingGeometry(id, rect, null)) return;
             try desktop.reflow();
+            desktop.scene_changed = true;
         }
 
         pub fn setWorkArea(desktop: *Self, rect: geometry.Rect) !void {
@@ -1519,16 +1536,18 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                                 // Tiled anchors belong to the placement, not
                                 // the grab; the neighbour has no resizing state.
                                 if (state.mode == .floating and !state.resizing and anchor.final_serial == commit.serial) {
-                                    _ = try desktop.policy.setFloatingGeometry(id, slot.target_scene.geometry);
+                                    _ = try desktop.policy.setFloatingGeometry(id, slot.target_scene.geometry, state.floating_pointer);
                                     slot.resize_anchor = null;
                                 }
                             } else if (state.mode == .floating) {
+                                // Client redraws update size, not the output
+                                // chosen by the last compositor drag.
                                 _ = try desktop.policy.setFloatingGeometry(id, .{
                                     .x = state.floating.x,
                                     .y = state.floating.y,
                                     .width = commit.window_width,
                                     .height = commit.window_height,
-                                });
+                                }, state.floating_pointer);
                             }
                         }
                     }
@@ -3014,8 +3033,8 @@ const KioskPolicyFactory = struct {
                 return policy.base.beginInteractive(id, kind, current_geometry);
             }
 
-            pub fn updateInteractive(policy: *Self, id: ToplevelId, rect: geometry.Rect) !bool {
-                return policy.base.updateInteractive(id, rect);
+            pub fn updateInteractive(policy: *Self, id: ToplevelId, rect: geometry.Rect, pointer: ?geometry.Point) !bool {
+                return policy.base.updateInteractive(id, rect, pointer);
             }
 
             pub fn updateToplevelDrag(
@@ -3033,8 +3052,8 @@ const KioskPolicyFactory = struct {
                 return policy.base.endInteractive(id);
             }
 
-            pub fn setFloatingGeometry(policy: *Self, id: ToplevelId, rect: geometry.Rect) !bool {
-                return policy.base.setFloatingGeometry(id, rect);
+            pub fn setFloatingGeometry(policy: *Self, id: ToplevelId, rect: geometry.Rect, pointer: ?geometry.Point) !bool {
+                return policy.base.setFloatingGeometry(id, rect, pointer);
             }
 
             pub fn setState(
@@ -3927,7 +3946,7 @@ test "desktop: tiled edge resize changes a retained split" {
         .y = initial.y,
         .width = initial.width + 10,
         .height = initial.height,
-    });
+    }, null);
     try settleDesktop(&desktop, &shell);
     try std.testing.expectEqual(@as(i32, 60), (try desktop.scene(first)).geometry.width);
     try desktop.endInteractive(first);
@@ -3979,7 +3998,7 @@ test "desktop: tiled resize anchors late neighbour commits across timeout and re
                     if (grab_neighbour) requested.x += delta;
                     requested.width += if (grab_neighbour) -delta else delta;
                 }
-                try desktop.updateInteractive(grabbed, requested);
+                try desktop.updateInteractive(grabbed, requested, null);
                 while (desktop.pendingCommands() != 0) _ = try desktop.flushConfigure(&shell);
                 serials[step] = desktop.slots[second.index].expected_serial.?;
             }
@@ -4041,7 +4060,7 @@ test "desktop: relocating a resized tile still waits for the layout transaction"
     const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
     const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
     _ = (try desktop.beginInteractive(.{ .id = first, .kind = .{ .resize = .right } })).?;
-    try desktop.updateInteractive(first, .{ .x = 0, .y = 0, .width = 60, .height = 60 });
+    try desktop.updateInteractive(first, .{ .x = 0, .y = 0, .width = 60, .height = 60 }, null);
     try desktop.endInteractive(first);
     try settleDesktop(&desktop, &shell);
     try std.testing.expect(desktop.slots[second.index].resize_anchor.?.right);
@@ -5017,7 +5036,7 @@ test "desktop: interactive resize preserves geometry and publishes resizing stat
     try std.testing.expectEqual(before, interactive.rect);
     try std.testing.expect((try desktop.policy.windowState(id)).mode == .floating);
     try std.testing.expect(desktop.slots[id.index].last_configure.states.resizing);
-    try desktop.updateInteractive(id, .{ .x = before.x, .y = before.y, .width = 80, .height = 40 });
+    try desktop.updateInteractive(id, .{ .x = before.x, .y = before.y, .width = 80, .height = 40 }, null);
     try std.testing.expectEqual(@as(i32, 80), (try desktop.policy.windowState(id)).floating.width);
     try desktop.endInteractive(id);
     try std.testing.expect(!desktop.slots[id.index].last_configure.states.resizing);
@@ -5067,10 +5086,10 @@ test "desktop: floating resize anchors intermediate commits and the final rounde
                 .width = if (horizontal) 400 + 2 * delta else 400,
                 .height = if (vertical) 300 + 2 * delta else 300,
             };
-            try desktop.updateInteractive(id, first);
+            try desktop.updateInteractive(id, first, null);
             while (desktop.pendingCommands() != 0) _ = try desktop.flushConfigure(&shell);
             const older_serial = shell.configure_serial;
-            try desktop.updateInteractive(id, latest);
+            try desktop.updateInteractive(id, latest, null);
             while (desktop.pendingCommands() != 0) _ = try desktop.flushConfigure(&shell);
             const newer_serial = shell.configure_serial;
             // A client paints an older configure while the pointer is already
@@ -5187,6 +5206,194 @@ test "desktop: pointer drops swap centers and insert on all four sides without f
     }
 }
 
+test "desktop: peripheral tiles reserve the center and drag between bands with gaps" {
+    var desktop = try initTestDesktop(16);
+    defer desktop.deinit();
+    try desktop.setWorkArea(.{ .x = -200, .y = 40, .width = 1000, .height = 600 });
+    var settings: TestDesktop.PolicySnapshot = .{
+        .inner_gap = 12,
+        .outer_gap = 10,
+        .peripheral = .{ .enabled = true },
+    };
+    try desktop.installPolicySnapshot(&settings);
+    var shell = TestShell{};
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const center = geometry.Rect{ .x = 56, .y = 50, .width = 488, .height = 580 };
+    const left = geometry.Rect{ .x = -190, .y = 50, .width = 234, .height = 580 };
+    const right = geometry.Rect{ .x = 556, .y = 50, .width = 234, .height = 580 };
+    try std.testing.expectEqual(center, (try desktop.scene(first)).geometry);
+
+    shell.push(created(1));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
+    const before = (try desktop.scene(first)).geometry;
+    // A preview must not mutate the tree or float the source.
+    try std.testing.expect((try desktop.reorderPreview(first, .{ .x = -150, .y = 300 })) != null);
+    try std.testing.expectEqual(before, (try desktop.scene(first)).geometry);
+    try desktop.finishReorder(first, .{ .x = -150, .y = 300 });
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(left, (try desktop.scene(first)).geometry);
+    try std.testing.expectEqual(center, (try desktop.scene(second)).geometry);
+    try std.testing.expectEqual(TestDesktop.Mode.tiled, (try desktop.policy.windowState(first)).mode);
+
+    // Empty the center, then bring a side tile back into its full reserved area.
+    try desktop.finishReorder(second, .{ .x = 700, .y = 300 });
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(right, (try desktop.scene(second)).geometry);
+    try std.testing.expectEqual(center, (try desktop.reorderPreview(first, .{ .x = 300, .y = 300 })).?);
+    try desktop.finishReorder(first, .{ .x = 300, .y = 300 });
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(center, (try desktop.scene(first)).geometry);
+    try std.testing.expectEqual(right, (try desktop.scene(second)).geometry);
+
+    // New windows go to the center even while a side tile has focus.
+    try desktop.focusToplevel(second);
+    shell.push(created(2));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const third = try desktop.idForShell(.{ .index = 2, .generation = 1 });
+    for ([_]TestDesktop.ToplevelId{ first, third }) |id| {
+        const rect = (try desktop.scene(id)).geometry;
+        try std.testing.expectEqual(center.x, rect.x);
+        try std.testing.expectEqual(center.width, rect.width);
+        try std.testing.expect(rect.y >= center.y and rect.y + rect.height <= center.y + center.height);
+    }
+    try std.testing.expectEqual(right, (try desktop.scene(second)).geometry);
+
+    // Side membership follows a tile between workspaces. Disabling the mode
+    // also merges hidden workspaces, so their tiles cannot be stranded.
+    try desktop.focusToplevel(second);
+    const output = (try desktop.policy.windowState(second)).output.?;
+    try desktop.moveFocusedToWorkspace(2);
+    try settleDesktop(&desktop, &shell);
+    try desktop.switchWorkspace(output, 2);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(right, (try desktop.scene(second)).geometry);
+    try desktop.switchWorkspace(output, 1);
+    try settleDesktop(&desktop, &shell);
+    var disabled: TestDesktop.PolicySnapshot = .{ .inner_gap = 12, .outer_gap = 10 };
+    try desktop.installPolicySnapshot(&disabled);
+    try settleDesktop(&desktop, &shell);
+    try desktop.switchWorkspace(output, 2);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 50, .width = 980, .height = 580 }, (try desktop.scene(second)).geometry);
+}
+
+test "desktop: peripheral pointer drag keeps tile size and only snaps on center release" {
+    var desktop = try initTestDesktop(16);
+    defer desktop.deinit();
+    try desktop.setWorkArea(.{ .x = -200, .y = 40, .width = 1000, .height = 600 });
+    var settings: TestDesktop.PolicySnapshot = .{ .inner_gap = 12, .outer_gap = 10, .peripheral = .{ .enabled = true } };
+    try desktop.installPolicySnapshot(&settings);
+    var shell = TestShell{};
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const id = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const center = geometry.Rect{ .x = 56, .y = 50, .width = 488, .height = 580 };
+    const initial = (try desktop.beginInteractive(.{ .id = id, .kind = .reorder })).?;
+    try std.testing.expect(initial.kind == .move);
+    try std.testing.expectEqual(center, initial.rect);
+    const moved = geometry.Rect{ .x = -144, .y = 57, .width = 488, .height = 580 };
+    try desktop.updateInteractive(id, moved, .{ .x = -150, .y = 300 });
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(moved, (try desktop.scene(id)).geometry);
+    try std.testing.expectEqual(TestDesktop.Mode.floating, (try desktop.scene(id)).mode);
+    try desktop.finishMove(id, .{ .x = -150, .y = 300 });
+    try desktop.endInteractive(id);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(moved, (try desktop.scene(id)).geometry);
+    try std.testing.expectEqual(TestDesktop.Mode.floating, (try desktop.scene(id)).mode);
+
+    // Crossing center while still held does not tile. Cancelling there also
+    // leaves the window floating; only an explicit release snaps it.
+    _ = (try desktop.beginInteractive(.{ .id = id, .kind = .move })).?;
+    try desktop.updateInteractive(id, center, .{ .x = 300, .y = 300 });
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(TestDesktop.Mode.floating, (try desktop.scene(id)).mode);
+    try desktop.endInteractive(id);
+    try std.testing.expectEqual(TestDesktop.Mode.floating, (try desktop.scene(id)).mode);
+    _ = (try desktop.beginInteractive(.{ .id = id, .kind = .move })).?;
+    try desktop.finishMove(id, .{ .x = 300, .y = 300 });
+    try desktop.endInteractive(id);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(TestDesktop.Mode.tiled, (try desktop.scene(id)).mode);
+    try std.testing.expectEqual(center, (try desktop.scene(id)).geometry);
+}
+
+test "desktop: peripheral drop uses the destination output and active workspace" {
+    var desktop = try initTestDesktop(16);
+    defer desktop.deinit();
+    const topology = [_]TestDesktop.OutputArea{
+        .{ .id = .{ .value = 10 }, .geometry = .{ .x = -600, .y = 40, .width = 600, .height = 400 } },
+        .{ .id = .{ .value = 20 }, .geometry = .{ .x = 0, .y = -100, .width = 800, .height = 500 } },
+    };
+    desktop.applyTopology(.{ .x = -600, .y = -100, .width = 1400, .height = 540 }, &topology);
+    var settings: TestDesktop.PolicySnapshot = .{ .inner_gap = 0, .outer_gap = 0, .peripheral = .{ .enabled = true } };
+    try desktop.installPolicySnapshot(&settings);
+    var shell = TestShell{};
+    desktop.setNextSpawnOutput(topology[0].id);
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    try desktop.switchWorkspace(topology[1].id, 3);
+    try desktop.finishReorder(first, .{ .x = 100, .y = 100 });
+    try settleDesktop(&desktop, &shell);
+    const state = try desktop.policy.windowState(first);
+    try std.testing.expectEqual(topology[1].id, state.output.?);
+    try std.testing.expectEqual(@as(u8, 3), state.workspace);
+    try std.testing.expectEqual(geometry.Rect{ .x = 0, .y = -100, .width = 200, .height = 500 }, (try desktop.scene(first)).geometry);
+    try desktop.finishReorder(first, .{ .x = -300, .y = 200 });
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(geometry.Rect{ .x = -450, .y = 40, .width = 300, .height = 400 }, (try desktop.scene(first)).geometry);
+    try std.testing.expectEqual(@as(u8, 1), (try desktop.policy.windowState(first)).workspace);
+}
+
+test "desktop: peripheral floating monitor handoff follows the cursor not the rectangle" {
+    var desktop = try initTestDesktop(16);
+    defer desktop.deinit();
+    const topology = [_]TestDesktop.OutputArea{
+        .{ .id = .{ .value = 10 }, .geometry = .{ .x = -600, .y = 40, .width = 600, .height = 400 } },
+        .{ .id = .{ .value = 20 }, .geometry = .{ .x = 0, .y = -100, .width = 800, .height = 500 } },
+    };
+    desktop.applyTopology(.{ .x = -600, .y = -100, .width = 1400, .height = 540 }, &topology);
+    var settings: TestDesktop.PolicySnapshot = .{ .inner_gap = 0, .outer_gap = 0, .peripheral = .{ .enabled = true } };
+    try desktop.installPolicySnapshot(&settings);
+    var shell = TestShell{};
+    desktop.setNextSpawnOutput(topology[0].id);
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const id = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    try desktop.setFloating(id, true);
+    try settleDesktop(&desktop, &shell);
+    _ = (try desktop.beginInteractive(.{ .id = id, .kind = .move })).?;
+    try desktop.switchWorkspace(topology[1].id, 3);
+    const rect: geometry.Rect = .{ .x = -50, .y = 100, .width = 200, .height = 120 };
+    // The center and most of the rectangle are on the right monitor already.
+    // Only crossing with the pointer transfers it, in either direction.
+    for ([_]i32{ -1, 0, -1 }, [_]usize{ 0, 1, 0 }) |x, index| {
+        try desktop.updateInteractive(id, rect, .{ .x = x, .y = 150 });
+        try settleDesktop(&desktop, &shell);
+        const state = try desktop.policy.windowState(id);
+        try std.testing.expectEqual(topology[index].id, state.output.?);
+        try std.testing.expectEqual(@as(u8, if (index == 0) 1 else 3), state.workspace);
+    }
+    try desktop.endInteractive(id);
+    try desktop.focusToplevel(id);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(topology[0].id, (try desktop.policy.windowState(id)).output.?);
+    // An explicit geometry command is still free to choose another output.
+    try desktop.setFloatingGeometry(id, rect);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(topology[1].id, (try desktop.policy.windowState(id)).output.?);
+}
+
 test "desktop: drop preview respects odd geometry, root strips, and invalid targets" {
     var desktop = try initTestDesktop(16);
     defer desktop.deinit();
@@ -5268,7 +5475,7 @@ test "desktop: handles resize real tiled boundaries without a gap jump" {
     const handle = (try desktop.resizeHandleAt(.{ .x = 50, .y = 30 })).?;
     try std.testing.expect(handle.tiled);
     const initial = (try desktop.beginInteractive(.{ .id = handle.id, .kind = .{ .resize = handle.edge } })).?;
-    try desktop.updateInteractive(handle.id, initial.rect);
+    try desktop.updateInteractive(handle.id, initial.rect, null);
     try settleDesktop(&desktop, &shell);
     try std.testing.expectEqual(before, (try desktop.scene(first)).geometry);
     var resized = initial.rect;
@@ -5276,7 +5483,7 @@ test "desktop: handles resize real tiled boundaries without a gap jump" {
         resized.x += 10;
         resized.width -= 10;
     }
-    try desktop.updateInteractive(handle.id, resized);
+    try desktop.updateInteractive(handle.id, resized, null);
     try settleDesktop(&desktop, &shell);
     try std.testing.expect((try desktop.scene(first)).geometry.width > before.width);
     try desktop.endInteractive(handle.id);
@@ -5346,14 +5553,14 @@ test "desktop: nested handles skip hidden splits and survive retile during a gra
     try std.testing.expectEqual(TestDesktop.Mode.tiled, (try desktop.policy.windowState(first)).mode);
     var larger = initial.rect;
     larger.width += 60;
-    try desktop.updateInteractive(first, larger);
+    try desktop.updateInteractive(first, larger, null);
     try desktop.endInteractive(first);
     try settleDesktop(&desktop, &shell);
     try std.testing.expectEqual(@as(i32, 360), (try desktop.scene(first)).geometry.width);
     try desktop.setFloating(first, true);
     _ = (try desktop.beginInteractive(.{ .id = first, .kind = .move })).?;
     try desktop.setFloating(first, false);
-    try desktop.updateInteractive(first, larger);
+    try desktop.updateInteractive(first, larger, null);
     try desktop.endInteractive(first);
     try std.testing.expectEqual(TestDesktop.Mode.tiled, (try desktop.policy.windowState(first)).mode);
 }

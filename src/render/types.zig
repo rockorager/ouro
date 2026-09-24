@@ -248,16 +248,17 @@ pub const UploadDamage = struct {
 
 pub const Filter = enum { nearest, adaptive };
 
-/// Visual-only uniform scale of a whole surface tree about a logical anchor,
-/// applied before output scaling. The client is never told about it: its
+/// Visual-only uniform scale about a logical anchor and translation of a whole
+/// surface tree, applied before output scaling. The client is never told: its
 /// configured size, buffer, and input coordinates stay in logical geometry,
-/// only the rendered destination shrinks. `scale` is 16.16 fixed point.
+/// only the rendered destination changes. `scale` is 16.16 fixed point.
 pub const VisualTransform = struct {
     anchor: Point,
     scale: i32,
+    translation: Point = .{ .x = 0, .y = 0 },
 
     pub fn identity(transform: VisualTransform) bool {
-        return transform.scale == fixed_one;
+        return transform.scale == fixed_one and transform.translation.x == 0 and transform.translation.y == 0;
     }
 
     /// Maps one logical edge; every edge uses the same rounding so adjacent
@@ -269,19 +270,19 @@ pub const VisualTransform = struct {
 
     pub fn mapPoint(transform: VisualTransform, point: Point) !Point {
         return .{
-            .x = std.math.cast(i32, transform.mapCoordinate(point.x, transform.anchor.x)) orelse
+            .x = std.math.cast(i32, transform.mapCoordinate(point.x, transform.anchor.x) + transform.translation.x) orelse
                 return error.InvalidDestination,
-            .y = std.math.cast(i32, transform.mapCoordinate(point.y, transform.anchor.y)) orelse
+            .y = std.math.cast(i32, transform.mapCoordinate(point.y, transform.anchor.y) + transform.translation.y) orelse
                 return error.InvalidDestination,
         };
     }
 
     /// Maps a logical rectangle. A rectangle never collapses below one pixel.
     pub fn mapRect(transform: VisualTransform, rect: Rect) !Rect {
-        const left = transform.mapCoordinate(rect.x, transform.anchor.x);
-        const top = transform.mapCoordinate(rect.y, transform.anchor.y);
-        const right = transform.mapCoordinate(@as(i64, rect.x) + rect.width, transform.anchor.x);
-        const bottom = transform.mapCoordinate(@as(i64, rect.y) + rect.height, transform.anchor.y);
+        const left = transform.mapCoordinate(rect.x, transform.anchor.x) + transform.translation.x;
+        const top = transform.mapCoordinate(rect.y, transform.anchor.y) + transform.translation.y;
+        const right = transform.mapCoordinate(@as(i64, rect.x) + rect.width, transform.anchor.x) + transform.translation.x;
+        const bottom = transform.mapCoordinate(@as(i64, rect.y) + rect.height, transform.anchor.y) + transform.translation.y;
         return .{
             .x = std.math.cast(i32, left) orelse return error.InvalidDestination,
             .y = std.math.cast(i32, top) orelse return error.InvalidDestination,
@@ -299,8 +300,8 @@ pub const VisualTransform = struct {
 
     pub fn unmapPoint(transform: VisualTransform, point: Point) ?Point {
         return .{
-            .x = std.math.cast(i32, transform.unmapCoordinate(point.x, transform.anchor.x)) orelse return null,
-            .y = std.math.cast(i32, transform.unmapCoordinate(point.y, transform.anchor.y)) orelse return null,
+            .x = std.math.cast(i32, transform.unmapCoordinate(@as(i64, point.x) - transform.translation.x, transform.anchor.x)) orelse return null,
+            .y = std.math.cast(i32, transform.unmapCoordinate(@as(i64, point.y) - transform.translation.y, transform.anchor.y)) orelse return null,
         };
     }
 };

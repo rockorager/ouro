@@ -678,6 +678,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 window: Desktop.SceneWindow,
                 point: geometry.Point,
             ) ?geometry.Point {
+                if (scene.coordinator.peripheralOutput(window)) |physical| {
+                    const bounds = scene.coordinator.outputBoundsFor(physical) catch return null;
+                    if (!bounds.contains(point)) return null;
+                }
                 const visual = scene.coordinator.windowVisual(window) orelse return point;
                 return peripheral.logicalPoint(visual, window.geometry, point);
             }
@@ -4190,7 +4194,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (!attachment.initially_mapped) {
                 initial.x = pointer.x -| attachment.x_offset;
                 initial.y = pointer.y -| attachment.y_offset;
-                try self.desktop.updateInteractive(toplevel, initial);
+                try self.desktop.updateInteractive(toplevel, initial, pointer);
             }
             self.toplevel_drag_move = .{
                 .toplevel = toplevel,
@@ -7189,14 +7193,19 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn boundLayerOutput(self: *Self, layer: *const Layer) ?OutputAdapter.OutputId {
-            return self.layerShellOutput(layer) orelse self.sessionLockOutput(layer);
+            if (self.layerShellOutput(layer) orelse self.sessionLockOutput(layer)) |output| return output;
+            if (!self.desktop.policy.peripheral.enabled) return null;
+            const scene = self.surfaceScene(layer.id orelse return null) orelse return null;
+            const physical = self.peripheralOutput(scene.root) orelse return null;
+            return physical.protocol_output;
         }
 
         fn surfaceStateTouchesOutput(
             state: damage.SurfaceState,
             bounds: geometry.Rect,
         ) bool {
-            return (clipToOutput(state.destination, bounds) catch return true) != null;
+            const destination = if (state.visual) |visual| visual.mapRect(state.destination) catch return true else state.destination;
+            return (clipToOutput(destination, bounds) catch return true) != null;
         }
 
         fn requestLayerOutputDamage(
@@ -9036,8 +9045,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 // client without waiting for it to submit another buffer.
                 // Per-output sampling excludes offscreen destinations; damage
                 // state still requires a nonempty clip for coordinate scaling.
-                sample.clip = clipToOutput(sample.destination, output_bounds) catch unreachable orelse sample.destination;
-                if (!std.meta.eql(sample.destination, layer.sample.?.destination))
+                sample.clip = if (sample.visual != null) sample.destination else clipToOutput(sample.destination, output_bounds) catch unreachable orelse sample.destination;
+                if (!std.meta.eql(sample.destination, layer.sample.?.destination) or !std.meta.eql(sample.visual, layer.sample.?.visual))
                     self.output_associations_dirty = true;
                 const previous = layer.change.?.current;
                 layer.sample = sample;
@@ -9513,7 +9522,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .upload_damage = upload_damage,
                 .crop = crop,
                 .destination = destination,
-                .clip = visible_clip,
+                .clip = if (surface_scene != null and self.windowVisual(surface_scene.?.root) != null) destination else visible_clip,
                 .scale_origin = if (surface_scene) |scene| surfaceScaleOrigin(self, scene, content_origin) else null,
                 .visual = if (surface_scene) |scene| self.windowVisual(scene.root) else null,
                 .transform = inverseSurfaceTransform(content.surface.transform),
@@ -9693,6 +9702,7 @@ pub fn Coordinator(comptime protocol: type) type {
             sample.clip = visible_clip;
             sample.scale_origin = if (surface_scene) |scene| surfaceScaleOrigin(self, scene, content_origin) else null;
             sample.visual = if (surface_scene) |scene| self.windowVisual(scene.root) else null;
+            if (sample.visual != null) sample.clip = destination;
             sample.transform = inverseSurfaceTransform(content.surface.transform);
             sample.color_description = content.surface.color_description;
             sample.color_representation = content.surface.color_representation;
@@ -10784,7 +10794,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 const layer = self.findAppLayer(surface) orelse continue;
                 if (!layer.active) continue;
                 if (!try self.refreshSubsurfaceLayer(layer)) continue;
-                if (try clipToOutput(layer.sample.?.destination, output_bounds) == null) continue;
+                if (self.boundLayerOutput(layer)) |bound| if (!std.meta.eql(bound, physical.protocol_output)) continue;
+                const sample = layer.sample.?;
+                const destination = if (sample.visual) |visual| try visual.mapRect(sample.destination) else sample.destination;
+                if (try clipToOutput(destination, output_bounds) == null) continue;
                 try self.ensureFrameStorage(count.* + 1);
                 const head_state = try self.output_management_adapter.lifecycle.currentHead(
                     physical.management_head,
@@ -10834,12 +10847,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 sample.visual = self.windowVisual(scene.root);
                 layer.window_geometry = scene.root.geometry;
             }
-            sample.clip = try clipToOutput(sample.destination, output_bounds) orelse return false;
+            sample.clip = if (sample.visual != null) sample.destination else try clipToOutput(sample.destination, output_bounds) orelse return false;
             if (std.meta.eql(sample.destination, layer.sample.?.destination) and
                 std.meta.eql(sample.scale_origin, layer.sample.?.scale_origin) and
                 std.meta.eql(sample.visual, layer.sample.?.visual) and
                 std.meta.eql(sample.clip, layer.sample.?.clip)) return true;
-            if (!std.meta.eql(sample.destination, layer.sample.?.destination))
+            if (!std.meta.eql(sample.destination, layer.sample.?.destination) or !std.meta.eql(sample.visual, layer.sample.?.visual))
                 self.output_associations_dirty = true;
             const natural_size = layer.change.?.current.?.surface_size;
             const previous = layer.change.?.current;
@@ -12347,8 +12360,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 // shrink here so the client keeps receiving logical
                 // coordinates while dragging inside a drawn-smaller window.
                 // The mapping is linear, so 1/256 fixed units unmap directly.
-                .x = visual.unmapCoordinate(global.x, @as(i64, visual.anchor.x) * 256),
-                .y = visual.unmapCoordinate(global.y, @as(i64, visual.anchor.y) * 256),
+                .x = visual.unmapCoordinate(global.x - @as(i64, visual.translation.x) * 256, @as(i64, visual.anchor.x) * 256),
+                .y = visual.unmapCoordinate(global.y - @as(i64, visual.translation.y) * 256, @as(i64, visual.anchor.y) * 256),
             } else global;
             const point = fixedPointForScene(scene, logical) orelse return null;
             return .{ .x = point.x, .y = point.y };
@@ -12361,8 +12374,23 @@ pub fn Coordinator(comptime protocol: type) type {
             const settings = self.desktop.policy.peripheral;
             if (!settings.enabled or !window.managed) return null;
             const toplevel = self.desktop.scene(window.id) catch return null;
+            // The center is a real tiled work area: even a narrow tile at its
+            // edge must fill its configured rectangle, not shrink a second time.
+            if (toplevel.mode == .tiled and self.desktop.policy.tileRegion(window.id) == .center) return null;
+            if (self.peripheralOutput(toplevel)) |physical| {
+                const bounds = self.outputBoundsFor(physical) catch return null;
+                return peripheral.boundedTransform(settings, toplevel.geometry, bounds);
+            }
             const bounds = self.peripheralBounds(toplevel.geometry) orelse return null;
             return peripheral.transform(settings, toplevel.geometry, bounds);
+        }
+
+        fn peripheralOutput(self: *Self, window: Desktop.SceneWindow) ?*const PhysicalOutput {
+            if (!self.desktop.policy.peripheral.enabled or !window.managed) return null;
+            const state = self.desktop.policy.windowState(window.id) catch return null;
+            if (state.mode != .floating or state.floating_pointer == null or state.fullscreen or state.maximized) return null;
+            const output = self.workspaceOutputForDesktopId(state.output orelse return null) orelse return null;
+            return self.physicalOutputForWorkspaceId(output);
         }
 
         /// The output whose logical area contains the window center, or the

@@ -77,8 +77,8 @@ pub const General = struct {
     focus_follows_mouse: bool = false,
     inner_gap: u32 = 12,
     outer_gap: u32 = 12,
-    /// Render windows smaller toward the left and right output edges. Clients
-    /// are never told; only presentation and input mapping change.
+    /// Reserve center and side tiling bands; shrink side tiles and floating
+    /// windows near output edges through presentation and input mapping.
     peripheral_shrink: bool = false,
     /// Width of the full-size central band, in percent of the output width.
     peripheral_center_percent: u32 = 50,

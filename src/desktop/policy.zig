@@ -37,6 +37,9 @@ pub fn Policy(
             output: ?OutputId = null,
             workspace: u8 = 1,
             floating: geometry.Rect = undefined,
+            // Retain the last drag point after release: an overlapping logical
+            // rectangle must not undo the cursor-selected output on the next reflow.
+            floating_pointer: ?geometry.Point = null,
             fullscreen: bool = false,
             maximized: bool = false,
             minimized: bool = false,
@@ -53,7 +56,7 @@ pub fn Policy(
         };
 
         const RequestedState = enum { fullscreen, maximized, minimized };
-        const LayoutOutput = struct { output: OutputId, workspace: u8 };
+        const LayoutOutput = struct { output: OutputId, workspace: u8, region: peripheral.Region = .center };
         const Tiling = layout.Tree(ToplevelId, LayoutOutput);
         const OutputWorkspace = struct {
             output: OutputId,
@@ -361,17 +364,20 @@ pub fn Policy(
                 switch (kind) {
                     .move => {
                         _ = try policy.setFloating(id, true);
-                        _ = try policy.setFloatingGeometry(id, current_geometry);
+                        _ = try policy.setFloatingGeometry(id, current_geometry, null);
                     },
                     .resize => |edge| {
                         if (policy.tiling.beginResize(id, edge)) |resize| {
                             policy.tiled_resize = resize;
                         } else {
                             _ = try policy.setFloating(id, true);
-                            _ = try policy.setFloatingGeometry(id, current_geometry);
+                            _ = try policy.setFloatingGeometry(id, current_geometry, null);
                         }
                     },
-                    .reorder => {},
+                    .reorder => if (policy.peripheral.enabled) {
+                        _ = try policy.setFloating(id, true);
+                        _ = try policy.setFloatingGeometry(id, current_geometry, null);
+                    },
                 }
             } else if (kind == .reorder) return false;
             _ = try policy.setResizing(id, kind == .resize);
@@ -404,12 +410,16 @@ pub fn Policy(
             }
             const index = output_index orelse return null;
             const output = view.output(index);
-            const destination = LayoutOutput{ .output = output.id, .workspace = policy.activeWorkspace(output.id) };
+            const regions = peripheral.tileRegions(policy.peripheral, output.geometry, policy.inner_gap, policy.outer_gap);
+            const region: peripheral.Region = if (regions) |bands| bands.at(point) else .center;
+            const area = if (regions) |bands| bands.areas[@intFromEnum(region)] else output.geometry;
+            const destination = LayoutOutput{ .output = output.id, .workspace = policy.activeWorkspace(output.id), .region = region };
             const source = policy.layoutOutput(state.*);
             const same_workspace = std.meta.eql(source, destination);
 
             // The outer horizontal strips are explicit output-root insertion.
-            if (point.x < output.geometry.x + 32 or point.x >= output.geometry.x + output.geometry.width - 32) {
+            // Peripheral bands are already independent roots, not half-output splits.
+            if (regions == null and (point.x < output.geometry.x + 32 or point.x >= output.geometry.x + output.geometry.width - 32)) {
                 const direction: layout.Direction = if (point.x < output.geometry.x + 32) .left else .right;
                 return .{ .destination = destination, .same_workspace = same_workspace, .direction = direction, .rect = output.geometry };
             }
@@ -426,8 +436,8 @@ pub fn Policy(
                     continue;
                 }
                 const candidate = policy.resolveConst(window.id) catch continue;
-                if (!policy.layoutEligible(candidate.*) or candidate.output == null or
-                    !std.meta.eql(candidate.output.?, output.id)) continue;
+                if (!policy.layoutEligible(candidate.*) or
+                    !std.meta.eql(policy.layoutOutput(candidate.*), destination)) continue;
                 const rect = window.current_geometry;
                 if (point.x < rect.x or point.x >= rect.x + rect.width or point.y < rect.y or point.y >= rect.y + rect.height) continue;
                 const stacking = for (policy.tiles[0..policy.tile_len], 0..) |tile, order| {
@@ -441,7 +451,7 @@ pub fn Policy(
             }
             const target_id = drop_target orelse {
                 if (same_workspace) return null;
-                return .{ .destination = destination, .same_workspace = false, .direction = null, .rect = output.geometry };
+                return .{ .destination = destination, .same_workspace = false, .direction = null, .rect = area };
             };
             const nx = @as(f64, @floatFromInt(point.x - target_rect.x)) / @as(f64, @floatFromInt(target_rect.width)) * 2.0 - 1.0;
             const ny = @as(f64, @floatFromInt(point.y - target_rect.y)) / @as(f64, @floatFromInt(target_rect.height)) * 2.0 - 1.0;
@@ -459,19 +469,20 @@ pub fn Policy(
 
         pub fn reorderPreview(policy: *const Self, id: ToplevelId, point: geometry.Point, view: anytype) !?geometry.Rect {
             const drop = try policy.reorderTarget(id, point, view) orelse return null;
+            var occupied = drop.window != null;
             if (drop.window == null) {
                 var windows = view.windows();
-                const occupied = while (windows.next()) |window| {
+                occupied = while (windows.next()) |window| {
                     if (std.meta.eql(window.id, id)) continue;
                     const state = policy.resolveConst(window.id) catch continue;
                     if (policy.layoutEligible(state.*) and std.meta.eql(policy.layoutOutput(state.*), drop.destination)) break true;
                 } else false;
                 // There is nothing to split on an empty output, nor anything
                 // to reorder when the source is its only tile.
-                if (!occupied) return if (drop.same_workspace) null else drop.rect;
+                if (!occupied and drop.same_workspace) return null;
             }
             var rect = drop.rect;
-            if (drop.direction) |direction| switch (direction) {
+            if (occupied) if (drop.direction) |direction| switch (direction) {
                 .left => rect.width = @divTrunc(rect.width, 2),
                 .right => {
                     const half = @divTrunc(rect.width, 2);
@@ -485,6 +496,11 @@ pub fn Policy(
                     rect.height -= half;
                 },
             };
+            if (drop.destination.region != .center) {
+                const output = view.outputFor(drop.destination.output, rect);
+                if (peripheral.transform(policy.peripheral, rect, output.bounds orelse output.geometry)) |visual|
+                    return peripheral.renderedRect(visual, rect);
+            }
             return if (rect.width > 0 and rect.height > 0) rect else null;
         }
 
@@ -511,7 +527,29 @@ pub fn Policy(
             return changed;
         }
 
-        pub fn updateInteractive(policy: *Self, id: ToplevelId, rect: geometry.Rect) !bool {
+        /// Peripheral moves are free drags; only a release in the center
+        /// returns the window to tiling. Cancellation never calls this path.
+        pub fn finishMove(policy: *Self, id: ToplevelId, point: geometry.Point, view: anytype) !bool {
+            const state = try policy.resolve(id);
+            if (!policy.peripheral.enabled or state.mode != .floating or
+                !policy.isVisible(state.*) or state.fullscreen or state.maximized) return false;
+            for (0..view.outputCount()) |index| {
+                const output = view.output(index);
+                if (!output.geometry.contains(point)) continue;
+                const regions = peripheral.tileRegions(policy.peripheral, output.geometry, policy.inner_gap, policy.outer_gap) orelse return false;
+                if (regions.at(point) != .center) return false;
+                try policy.validateLayout(policy.layoutCount() + 1, view);
+                if (!std.meta.eql(state.output, @as(?OutputId, output.id)) or state.workspace != policy.activeWorkspace(output.id)) {
+                    state.output = output.id;
+                    state.workspace = policy.activeWorkspace(output.id);
+                    policy.workspace_revision +%= 1;
+                }
+                return policy.setFloating(id, false);
+            }
+            return false;
+        }
+
+        pub fn updateInteractive(policy: *Self, id: ToplevelId, rect: geometry.Rect, pointer: ?geometry.Point) !bool {
             const state = try policy.resolve(id);
             if (!policy.isVisible(state.*) or state.fullscreen or state.maximized) return false;
             if (policy.tiled_resize) |resize| {
@@ -521,7 +559,7 @@ pub fn Policy(
             // A keyboard action can retile the subject while its button is
             // still held. Do not turn the next motion into NotFloating.
             if (state.mode != .floating) return false;
-            return policy.setFloatingGeometry(id, rect);
+            return policy.setFloatingGeometry(id, rect, if (policy.peripheral.enabled and !state.resizing) pointer else null);
         }
 
         pub fn updateToplevelDrag(
@@ -538,12 +576,12 @@ pub fn Policy(
             const max_y = @as(i64, work_area.y) + work_area.height - 1;
             const x = std.math.clamp(@as(i64, initial.x) + current.x - start.x, min_x, max_x);
             const y = std.math.clamp(@as(i64, initial.y) + current.y - start.y, min_y, max_y);
-            return policy.setFloatingGeometry(id, .{
+            return policy.updateInteractive(id, .{
                 .x = std.math.cast(i32, x) orelse return error.InvalidGeometry,
                 .y = std.math.cast(i32, y) orelse return error.InvalidGeometry,
                 .width = initial.width,
                 .height = initial.height,
-            });
+            }, current);
         }
 
         pub fn endInteractive(policy: *Self, id: ToplevelId) !bool {
@@ -680,6 +718,7 @@ pub fn Policy(
                 state.floating.x = std.math.cast(i32, x) orelse return error.InvalidGeometry;
                 state.floating.y = std.math.cast(i32, y) orelse return error.InvalidGeometry;
             }
+            state.floating_pointer = null;
             state.output = destination.id;
             state.workspace = policy.activeWorkspace(destination.id);
             if (state.committed) policy.workspace_revision +%= 1;
@@ -734,6 +773,7 @@ pub fn Policy(
             policy.clearTiledResize(id);
             if (state.committed) policy.tiling.remove(id);
             state.mode = mode;
+            state.floating_pointer = null;
             if (floating) {
                 policy.removeTile(id);
             } else {
@@ -743,12 +783,13 @@ pub fn Policy(
             return true;
         }
 
-        pub fn setFloatingGeometry(policy: *Self, id: ToplevelId, rect: geometry.Rect) !bool {
+        pub fn setFloatingGeometry(policy: *Self, id: ToplevelId, rect: geometry.Rect, pointer: ?geometry.Point) !bool {
             const state = try policy.resolve(id);
             if (state.mode != .floating) return error.NotFloating;
-            if (std.meta.eql(state.floating, rect)) return false;
+            const changed = !std.meta.eql(state.floating, rect) or !std.meta.eql(state.floating_pointer, pointer);
+            state.floating_pointer = pointer;
             state.floating = rect;
-            return true;
+            return changed;
         }
 
         pub fn setState(
@@ -773,6 +814,7 @@ pub fn Policy(
                         const workspace_changed = !std.meta.eql(state.output, destination) or
                             state.workspace != policy.activeWorkspace(destination);
                         state.output = destination;
+                        state.floating_pointer = null;
                         state.workspace = policy.activeWorkspace(destination);
                         if (state.committed and workspace_changed) policy.workspace_revision +%= 1;
                         if (state.mode == .tiled and state.committed)
@@ -827,15 +869,28 @@ pub fn Policy(
             var placement_len: usize = 0;
             for (0..view.outputCount()) |area_index| {
                 const output = view.output(area_index);
-                const plans = try policy.tiling.arrange(
-                    .{ .output = output.id, .workspace = policy.activeWorkspace(output.id) },
-                    output.geometry,
-                    policy.inner_gap,
-                    policy.outer_gap,
-                    Eligibility{ .policy = policy },
-                    policy.placements[placement_len..],
-                );
-                placement_len += plans.len;
+                const regions = peripheral.tileRegions(policy.peripheral, output.geometry, policy.inner_gap, policy.outer_gap);
+                if (regions == null) {
+                    // Turning peripheral mode off (or shrinking an output too
+                    // far for three bands) returns every workspace to one tree.
+                    for (policy.states) |state| {
+                        if (!state.active or !state.committed or state.mode != .tiled or
+                            !std.meta.eql(state.output, @as(?OutputId, output.id))) continue;
+                        policy.tiling.moveToOutput(state.id, .{ .output = output.id, .workspace = state.workspace }, null);
+                    }
+                }
+                const areas = if (regions) |bands| bands.areas else [3]geometry.Rect{ output.geometry, output.geometry, output.geometry };
+                for (areas[0..if (regions != null) @as(usize, 3) else 1], 0..) |area, region| {
+                    const plans = try policy.tiling.arrange(
+                        .{ .output = output.id, .workspace = policy.activeWorkspace(output.id), .region = @enumFromInt(region) },
+                        area,
+                        policy.inner_gap,
+                        if (regions != null) 0 else policy.outer_gap,
+                        Eligibility{ .policy = policy },
+                        policy.placements[placement_len..],
+                    );
+                    placement_len += plans.len;
+                }
             }
 
             for (policy.placements[0..placement_len]) |placement| {
@@ -877,7 +932,15 @@ pub fn Policy(
                     state_value.output = output.id;
                     break :rect if (state_value.fullscreen) output.bounds orelse output.geometry else output.geometry;
                 } else rect: {
-                    const output = view.output(view.outputIndexForRect(state_value.floating));
+                    const output = if (policy.peripheral.enabled and state_value.floating_pointer != null) selected: {
+                        for (0..view.outputCount()) |index| {
+                            const candidate = view.output(index);
+                            if ((candidate.bounds orelse candidate.geometry).contains(state_value.floating_pointer.?))
+                                break :selected candidate;
+                        }
+                        // A pointer in a gap between outputs keeps its owner.
+                        break :selected view.outputFor(state_value.output, state_value.floating);
+                    } else view.output(view.outputIndexForRect(state_value.floating));
                     if (state_value.output == null or !std.meta.eql(state_value.output.?, output.id)) {
                         state_value.workspace = policy.activeWorkspace(output.id);
                         policy.workspace_revision +%= 1;
@@ -962,8 +1025,12 @@ pub fn Policy(
                 state_value.output != null and state_value.workspace == policy.activeWorkspace(state_value.output.?);
         }
 
-        fn layoutOutput(_: *const Self, state_value: State) LayoutOutput {
-            return .{ .output = state_value.output.?, .workspace = state_value.workspace };
+        pub fn tileRegion(policy: *const Self, id: ToplevelId) peripheral.Region {
+            return if (policy.tiling.outputFor(id)) |output| output.region else .center;
+        }
+
+        fn layoutOutput(policy: *const Self, state_value: State) LayoutOutput {
+            return .{ .output = state_value.output.?, .workspace = state_value.workspace, .region = policy.tileRegion(state_value.id) };
         }
 
         fn activeWorkspace(policy: *const Self, output: OutputId) u8 {
@@ -1043,6 +1110,7 @@ pub fn Policy(
                 }
                 if (state.committed) policy.workspace_revision +%= 1;
                 state.output = primary.id;
+                state.floating_pointer = null;
                 if (state.mode == .tiled and state.committed)
                     policy.tiling.moveToOutput(state.id, policy.layoutOutput(state.*), policy.focusedToplevel());
             }

@@ -718,7 +718,7 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
                 else => {},
             };
             if (interactive_rect) |rect|
-                try desktop.updateInteractive(self.mode.interactive.target.toplevel, rect);
+                try desktop.updateInteractive(self.mode.interactive.target.toplevel, rect, point);
             if (focus_candidate and try desktop.requestFocus(target.?.toplevel, .pointer_motion)) {
                 self.keyboard_focus = keyboard_target.?;
                 self.enqueue(.{ .keyboard_focus = keyboard_target.? });
@@ -758,6 +758,8 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
                     const operation = self.mode.interactive;
                     if (self.reorderSource()) |source|
                         try desktop.finishReorder(source, self.pointerPosition());
+                    if (operation.kind == .move)
+                        try desktop.finishMove(operation.target.toplevel, self.pointerPosition());
                     try desktop.endInteractive(operation.target.toplevel);
                     self.mode = .default;
                     self.resize_handle = null;
@@ -786,7 +788,7 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
                     if (try desktop.beginInteractive(.{ .id = value.toplevel, .kind = kind })) |initial| {
                         self.mode = .{ .interactive = .{
                             .target = value,
-                            .kind = kind,
+                            .kind = initial.kind,
                             .start_x_fixed = self.x_fixed,
                             .start_y_fixed = self.y_fixed,
                             .geometry = initial,
@@ -1248,6 +1250,7 @@ const TestDesktop = struct {
     pub const ResizeHandle = struct { id: TestId, edge: @FieldType(InteractiveKind, "resize"), tiled: bool };
     pub const InteractiveRequest = struct { id: TestId, kind: InteractiveKind };
     pub const InteractiveGeometry = struct {
+        kind: InteractiveKind = .move,
         rect: geometry.Rect,
         min_width: i32,
         min_height: i32,
@@ -1291,6 +1294,8 @@ const TestDesktop = struct {
     pub fn finishReorder(self: *@This(), _: TestId, point: geometry.Point) !void {
         self.reorder_point = point;
     }
+
+    pub fn finishMove(_: *@This(), _: TestId, _: geometry.Point) !void {}
 
     pub fn sceneSnapshot(self: *const @This(), output: []SceneWindow) ![]SceneWindow {
         if (output.len < self.len) return error.Exhausted;
@@ -1360,6 +1365,7 @@ const TestDesktop = struct {
         for (self.windows[0..self.len]) |window| if (std.meta.eql(window.id, request.id)) {
             self.resizing = request.kind == .resize;
             return .{
+                .kind = request.kind,
                 .rect = window.geometry,
                 .min_width = 5,
                 .min_height = 4,
@@ -1370,7 +1376,7 @@ const TestDesktop = struct {
         return error.StaleToplevel;
     }
 
-    pub fn updateInteractive(self: *@This(), _: TestId, rect: geometry.Rect) !void {
+    pub fn updateInteractive(self: *@This(), _: TestId, rect: geometry.Rect, _: ?geometry.Point) !void {
         self.interactive_rect = rect;
     }
 
