@@ -3525,16 +3525,15 @@ test "shell-input: last window removal clears every reused scanout image" {
     }
 }
 
-test "shell-input: peripheral tiled drag floats at retained size, shrinks and snaps back" {
+test "shell-input: peripheral side tiles draw in a grid, take input, swap, and hand off" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-peripheral-{d}.sock", .{linux.getpid()});
     wayring.unix_socket.unlink(path) catch {};
     defer wayring.unix_socket.unlink(path) catch {};
 
-    // A 64x16 output with a 16px central band. Both windows start tiled in
-    // the center; Super-drag detaches the first. Its client keeps a 16x16
-    // buffer, drawn smaller by exponential decay, while the other fills center.
+    // A 64x16 output with a 16px central band. Both clients keep a 16x16
+    // buffer: one holds the center, the other is drawn in a side grid.
     const window_pixels = [_]u8{ 0x10, 0x80, 0xc0, 0xff } ** (16 * 16);
     var fixture = try physical_fixture.Fixture.init();
     defer fixture.deinit();
@@ -3616,6 +3615,174 @@ test "shell-input: peripheral tiled drag floats at retained size, shrinks and sn
         .device = device,
         .info = .{ .capabilities = .{ .pointer = true, .keyboard = true } },
     } }));
+
+    // Center band {24,0,16,16}; sides {0,0,24,16} and {40,0,24,16}. One
+    // window holds the center and the other keeps the same logical
+    // rectangle while its 16x16 image is centered in the left band at x=4.
+    const center_rect = ouro.scene_geometry.Rect{ .x = 24, .y = 0, .width = 16, .height = 16 };
+    const side_index: usize = if (coordinator.desktop.policy.tileRegion(windows[0].id) == .center) 1 else 0;
+    var side = windows[side_index];
+    var center = windows[1 - side_index];
+    try std.testing.expectEqual(ouro.scene_peripheral.Region.left, coordinator.desktop.policy.tileRegion(side.id));
+    try std.testing.expectEqual(ouro.scene_peripheral.Region.center, coordinator.desktop.policy.tileRegion(center.id));
+    for (windows) |window| {
+        try std.testing.expectEqual(center_rect, (try coordinator.desktop.scene(window.id)).geometry);
+        try std.testing.expect((try coordinator.desktop.scene(window.id)).mode == .tiled);
+    }
+    try std.testing.expect(coordinator.desktop.policy.tileVisual(center.id) == null);
+    try std.testing.expectEqual(
+        ouro.scene_geometry.Rect{ .x = 4, .y = 0, .width = 16, .height = 16 },
+        ouro.scene_peripheral.renderedRect(coordinator.desktop.policy.tileVisual(side.id).?, center_rect).?,
+    );
+
+    const Frame = struct {
+        fn expect(image: []const u8, window: []const u8, spans: []const [2]usize) !void {
+            for (0..16) |y| for (0..64) |x| {
+                var drawn = false;
+                for (spans) |span| drawn = drawn or (x >= span[0] and x < span[1]);
+                const expected: []const u8 = if (drawn) window[0..4] else &.{ 0, 0, 0, 0xff };
+                std.testing.expectEqualSlices(u8, expected, image[y * 256 + x * 4 ..][0..4]) catch |err| {
+                    std.debug.print("pixel mismatch at x={d} y={d}\n", .{ x, y });
+                    return err;
+                };
+            };
+        }
+    };
+    const Settle = struct {
+        fn frame(c: *Coordinator, f: *physical_fixture.Fixture, reactor: *wayring.io_uring.Reactor, d: *ClientDriver, h: *MultiHandler, r: *Compositor, l: *Loop, probe_x: usize, expected: []const u8) ![]const u8 {
+            var presented = c.stats.presented;
+            for (0..512) |_| {
+                _ = try drainMultiClient(reactor, d, h);
+                _ = try l.turn(c);
+                const output = c.primaryKmsOutput().?;
+                if (!c.desktop.transactionPending() and c.stats.presented > presented and output.kms_output.current != null) {
+                    presented = c.stats.presented;
+                    const image: []const u8 = &f.dumb_bytes[output.kms_output.current.?.slot];
+                    if (std.mem.eql(u8, expected, image[8 * 256 + probe_x * 4 ..][0..4])) return image;
+                    try output.request(.damage, 1);
+                }
+                if (r.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+                    try waitForEither(&r.ring, reactor.ring);
+            }
+            return error.FrameNotPresented;
+        }
+    };
+    {
+        const image = try Settle.frame(coordinator, &fixture, &client_reactor, &driver, &handler, root, &loop, 4, window_pixels[0..4]);
+        try Frame.expect(image, &window_pixels, &.{ .{ 4, 20 }, .{ 24, 40 } });
+        if (std.c.getenv("OURO_PERIPHERAL_CAPTURE")) |capture| {
+            const header = "P6\n64 16\n255\n";
+            var ppm: [header.len + 64 * 16 * 3]u8 = undefined;
+            @memcpy(ppm[0..header.len], header);
+            for (0..64 * 16) |pixel| {
+                ppm[header.len + pixel * 3] = image[pixel * 4 + 2];
+                ppm[header.len + pixel * 3 + 1] = image[pixel * 4 + 1];
+                ppm[header.len + pixel * 3 + 2] = image[pixel * 4];
+            }
+            try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(capture), .data = &ppm });
+        }
+    }
+
+    // Input over the drawn side window maps to the client's logical
+    // coordinates; the gaps around the images hit nothing.
+    for (0..128) |_| {
+        _ = try drainMultiClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.pointer != null) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(handler.pointer != null);
+    const Step = struct { point: ouro.scene_geometry.Point, surface: ?u32, local: ?struct { x: i32, y: i32 } };
+    const Pointer = struct {
+        fn run(c: *Coordinator, reactor: *wayring.io_uring.Reactor, d: *ClientDriver, h: *MultiHandler, r: *Compositor, l: *Loop, input_device: ouro.input_backend.DeviceId, steps: []const Step) !void {
+            for (steps, 0..) |step, index| {
+                const delta = c.interaction.motionToPoint(step.point);
+                try std.testing.expect(try c.acceptNormalizedInput(.{ .pointer_motion = .{
+                    .device = input_device,
+                    .time_usec = (index + 1) * 1_000,
+                    .dx = delta.dx,
+                    .dy = delta.dy,
+                } }));
+                const focus = c.seat_adapter.pointerState().focus;
+                if (step.surface) |surface| {
+                    try std.testing.expectEqual(surface, (try c.adapter.surfaceHandle(focus.?.surface)).id);
+                } else try std.testing.expect(focus == null);
+                for (0..128) |_| {
+                    _ = try drainMultiClient(reactor, d, h);
+                    _ = try l.turn(c);
+                    if (h.pointer_surface == step.surface and (step.local == null or
+                        std.meta.eql(h.pointer_position, .{ .x = step.local.?.x, .y = step.local.?.y }))) break;
+                    if (r.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+                        try waitForEither(&r.ring, reactor.ring);
+                }
+                try std.testing.expectEqual(step.surface, h.pointer_surface);
+                if (step.local) |local| {
+                    try std.testing.expectEqual(local.x, h.pointer_position.?.x);
+                    try std.testing.expectEqual(local.y, h.pointer_position.?.y);
+                }
+            }
+        }
+    };
+    var side_surface = (try coordinator.adapter.surfaceHandle(side.surface)).id;
+    var center_surface = (try coordinator.adapter.surfaceHandle(center.surface)).id;
+    try Pointer.run(coordinator, &client_reactor, &driver, &handler, root, &loop, device, &.{
+        .{ .point = .{ .x = 8, .y = 8 }, .surface = side_surface, .local = .{ .x = 4 * 256, .y = 8 * 256 } },
+        .{ .point = .{ .x = 2, .y = 8 }, .surface = null, .local = null },
+        .{ .point = .{ .x = 19, .y = 15 }, .surface = side_surface, .local = .{ .x = 15 * 256, .y = 15 * 256 } },
+        .{ .point = .{ .x = 22, .y = 8 }, .surface = null, .local = null },
+        .{ .point = .{ .x = 27, .y = 6 }, .surface = center_surface, .local = .{ .x = 3 * 256, .y = 6 * 256 } },
+    });
+
+    // Clicking the side window gives it keyboard focus.
+    const Click = struct {
+        fn at(c: *Coordinator, input_device: ouro.input_backend.DeviceId, point: ouro.scene_geometry.Point) !void {
+            const delta = c.interaction.motionToPoint(point);
+            try std.testing.expect(try c.acceptNormalizedInput(.{ .pointer_motion = .{
+                .device = input_device,
+                .time_usec = 10_000,
+                .dx = delta.dx,
+                .dy = delta.dy,
+            } }));
+            for ([_]bool{ true, false }, 0..) |pressed, index| {
+                try std.testing.expect(try c.acceptNormalizedInput(.{ .pointer_button = .{
+                    .device = input_device,
+                    .time_usec = 11_000 + index * 1_000,
+                    .button = 272,
+                    .pressed = pressed,
+                } }));
+            }
+        }
+    };
+    try Click.at(coordinator, device, .{ .x = 30, .y = 8 });
+    try std.testing.expectEqual(center.id, coordinator.desktop.focused().?);
+    try Click.at(coordinator, device, .{ .x = 8, .y = 8 });
+    try std.testing.expectEqual(side.id, coordinator.desktop.focused().?);
+    try std.testing.expectEqual(side.surface, coordinator.seat_adapter.keyboard_focus.?.surface);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+    // swap-center exchanges the focused side window with the center window.
+    // Neither client is reconfigured; only the drawn placement changes.
+    try coordinator.swapFocusedToCenter();
+    try std.testing.expectEqual(ouro.scene_peripheral.Region.center, coordinator.desktop.policy.tileRegion(side.id));
+    try std.testing.expectEqual(ouro.scene_peripheral.Region.left, coordinator.desktop.policy.tileRegion(center.id));
+    std.mem.swap(Coordinator.Desktop.SceneWindow, &side, &center);
+    std.mem.swap(u32, &side_surface, &center_surface);
+    for (0..64) |_| {
+        _ = try drainMultiClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!coordinator.desktop.transactionPending()) break;
+    }
+    try std.testing.expect(!coordinator.desktop.transactionPending());
+    try std.testing.expectEqual(@as(usize, 2), handler.frame_done);
+    try Pointer.run(coordinator, &client_reactor, &driver, &handler, root, &loop, device, &.{
+        .{ .point = .{ .x = 27, .y = 6 }, .surface = center_surface, .local = .{ .x = 3 * 256, .y = 6 * 256 } },
+        .{ .point = .{ .x = 8, .y = 8 }, .surface = side_surface, .local = .{ .x = 4 * 256, .y = 8 * 256 } },
+    });
+
+    // Super-drag the center window toward the right band. While held, the
+    // center stays open and the left window keeps its place; releasing parks
+    // the dragged window in the right band and promotes the left window.
     const Drag = struct {
         fn run(c: *Coordinator, input_device: ouro.input_backend.DeviceId, from: ouro.scene_geometry.Point, to: ouro.scene_geometry.Point) !void {
             var motion = c.interaction.motionToPoint(from);
@@ -3634,146 +3801,35 @@ test "shell-input: peripheral tiled drag floats at retained size, shrinks and sn
             try std.testing.expect(!c.interaction.compositorGrab());
         }
     };
-    try Drag.run(coordinator, device, .{ .x = 26, .y = 6 }, .{ .x = 2, .y = 6 });
-    for (0..512) |_| {
-        _ = try drainMultiClient(&client_reactor, &driver, &handler);
-        _ = try loop.turn(coordinator);
-        if (!coordinator.desktop.transactionPending() and (try coordinator.desktop.scene(windows[0].id)).geometry.x == 0) break;
-        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
-            try waitForEither(&root.ring, client_reactor.ring);
-    }
-    const left = try coordinator.desktop.scene(windows[0].id);
-    const right = try coordinator.desktop.scene(windows[1].id);
-    try std.testing.expectEqual(ouro.scene_geometry.Rect{ .x = 0, .y = 0, .width = 16, .height = 16 }, left.geometry);
-    try std.testing.expectEqual(ouro.scene_geometry.Rect{ .x = 24, .y = 0, .width = 16, .height = 16 }, right.geometry);
-    try std.testing.expect(left.mode == .floating and right.mode == .tiled);
-
-    // While still held, the left window occupies {5,5,6,6}; center is full-size.
-    // Check every pixel, including erased former tiles and the empty right band.
-    var presented = coordinator.stats.presented;
-    var shrunken_frame = false;
-    for (0..512) |_| {
-        _ = try drainMultiClient(&client_reactor, &driver, &handler);
-        _ = try loop.turn(coordinator);
-        const output = coordinator.primaryKmsOutput().?;
-        if (coordinator.stats.presented > presented and output.kms_output.current != null) {
-            presented = coordinator.stats.presented;
-            const image = fixture.dumb_bytes[output.kms_output.current.?.slot];
-            if (std.mem.eql(u8, &window_pixels[0..4].*, image[5 * 256 + 5 * 4 ..][0..4]) and
-                std.mem.eql(u8, &.{ 0, 0, 0, 0xff }, image[40 * 4 ..][0..4]))
-            {
-                shrunken_frame = true;
-                break;
-            }
-            try output.request(.damage, 1);
-        }
-        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
-            try waitForEither(&root.ring, client_reactor.ring);
-    }
-    try std.testing.expect(shrunken_frame);
-    {
-        const output = coordinator.primaryKmsOutput().?;
-        const image = fixture.dumb_bytes[output.kms_output.current.?.slot];
-        for (0..16) |y| for (0..64) |x| {
-            const in_left = x >= 5 and x < 11 and y >= 5 and y < 11;
-            const in_right = x >= 24 and x < 40;
-            const expected: []const u8 = if (in_left or in_right) window_pixels[0..4] else &.{ 0, 0, 0, 0xff };
-            std.testing.expectEqualSlices(u8, expected, image[y * 256 + x * 4 ..][0..4]) catch |err| {
-                std.debug.print("pixel mismatch at x={d} y={d}\n", .{ x, y });
-                return err;
-            };
-        };
-        // Optional capture of the actual Pixman scanout for visual review.
-        if (std.c.getenv("OURO_PERIPHERAL_CAPTURE")) |capture| {
-            const header = "P6\n64 16\n255\n";
-            var ppm: [header.len + 64 * 16 * 3]u8 = undefined;
-            @memcpy(ppm[0..header.len], header);
-            for (0..64 * 16) |pixel| {
-                ppm[header.len + pixel * 3] = image[pixel * 4 + 2];
-                ppm[header.len + pixel * 3 + 1] = image[pixel * 4 + 1];
-                ppm[header.len + pixel * 3 + 2] = image[pixel * 4];
-            }
-            try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(capture), .data = &ppm });
-        }
-    }
-
+    try Drag.run(coordinator, device, .{ .x = 30, .y = 8 }, .{ .x = 52, .y = 8 });
+    try std.testing.expect((try coordinator.desktop.policy.windowState(center.id)).mode == .floating);
+    try std.testing.expectEqual(ouro.scene_peripheral.Region.left, coordinator.desktop.policy.tileRegion(side.id));
+    try std.testing.expectEqual(
+        ouro.scene_geometry.Rect{ .x = 46, .y = 0, .width = 16, .height = 16 },
+        (try coordinator.desktop.policy.windowState(center.id)).floating,
+    );
     try Drag.release(coordinator, device);
-    try std.testing.expect((try coordinator.desktop.policy.windowState(left.id)).mode == .floating);
-
-    // Input over the drawn center maps to logical local (8,8), while the
-    // logical-but-undrawn pixel (1,1) misses it.
-    for (0..128) |_| {
-        _ = try drainMultiClient(&client_reactor, &driver, &handler);
-        _ = try loop.turn(coordinator);
-        if (handler.pointer != null) break;
-        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
-            try waitForEither(&root.ring, client_reactor.ring);
+    try std.testing.expectEqual(ouro.scene_peripheral.Region.right, coordinator.desktop.policy.tileRegion(center.id));
+    try std.testing.expectEqual(ouro.scene_peripheral.Region.center, coordinator.desktop.policy.tileRegion(side.id));
+    std.mem.swap(Coordinator.Desktop.SceneWindow, &side, &center);
+    std.mem.swap(u32, &side_surface, &center_surface);
+    for (windows) |window| try std.testing.expectEqual(center_rect, (try coordinator.desktop.scene(window.id)).geometry);
+    {
+        const image = try Settle.frame(coordinator, &fixture, &client_reactor, &driver, &handler, root, &loop, 4, &.{ 0, 0, 0, 0xff });
+        try Frame.expect(image, &window_pixels, &.{ .{ 24, 40 }, .{ 44, 60 } });
     }
-    try std.testing.expect(handler.pointer != null);
-    const left_surface = (try coordinator.adapter.surfaceHandle(left.surface)).id;
-    const right_surface = (try coordinator.adapter.surfaceHandle(right.surface)).id;
-
-    const Step = struct { point: ouro.scene_geometry.Point, surface: ?u32, local: ?struct { x: i32, y: i32 } };
-    const steps = [_]Step{
-        .{ .point = .{ .x = 8, .y = 8 }, .surface = left_surface, .local = .{ .x = 8 * 256, .y = 8 * 256 } },
-        .{ .point = .{ .x = 1, .y = 1 }, .surface = null, .local = null },
-        .{ .point = .{ .x = 10, .y = 10 }, .surface = left_surface, .local = .{ .x = 14 * 256, .y = 14 * 256 } },
-        .{ .point = .{ .x = 27, .y = 6 }, .surface = right_surface, .local = .{ .x = 3 * 256, .y = 6 * 256 } },
-    };
-    for (steps, 0..) |step, index| {
-        const delta = coordinator.interaction.motionToPoint(step.point);
-        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_motion = .{
-            .device = device,
-            .time_usec = (index + 1) * 1_000,
-            .dx = delta.dx,
-            .dy = delta.dy,
-        } }));
-        const focus = coordinator.seat_adapter.pointerState().focus;
-        if (step.surface) |surface| {
-            try std.testing.expectEqual(surface, (try coordinator.adapter.surfaceHandle(focus.?.surface)).id);
-        } else try std.testing.expect(focus == null);
-        for (0..128) |_| {
-            _ = try drainMultiClient(&client_reactor, &driver, &handler);
-            _ = try loop.turn(coordinator);
-            if (handler.pointer_surface == step.surface and (step.local == null or
-                std.meta.eql(handler.pointer_position, .{ .x = step.local.?.x, .y = step.local.?.y }))) break;
-            if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
-                try waitForEither(&root.ring, client_reactor.ring);
-        }
-        try std.testing.expectEqual(step.surface, handler.pointer_surface);
-        if (step.local) |local| {
-            try std.testing.expectEqual(local.x, handler.pointer_position.?.x);
-            try std.testing.expectEqual(local.y, handler.pointer_position.?.y);
-        }
-    }
-
-    // Clicking the shrunken window gives it keyboard focus.
-    try coordinator.focusNext();
-    try std.testing.expectEqual(windows[1].id, coordinator.desktop.focused().?);
-    const delta = coordinator.interaction.motionToPoint(.{ .x = 6, .y = 6 });
-    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_motion = .{
-        .device = device,
-        .time_usec = 10_000,
-        .dx = delta.dx,
-        .dy = delta.dy,
-    } }));
-    for ([_]bool{ true, false }, 0..) |pressed, index| {
-        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{
-            .device = device,
-            .time_usec = 11_000 + index * 1_000,
-            .button = 272,
-            .pressed = pressed,
-        } }));
-    }
-    try std.testing.expectEqual(windows[0].id, coordinator.desktop.focused().?);
-    try std.testing.expectEqual(left.surface, coordinator.seat_adapter.keyboard_focus.?.surface);
-    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+    try Pointer.run(coordinator, &client_reactor, &driver, &handler, root, &loop, device, &.{
+        .{ .point = .{ .x = 44, .y = 0 }, .surface = side_surface, .local = .{ .x = 0, .y = 0 } },
+        .{ .point = .{ .x = 42, .y = 8 }, .surface = null, .local = null },
+    });
+    const left = center;
 
     // The logical rectangle is entirely on the second output. Keep its drawn
     // minimum-sized image on the first until the pointer crosses x=64, then
     // cross back. Inspect both scanouts, including the erased prior image.
     try std.testing.expectEqual(@as(usize, 2), coordinator.physical_output_count);
     try coordinator.desktop.setFloating(left.id, true);
+    try std.testing.expectEqual(ouro.scene_peripheral.Region.center, coordinator.desktop.policy.tileRegion(side.id));
     _ = (try coordinator.desktop.beginInteractive(.{ .id = left.id, .kind = .move })).?;
     var handoff_pixels: [128 * 32 * 3]u8 = undefined;
     for ([_]i32{ 63, 64, 63 }, 0..) |pointer_x, step| {
@@ -3807,12 +3863,12 @@ test "shell-input: peripheral tiled drag floats at retained size, shrinks and sn
             const output = physical.kms_output.?;
             const image = output.pool.slots[output.kms_output.current.?.slot].dumb.?.bytes;
             for (0..16) |y| for (0..64) |x| {
-                const center = index == 0 and x >= 24 and x < 40;
+                const in_center = index == 0 and x >= 24 and x < 40;
                 const floating = if (pointer_x < 64)
                     index == 0 and x >= 60 and y >= 6 and y < 10
                 else
                     index == 1 and x >= 9 and x < 15 and y >= 5 and y < 11;
-                const expected: []const u8 = if (center or floating) window_pixels[0..4] else &.{ 0, 0, 0, 0xff };
+                const expected: []const u8 = if (in_center or floating) window_pixels[0..4] else &.{ 0, 0, 0, 0xff };
                 try std.testing.expectEqualSlices(u8, expected, image[y * 256 + x * 4 ..][0..4]);
                 if (step < 2) {
                     const pixel = ((step * 16 + y) * 128 + index * 64 + x) * 3;
@@ -3835,10 +3891,15 @@ test "shell-input: peripheral tiled drag floats at retained size, shrinks and sn
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
-    // Center splits horizontally beside the existing tile. This fixed-buffer
-    // client still reports 16x16, but its origin must snap to the right leaf.
-    try std.testing.expectEqual(ouro.scene_geometry.Rect{ .x = 32, .y = 0, .width = 16, .height = 16 }, (try coordinator.desktop.scene(left.id)).geometry);
+    // It takes the center; the previous center window moves to the left grid.
+    try std.testing.expectEqual(center_rect, (try coordinator.desktop.scene(left.id)).geometry);
     try std.testing.expect((try coordinator.desktop.scene(left.id)).mode == .tiled);
+    try std.testing.expectEqual(ouro.scene_peripheral.Region.center, coordinator.desktop.policy.tileRegion(left.id));
+    try std.testing.expectEqual(ouro.scene_peripheral.Region.left, coordinator.desktop.policy.tileRegion(side.id));
+    try std.testing.expectEqual(
+        ouro.scene_geometry.Rect{ .x = 4, .y = 0, .width = 16, .height = 16 },
+        ouro.scene_peripheral.renderedRect(coordinator.desktop.policy.tileVisual(side.id).?, center_rect).?,
+    );
     if (std.c.getenv("OURO_PERIPHERAL_CAPTURE")) |capture| {
         const header = "P6\n128 32\n255\n";
         var ppm: [header.len + handoff_pixels.len]u8 = undefined;

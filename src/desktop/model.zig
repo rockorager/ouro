@@ -8,6 +8,7 @@ const std = @import("std");
 const geometry = @import("../scene/geometry.zig");
 const desktop_layout = @import("layout.zig");
 const desktop_policy = @import("policy.zig");
+const peripheral = @import("../scene/peripheral.zig");
 pub const workspace = @import("workspace.zig");
 
 const none = std.math.maxInt(u32);
@@ -1093,6 +1094,13 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             try desktop.setFloating(id, (try desktop.policy.windowState(id)).mode != .floating);
         }
 
+        /// Peripheral mode: exchange the focused side window with the center
+        /// window, or tile a floating focused window into the center.
+        pub fn swapFocusedToCenter(desktop: *Self) !void {
+            try desktop.requireCommandCapacity(desktop.live);
+            if (try desktop.policy.swapFocusedToCenter(PolicyView{ .context = desktop })) try desktop.reflow();
+        }
+
         pub fn setFloating(desktop: *Self, id: ToplevelId, floating: bool) !void {
             _ = try desktop.resolveIndex(id);
             const mode: Mode = if (floating) .floating else .tiled;
@@ -2065,6 +2073,9 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                 PolicyTransaction{ .context = desktop, .tiled_resizing = tiled_resizing },
             );
             try (PolicyTransaction{ .context = desktop }).finish();
+            // Peripheral side tiles share the center's logical rectangle, so a
+            // grid change emits no configure; the scene still has to move.
+            if (desktop.policy.takeVisualChanged()) desktop.scene_changed = true;
 
             for (desktop.slots, 0..) |*slot, index| {
                 if (!slot.header.active or !slot.initial_committed) continue;
@@ -3089,6 +3100,10 @@ const KioskPolicyFactory = struct {
 
             pub fn initialGeometry(policy: *const Self, output: geometry.Rect) geometry.Rect {
                 return policy.base.initialGeometry(output);
+            }
+
+            pub fn takeVisualChanged(policy: *Self) bool {
+                return policy.base.takeVisualChanged();
             }
 
             pub fn arrange(policy: *Self, view: anytype, transaction: anytype) !void {
@@ -5206,73 +5221,205 @@ test "desktop: pointer drops swap centers and insert on all four sides without f
     }
 }
 
-test "desktop: peripheral tiles reserve the center and drag between bands with gaps" {
-    var desktop = try initTestDesktop(16);
-    defer desktop.deinit();
-    try desktop.setWorkArea(.{ .x = -200, .y = 40, .width = 1000, .height = 600 });
+const peripheral_center = geometry.Rect{ .x = 56, .y = 50, .width = 488, .height = 580 };
+
+fn initPeripheralDesktop() !TestDesktop {
+    var desktop = try TestDesktop.init(std.testing.allocator, .{
+        .toplevel_capacity = 4,
+        .command_capacity = 16,
+        .metadata_bytes = 16,
+    }, .{ .x = -200, .y = 40, .width = 1000, .height = 600 });
+    errdefer desktop.deinit();
     var settings: TestDesktop.PolicySnapshot = .{
         .inner_gap = 12,
         .outer_gap = 10,
         .peripheral = .{ .enabled = true },
     };
     try desktop.installPolicySnapshot(&settings);
+    return desktop;
+}
+
+fn spawnPeripheral(desktop: *TestDesktop, shell: *TestShell, index: u32) !TestDesktop.ToplevelId {
+    shell.push(created(index));
+    _ = try desktop.consume(shell, 1);
+    try settleDesktop(desktop, shell);
+    return desktop.idForShell(.{ .index = index, .generation = 1 });
+}
+
+/// Where a peripheral tile is drawn: its logical rectangle for the center,
+/// its grid cell placement for a side.
+fn drawnRect(desktop: *const TestDesktop, id: TestDesktop.ToplevelId) !geometry.Rect {
+    const rect = (try desktop.scene(id)).geometry;
+    try std.testing.expectEqual(TestDesktop.Mode.tiled, (try desktop.scene(id)).mode);
+    // Side tiles never change logical size, so no client is reconfigured by a swap.
+    try std.testing.expectEqual(peripheral_center, rect);
+    const visual = desktop.policy.tileVisual(id) orelse return rect;
+    return peripheral.renderedRect(visual, rect).?;
+}
+
+test "desktop: peripheral center holds one window and sides form aspect-preserving grids" {
+    var desktop = try initPeripheralDesktop();
+    defer desktop.deinit();
     var shell = TestShell{};
-    shell.push(created(0));
-    _ = try desktop.consume(&shell, 1);
-    try settleDesktop(&desktop, &shell);
-    const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
-    const center = geometry.Rect{ .x = 56, .y = 50, .width = 488, .height = 580 };
-    const left = geometry.Rect{ .x = -190, .y = 50, .width = 234, .height = 580 };
-    const right = geometry.Rect{ .x = 556, .y = 50, .width = 234, .height = 580 };
-    try std.testing.expectEqual(center, (try desktop.scene(first)).geometry);
+    const first = try spawnPeripheral(&desktop, &shell, 0);
+    try std.testing.expectEqual(peripheral_center, try drawnRect(&desktop, first));
+    try std.testing.expect(desktop.policy.tileVisual(first) == null);
 
-    shell.push(created(1));
-    _ = try desktop.consume(&shell, 1);
-    try settleDesktop(&desktop, &shell);
-    const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
-    const before = (try desktop.scene(first)).geometry;
-    // A preview must not mutate the tree or float the source.
-    try std.testing.expect((try desktop.reorderPreview(first, .{ .x = -150, .y = 300 })) != null);
-    try std.testing.expectEqual(before, (try desktop.scene(first)).geometry);
-    try desktop.finishReorder(first, .{ .x = -150, .y = 300 });
-    try settleDesktop(&desktop, &shell);
-    try std.testing.expectEqual(left, (try desktop.scene(first)).geometry);
-    try std.testing.expectEqual(center, (try desktop.scene(second)).geometry);
-    try std.testing.expectEqual(TestDesktop.Mode.tiled, (try desktop.policy.windowState(first)).mode);
+    // Each new window takes the center; the occupant goes to the emptier
+    // side, left on a tie.
+    const second = try spawnPeripheral(&desktop, &shell, 1);
+    try std.testing.expectEqual(peripheral_center, try drawnRect(&desktop, second));
+    try std.testing.expectEqual(peripheral.Region.left, desktop.policy.tileRegion(first));
+    const third = try spawnPeripheral(&desktop, &shell, 2);
+    try std.testing.expectEqual(peripheral.Region.right, desktop.policy.tileRegion(second));
+    const fourth = try spawnPeripheral(&desktop, &shell, 3);
+    try std.testing.expectEqual(peripheral.Region.left, desktop.policy.tileRegion(third));
+    try std.testing.expectEqual(peripheral_center, try drawnRect(&desktop, fourth));
 
-    // Empty the center, then bring a side tile back into its full reserved area.
-    try desktop.finishReorder(second, .{ .x = 700, .y = 300 });
-    try settleDesktop(&desktop, &shell);
-    try std.testing.expectEqual(right, (try desktop.scene(second)).geometry);
-    try std.testing.expectEqual(center, (try desktop.reorderPreview(first, .{ .x = 300, .y = 300 })).?);
-    try desktop.finishReorder(first, .{ .x = 300, .y = 300 });
-    try settleDesktop(&desktop, &shell);
-    try std.testing.expectEqual(center, (try desktop.scene(first)).geometry);
-    try std.testing.expectEqual(right, (try desktop.scene(second)).geometry);
+    // Left area {-190,50,234,580} holds two 488x580 windows: one column of
+    // 284-tall cells, scale 234/488, each drawn 234x278 and centered in its
+    // cell. The lone right window is centered vertically in its band.
+    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 53, .width = 234, .height = 278 }, try drawnRect(&desktop, first));
+    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 349, .width = 234, .height = 278 }, try drawnRect(&desktop, third));
+    try std.testing.expectEqual(geometry.Rect{ .x = 556, .y = 201, .width = 234, .height = 278 }, try drawnRect(&desktop, second));
 
-    // New windows go to the center even while a side tile has focus.
+    // Swapping exchanges the focused side window with the center window in
+    // place. No client is reconfigured, so the scene change must be reported
+    // from the visual placement alone.
     try desktop.focusToplevel(second);
-    shell.push(created(2));
-    _ = try desktop.consume(&shell, 1);
     try settleDesktop(&desktop, &shell);
-    const third = try desktop.idForShell(.{ .index = 2, .generation = 1 });
-    for ([_]TestDesktop.ToplevelId{ first, third }) |id| {
-        const rect = (try desktop.scene(id)).geometry;
-        try std.testing.expectEqual(center.x, rect.x);
-        try std.testing.expectEqual(center.width, rect.width);
-        try std.testing.expect(rect.y >= center.y and rect.y + rect.height <= center.y + center.height);
-    }
-    try std.testing.expectEqual(right, (try desktop.scene(second)).geometry);
+    _ = desktop.takeSceneChanged();
+    try desktop.swapFocusedToCenter();
+    try std.testing.expectEqual(@as(usize, 0), desktop.pendingCommands());
+    try std.testing.expect(desktop.takeSceneChanged());
+    try std.testing.expectEqual(peripheral_center, try drawnRect(&desktop, second));
+    try std.testing.expectEqual(geometry.Rect{ .x = 556, .y = 201, .width = 234, .height = 278 }, try drawnRect(&desktop, fourth));
+    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 53, .width = 234, .height = 278 }, try drawnRect(&desktop, first));
+    // Swapping the center window with itself changes nothing.
+    try desktop.swapFocusedToCenter();
+    try std.testing.expectEqual(@as(usize, 0), desktop.pendingCommands());
+    try std.testing.expect(!desktop.takeSceneChanged());
 
+    // Closing the center promotes the most recently focused side window.
+    shell.push(.{ .toplevel_destroyed = .{ .index = 1, .generation = 1 } });
+    _ = try desktop.consume(&shell, 1);
+    _ = desktop.takeDestroyed();
+    _ = desktop.takeDestroyedSurface();
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(peripheral_center, try drawnRect(&desktop, fourth));
+    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 53, .width = 234, .height = 278 }, try drawnRect(&desktop, first));
+    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 349, .width = 234, .height = 278 }, try drawnRect(&desktop, third));
+
+    // Floating the center promotes the next most recently focused side
+    // window; the remaining left window regrows to fill its band.
+    try desktop.focusToplevel(third);
+    try desktop.focusToplevel(fourth);
+    try desktop.toggleFocusedFloating();
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(TestDesktop.Mode.floating, (try desktop.scene(fourth)).mode);
+    try std.testing.expectEqual(peripheral_center, try drawnRect(&desktop, third));
+    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 201, .width = 234, .height = 278 }, try drawnRect(&desktop, first));
+
+    // A floating focused window swaps into the center, demoting the occupant.
+    try desktop.swapFocusedToCenter();
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(peripheral_center, try drawnRect(&desktop, fourth));
+    try std.testing.expectEqual(peripheral.Region.right, desktop.policy.tileRegion(third));
+    try std.testing.expectEqual(geometry.Rect{ .x = 556, .y = 201, .width = 234, .height = 278 }, try drawnRect(&desktop, third));
+}
+
+test "desktop: peripheral drag release takes the center or parks in a side grid" {
+    var desktop = try initPeripheralDesktop();
+    defer desktop.deinit();
+    var shell = TestShell{};
+    const first = try spawnPeripheral(&desktop, &shell, 0);
+    const second = try spawnPeripheral(&desktop, &shell, 1);
+    try std.testing.expectEqual(peripheral.Region.left, desktop.policy.tileRegion(first));
+
+    // Dragging the center window out and releasing over the left band parks
+    // it there and promotes the left window, since the center was emptied.
+    const initial = (try desktop.beginInteractive(.{ .id = second, .kind = .reorder })).?;
+    try std.testing.expectEqual(peripheral_center, initial.rect);
+    try desktop.updateInteractive(second, .{ .x = -144, .y = 57, .width = 488, .height = 580 }, .{ .x = -150, .y = 300 });
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(TestDesktop.Mode.floating, (try desktop.scene(second)).mode);
+    // The center stays open while the drag is held.
+    try std.testing.expectEqual(peripheral.Region.left, desktop.policy.tileRegion(first));
+    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 201, .width = 234, .height = 278 }, try drawnRect(&desktop, first));
+    try desktop.finishMove(second, .{ .x = -150, .y = 300 });
+    try desktop.endInteractive(second);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(peripheral_center, try drawnRect(&desktop, first));
+    try std.testing.expectEqual(peripheral.Region.left, desktop.policy.tileRegion(second));
+    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 201, .width = 234, .height = 278 }, try drawnRect(&desktop, second));
+
+    // Releasing over an empty side promotes from the other side.
+    _ = (try desktop.beginInteractive(.{ .id = first, .kind = .reorder })).?;
+    try desktop.finishMove(first, .{ .x = 700, .y = 300 });
+    try desktop.endInteractive(first);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(peripheral_center, try drawnRect(&desktop, second));
+    try std.testing.expectEqual(geometry.Rect{ .x = 556, .y = 201, .width = 234, .height = 278 }, try drawnRect(&desktop, first));
+
+    // A side tile detaches at its drawn position and takes the center on
+    // release there; the occupant is demoted to the emptier side.
+    // Side tiles have no split to resize.
+    try std.testing.expect((try desktop.beginInteractive(.{ .id = first, .kind = .{ .resize = .right } })) == null);
+    try std.testing.expectEqual(geometry.Rect{ .x = 556, .y = 201, .width = 234, .height = 278 }, try drawnRect(&desktop, first));
+    const detached = (try desktop.beginInteractive(.{ .id = first, .kind = .move })).?;
+    try std.testing.expectEqual(geometry.Rect{ .x = 429, .y = 50, .width = 488, .height = 580 }, detached.rect);
+    try desktop.finishMove(first, .{ .x = 300, .y = 300 });
+    try desktop.endInteractive(first);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(peripheral_center, try drawnRect(&desktop, first));
+    try std.testing.expectEqual(peripheral.Region.left, desktop.policy.tileRegion(second));
+    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 201, .width = 234, .height = 278 }, try drawnRect(&desktop, second));
+
+    // A cancelled drag leaves the window floating and only then promotes a
+    // side window into the open center.
+    _ = (try desktop.beginInteractive(.{ .id = first, .kind = .reorder })).?;
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(peripheral.Region.left, desktop.policy.tileRegion(second));
+    try desktop.endInteractive(first);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(TestDesktop.Mode.floating, (try desktop.scene(first)).mode);
+    try std.testing.expectEqual(peripheral_center, try drawnRect(&desktop, second));
+    try desktop.focusToplevel(first);
+    try desktop.swapFocusedToCenter();
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(peripheral_center, try drawnRect(&desktop, first));
+    try std.testing.expectEqual(peripheral.Region.left, desktop.policy.tileRegion(second));
+
+    // A lone window released over a side stays floating: the center would be empty.
+    shell.push(.{ .toplevel_destroyed = .{ .index = 1, .generation = 1 } });
+    _ = try desktop.consume(&shell, 1);
+    _ = desktop.takeDestroyed();
+    _ = desktop.takeDestroyedSurface();
+    try settleDesktop(&desktop, &shell);
+    _ = (try desktop.beginInteractive(.{ .id = first, .kind = .reorder })).?;
+    try desktop.finishMove(first, .{ .x = -150, .y = 300 });
+    try desktop.endInteractive(first);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(TestDesktop.Mode.floating, (try desktop.scene(first)).mode);
+    try std.testing.expectEqual(peripheral_center, (try desktop.scene(first)).geometry);
+}
+
+test "desktop: disabling peripheral mode merges side tiles across workspaces" {
+    var desktop = try initPeripheralDesktop();
+    defer desktop.deinit();
+    var shell = TestShell{};
+    const first = try spawnPeripheral(&desktop, &shell, 0);
+    const second = try spawnPeripheral(&desktop, &shell, 1);
     // Side membership follows a tile between workspaces. Disabling the mode
     // also merges hidden workspaces, so their tiles cannot be stranded.
-    try desktop.focusToplevel(second);
-    const output = (try desktop.policy.windowState(second)).output.?;
+    try desktop.focusToplevel(first);
+    const output = (try desktop.policy.windowState(first)).output.?;
     try desktop.moveFocusedToWorkspace(2);
     try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(peripheral_center, try drawnRect(&desktop, second));
     try desktop.switchWorkspace(output, 2);
     try settleDesktop(&desktop, &shell);
-    try std.testing.expectEqual(right, (try desktop.scene(second)).geometry);
+    try std.testing.expectEqual(peripheral_center, try drawnRect(&desktop, first));
     try desktop.switchWorkspace(output, 1);
     try settleDesktop(&desktop, &shell);
     var disabled: TestDesktop.PolicySnapshot = .{ .inner_gap = 12, .outer_gap = 10 };
@@ -5280,7 +5427,8 @@ test "desktop: peripheral tiles reserve the center and drag between bands with g
     try settleDesktop(&desktop, &shell);
     try desktop.switchWorkspace(output, 2);
     try settleDesktop(&desktop, &shell);
-    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 50, .width = 980, .height = 580 }, (try desktop.scene(second)).geometry);
+    try std.testing.expectEqual(geometry.Rect{ .x = -190, .y = 50, .width = 980, .height = 580 }, (try desktop.scene(first)).geometry);
+    try std.testing.expect(desktop.policy.tileVisual(first) == null);
 }
 
 test "desktop: peripheral pointer drag keeps tile size and only snaps on center release" {
@@ -5342,13 +5490,17 @@ test "desktop: peripheral drop uses the destination output and active workspace"
     try settleDesktop(&desktop, &shell);
     const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
     try desktop.switchWorkspace(topology[1].id, 3);
-    try desktop.finishReorder(first, .{ .x = 100, .y = 100 });
+    _ = (try desktop.beginInteractive(.{ .id = first, .kind = .reorder })).?;
+    try desktop.finishMove(first, .{ .x = 400, .y = 100 });
+    try desktop.endInteractive(first);
     try settleDesktop(&desktop, &shell);
     const state = try desktop.policy.windowState(first);
     try std.testing.expectEqual(topology[1].id, state.output.?);
     try std.testing.expectEqual(@as(u8, 3), state.workspace);
-    try std.testing.expectEqual(geometry.Rect{ .x = 0, .y = -100, .width = 200, .height = 500 }, (try desktop.scene(first)).geometry);
-    try desktop.finishReorder(first, .{ .x = -300, .y = 200 });
+    try std.testing.expectEqual(geometry.Rect{ .x = 200, .y = -100, .width = 400, .height = 500 }, (try desktop.scene(first)).geometry);
+    _ = (try desktop.beginInteractive(.{ .id = first, .kind = .reorder })).?;
+    try desktop.finishMove(first, .{ .x = -300, .y = 200 });
+    try desktop.endInteractive(first);
     try settleDesktop(&desktop, &shell);
     try std.testing.expectEqual(geometry.Rect{ .x = -450, .y = 40, .width = 300, .height = 400 }, (try desktop.scene(first)).geometry);
     try std.testing.expectEqual(@as(u8, 1), (try desktop.policy.windowState(first)).workspace);

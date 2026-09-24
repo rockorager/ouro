@@ -26,6 +26,7 @@ pub const actions = [_]Declaration{
     .{ .action = .toggle_fullscreen, .name = "toggle-fullscreen", .description = "Toggle fullscreen for the focused window." },
     .{ .action = .toggle_maximized, .name = "toggle-maximized", .description = "Toggle maximization for the focused window." },
     .{ .action = .toggle_floating, .name = "toggle-floating", .description = "Toggle the focused window between tiled and floating." },
+    .{ .action = .swap_center, .name = "swap-center", .description = "In peripheral mode, exchange the focused side window with the center window, or tile a floating focused window into the center." },
     .{ .action = .exit, .name = "exit", .description = "End the compositor session and disconnect its applications." },
     .{ .action = .run, .name = "run", .description = "Launch an application through systemd using argv, without a shell." },
     .{ .action = .call, .name = "call", .description = "Enqueue an MCP tool call to a local Unix socket. Remote results are discarded; failures are logged and calls are never retried." },
@@ -177,6 +178,7 @@ pub fn apply(coordinator: anytype, action: config.Action) !void {
         .toggle_fullscreen => try coordinator.toggleFocusedFullscreen(),
         .toggle_maximized => try coordinator.toggleFocusedMaximized(),
         .toggle_floating => try coordinator.toggleFocusedFloating(),
+        .swap_center => try coordinator.swapFocusedToCenter(),
         .exit, .run, .call => unreachable, // Process lifecycle belongs to main.
     }
 }

@@ -63,6 +63,86 @@ pub fn tileRegions(settings: Settings, bounds: geometry.Rect, inner: u32, outer:
     return .{ .areas = areas, .center_start = @intCast(center_start), .center_end = @intCast(center_end) };
 }
 
+/// Side windows keep the center's logical size and are drawn scaled into a
+/// grid. The grid picks the column count that gives the largest uniform
+/// scale (never above 1:1) once `inner` gaps separate its cells; leftover
+/// pixels center the grid inside the side area.
+pub const Grid = struct {
+    columns: usize,
+    rows: usize,
+    cell_width: i32,
+    cell_height: i32,
+    /// Top-left of the first cell after centering the grid in the area.
+    origin: geometry.Point,
+    inner: i32,
+    scale: i32,
+
+    pub fn cell(layout: Grid, index: usize) geometry.Rect {
+        const column: i32 = @intCast(index % layout.columns);
+        const row: i32 = @intCast(index / layout.columns);
+        return .{
+            .x = layout.origin.x + column * (layout.cell_width + layout.inner),
+            .y = layout.origin.y + row * (layout.cell_height + layout.inner),
+            .width = layout.cell_width,
+            .height = layout.cell_height,
+        };
+    }
+
+    /// Draws `window` at the grid scale, centered in cell `index`.
+    pub fn visual(layout: Grid, index: usize, window: geometry.Rect) ?render.VisualTransform {
+        var transform_value: render.VisualTransform = .{
+            .anchor = .{
+                .x = @intCast(@divFloor(@as(i64, window.x) * 2 + window.width, 2)),
+                .y = @intCast(@divFloor(@as(i64, window.y) * 2 + window.height, 2)),
+            },
+            .scale = layout.scale,
+        };
+        const drawn = renderedRect(transform_value, window) orelse return null;
+        const target = layout.cell(index);
+        transform_value.translation = .{
+            .x = std.math.cast(i32, @as(i64, target.x) + @divFloor(target.width - drawn.width, 2) - drawn.x) orelse return null,
+            .y = std.math.cast(i32, @as(i64, target.y) + @divFloor(target.height - drawn.height, 2) - drawn.y) orelse return null,
+        };
+        return transform_value;
+    }
+};
+
+/// Lays out `count` windows of `window` size inside `area`. Returns null when
+/// the area cannot hold a single one-pixel cell.
+pub fn grid(area: geometry.Rect, count: usize, window: geometry.Rect, inner: u32) ?Grid {
+    if (count == 0 or area.width <= 0 or area.height <= 0 or window.width <= 0 or window.height <= 0) return null;
+    const gap: i64 = inner;
+    var best: ?Grid = null;
+    for (1..count + 1) |columns| {
+        const rows = (count + columns - 1) / columns;
+        const cell_width = @divTrunc(@as(i64, area.width) - gap * @as(i64, @intCast(columns - 1)), @as(i64, @intCast(columns)));
+        const cell_height = @divTrunc(@as(i64, area.height) - gap * @as(i64, @intCast(rows - 1)), @as(i64, @intCast(rows)));
+        if (cell_width <= 0 or cell_height <= 0) continue;
+        const scale = @min(
+            @as(i64, render.fixed_one),
+            @divTrunc(cell_width * render.fixed_one, window.width),
+            @divTrunc(cell_height * render.fixed_one, window.height),
+        );
+        if (scale <= 0) continue;
+        if (best != null and scale <= best.?.scale) continue;
+        const used_width = cell_width * @as(i64, @intCast(columns)) + gap * @as(i64, @intCast(columns - 1));
+        const used_height = cell_height * @as(i64, @intCast(rows)) + gap * @as(i64, @intCast(rows - 1));
+        best = .{
+            .columns = columns,
+            .rows = rows,
+            .cell_width = @intCast(cell_width),
+            .cell_height = @intCast(cell_height),
+            .origin = .{
+                .x = @intCast(area.x + @divTrunc(area.width - used_width, 2)),
+                .y = @intCast(area.y + @divTrunc(area.height - used_height, 2)),
+            },
+            .inner = @intCast(inner),
+            .scale = @intCast(scale),
+        };
+    }
+    return best;
+}
+
 /// Returns the visual transform for a window occupying `window` on an output
 /// whose logical extent is `bounds`, or null when the window renders at its
 /// natural size. Returns null for identity so callers can skip the mapping.
@@ -285,6 +365,57 @@ test "peripheral: minimum-size window stays inside its selected monitor with inv
     try std.testing.expectEqual(@as(i32, 20), drawn.x);
     try std.testing.expectEqual(@as(i32, 0), drawn.y);
     try std.testing.expect(!right.identity());
+}
+
+test "peripheral: side grid maximises a uniform scale and centers windows in cells" {
+    const window: geometry.Rect = .{ .x = 300, .y = 100, .width = 400, .height = 600 };
+    // One window in a 200x600 side: width-bound at exactly half size, centered vertically.
+    const single = grid(.{ .x = 0, .y = 0, .width = 200, .height = 600 }, 1, window, 12).?;
+    try std.testing.expectEqual(@as(usize, 1), single.columns);
+    try std.testing.expectEqual(render.fixed_one / 2, single.scale);
+    try std.testing.expectEqual(geometry.Rect{ .x = 0, .y = 150, .width = 200, .height = 300 }, renderedRect(single.visual(0, window).?, window).?);
+
+    // Two portrait windows in a wide side: side by side beats stacked because
+    // stacking halves the height (300 -> 0.5) while columns keep 0.735.
+    const area: geometry.Rect = .{ .x = 1000, .y = 50, .width = 600, .height = 600 };
+    const pair = grid(area, 2, window, 12).?;
+    try std.testing.expectEqual(@as(usize, 2), pair.columns);
+    try std.testing.expectEqual(@as(usize, 1), pair.rows);
+    try std.testing.expectEqual(@as(i32, 294), pair.cell_width);
+    try std.testing.expectEqual(@divTrunc(294 * render.fixed_one, 400), pair.scale);
+    const first = renderedRect(pair.visual(0, window).?, window).?;
+    const second = renderedRect(pair.visual(1, window).?, window).?;
+    try std.testing.expectEqual(geometry.Rect{ .x = 1000, .y = 130, .width = 294, .height = 440 }, first);
+    try std.testing.expectEqual(@as(i32, 1306), second.x);
+    try std.testing.expectEqual(first.y, second.y);
+    try std.testing.expectEqual(first.width, second.width);
+    // The gap between the drawn windows is exactly the inner gap.
+    try std.testing.expectEqual(@as(i32, 12), second.x - (first.x + first.width));
+
+    // Three windows fall back to two columns and two rows; the odd leftover
+    // pixel centers the grid rather than skewing it to one edge.
+    const trio = grid(.{ .x = 0, .y = 0, .width = 601, .height = 600 }, 3, window, 0).?;
+    try std.testing.expectEqual(@as(usize, 2), trio.columns);
+    try std.testing.expectEqual(@as(usize, 2), trio.rows);
+    try std.testing.expectEqual(geometry.Point{ .x = 0, .y = 0 }, trio.origin);
+    try std.testing.expectEqual(geometry.Rect{ .x = 300, .y = 300, .width = 300, .height = 300 }, trio.cell(3));
+    for (0..3) |index| {
+        const cell = trio.cell(index);
+        const drawn = renderedRect(trio.visual(index, window).?, window).?;
+        try std.testing.expect(drawn.x >= cell.x and drawn.x + drawn.width <= cell.x + cell.width);
+        try std.testing.expect(drawn.y >= cell.y and drawn.y + drawn.height <= cell.y + cell.height);
+        try std.testing.expectEqual(cell.height, drawn.height);
+        try std.testing.expectEqual(@as(i32, 200), drawn.width);
+    }
+}
+
+test "peripheral: side grid never upscales and rejects impossible areas" {
+    const window: geometry.Rect = .{ .x = 0, .y = 0, .width = 16, .height = 16 };
+    const roomy = grid(.{ .x = 0, .y = 0, .width = 24, .height = 16 }, 1, window, 0).?;
+    try std.testing.expectEqual(render.fixed_one, roomy.scale);
+    try std.testing.expectEqual(geometry.Rect{ .x = 4, .y = 0, .width = 16, .height = 16 }, renderedRect(roomy.visual(0, window).?, window).?);
+    try std.testing.expect(grid(.{ .x = 0, .y = 0, .width = 24, .height = 16 }, 0, window, 0) == null);
+    try std.testing.expect(grid(.{ .x = 0, .y = 0, .width = 3, .height = 3 }, 4, window, 4) == null);
 }
 
 test "peripheral: settings reject impossible percentages" {

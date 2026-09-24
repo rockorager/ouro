@@ -12,7 +12,7 @@ const default_source =
     \\{"bindings":{
     \\"super+tab":["focus-next"],"super+q":["close"],
     \\"super+f":["toggle-fullscreen"],"super+m":["toggle-maximized"],
-    \\"super+space":["toggle-floating"],"super+h":["focus-left"],
+    \\"super+space":["toggle-floating"],"super+c":["swap-center"],"super+h":["focus-left"],
     \\"super+j":["focus-down"],"super+k":["focus-up"],"super+l":["focus-right"],
     \\"super+shift+h":["move-left"],"super+shift+j":["move-down"],
     \\"super+shift+k":["move-up"],"super+shift+l":["move-right"],
@@ -62,6 +62,7 @@ pub const Action = union(enum) {
     toggle_fullscreen,
     toggle_maximized,
     toggle_floating,
+    swap_center,
     exit,
     run: []const []const u8,
     call: @import("mcp_client.zig").Call,
@@ -530,6 +531,7 @@ pub fn parseAction(allocator: std.mem.Allocator, value: std.json.Value) !Action 
     if (std.mem.eql(u8, name, "toggle-fullscreen")) return .toggle_fullscreen;
     if (std.mem.eql(u8, name, "toggle-maximized")) return .toggle_maximized;
     if (std.mem.eql(u8, name, "toggle-floating")) return .toggle_floating;
+    if (std.mem.eql(u8, name, "swap-center")) return .swap_center;
     if (std.mem.eql(u8, name, "exit")) return .exit;
     return error.UnknownAction;
 }
@@ -849,7 +851,7 @@ test "store applies sibling fragments in lexical order" {
 test "default bindings" {
     var snapshot = try defaultSnapshot(std.testing.allocator);
     defer snapshot.deinit();
-    try std.testing.expectEqual(@as(usize, 44), snapshot.bindings.len);
+    try std.testing.expectEqual(@as(usize, 45), snapshot.bindings.len);
     var saw_exit = false;
     var saw_monstar = false;
     for (snapshot.bindings) |binding| switch (binding.action) {
@@ -888,7 +890,7 @@ test "hardware defaults can be overridden and removed" {
         \\{"bindings":{"XF86AudioRaiseVolume":["run","custom-volume","up"],"XF86KbdBrightnessDown":null}}
     });
     defer snapshot.deinit();
-    try std.testing.expectEqual(@as(usize, 43), snapshot.bindings.len);
+    try std.testing.expectEqual(@as(usize, 44), snapshot.bindings.len);
     var saw_override = false;
     for (snapshot.bindings) |binding| {
         try std.testing.expect(binding.trigger.keysym != c.XKB_KEY_XF86KbdBrightnessDown);

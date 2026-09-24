@@ -198,10 +198,18 @@ the outside of the layout. Crossing outputs moves the tile to the destination's
 active workspace. Tiled layout changes on release after at least 8 logical
 pixels of motion unless peripheral shrink mode is enabled.
 
-With `peripheral_shrink` enabled, tiles fill the central band with the configured
-gaps. Super-left-drag detaches a tile at its current size and moves it with the
-pointer. Release at the side to leave it floating, or release with the cursor
-in the center to snap it back into tiling. New windows start in the center.
+With `peripheral_shrink` enabled, the central band holds exactly one tiled
+window at the configured gaps. A new window takes the center and the previous
+center window moves to the side with fewer windows (left on a tie). Side windows
+keep the center's logical size; they are drawn in a grid on their side, as large
+as the gaps allow without exceeding their real size, centered in their cells,
+and stay fully interactive. Closing or floating the center window promotes the
+most recently focused side window. `swap-center` (`Super+C` by default)
+exchanges the focused side window with the center window, or tiles a floating
+focused window into the center. Super-left-drag detaches a tile at its current
+size and moves it with the pointer. Release in the center to make it the center
+window; release over a side to park it in that side's grid, promoting another
+window to the center (a lone window released over a side stays floating).
 `peripheral_center_percent` controls the center width;
 `peripheral_min_scale_percent` sets the minimum visual scale. Shrink follows an
 exponential decay: fast just outside the center, then slower near the edge.
@@ -270,7 +278,7 @@ not physical evdev positions. Actions are exact JSON arrays: `focus-next`,
 `move-output-next`, `move-output-previous`, `switch-workspace` followed by a
 number from 1 through 10, `move-focused-to-workspace` followed by the same,
 `close`, `toggle-fullscreen`,
-`toggle-maximized`, `toggle-floating`, `exit`, `run` followed by an argv,
+`toggle-maximized`, `toggle-floating`, `swap-center`, `exit`, `run` followed by an argv,
 or `call` followed by a Unix address, MCP tool name, and arguments object.
 `run` never invokes a shell and delegates process ownership to
 `systemd-run --user`; Ouro does not supervise applications.
@@ -333,7 +341,7 @@ authorization**. Existing socket paths are never unlinked on startup.
 | `move-next`, `move-previous`, `move-left`, `move-right`, `move-up`, `move-down` | `{}` |
 | `move-output-next`, `move-output-previous` | `{}` |
 | `switch-workspace`, `move-focused-to-workspace` | `{"number": 1}` (1–10) |
-| `close`, `toggle-fullscreen`, `toggle-maximized`, `toggle-floating`, `exit` | `{}` |
+| `close`, `toggle-fullscreen`, `toggle-maximized`, `toggle-floating`, `swap-center`, `exit` | `{}` |
 | `run` | `{"argv": ["application", "argument"]}` |
 | `call` | `{"address": "unix:/absolute/path", "method": "tool-name", "arguments": {}}` |
 | `get-state`, `get-memory`, `reload-config` | `{}` |

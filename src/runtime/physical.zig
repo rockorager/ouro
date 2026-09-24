@@ -2215,6 +2215,10 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.desktop.toggleFocusedFloating();
         }
 
+        pub fn swapFocusedToCenter(self: *Self) !void {
+            try self.desktop.swapFocusedToCenter();
+        }
+
         pub fn requestClose(self: *Self, id: ToplevelId) !void {
             try self.shell_adapter.queueClose(try self.desktop.shellToplevel(id));
             self.markProtocolAll(ProtocolReady.shell);
@@ -12364,9 +12368,10 @@ pub fn Coordinator(comptime protocol: type) type {
             const settings = self.desktop.policy.peripheral;
             if (!settings.enabled or !window.managed) return null;
             const toplevel = self.desktop.scene(window.id) catch return null;
-            // The center is a real tiled work area: even a narrow tile at its
-            // edge must fill its configured rectangle, not shrink a second time.
-            if (toplevel.mode == .tiled and self.desktop.policy.tileRegion(window.id) == .center) return null;
+            // Tiles are placed by the policy: the center tile fills its
+            // configured rectangle and side tiles take their grid cell, so
+            // neither shrinks by pointer-independent falloff.
+            if (toplevel.mode == .tiled) return self.desktop.policy.tileVisual(window.id);
             if (self.peripheralOutput(toplevel)) |physical| {
                 const bounds = self.outputBoundsFor(physical) catch return null;
                 return peripheral.boundedTransform(settings, toplevel.geometry, bounds);

@@ -8,6 +8,7 @@ const std = @import("std");
 const geometry = @import("../scene/geometry.zig");
 const layout = @import("layout.zig");
 const peripheral = @import("../scene/peripheral.zig");
+const render = @import("../render/types.zig");
 const workspace = @import("workspace.zig");
 
 const workspace_count = 10;
@@ -44,6 +45,9 @@ pub fn Policy(
             maximized: bool = false,
             minimized: bool = false,
             resizing: bool = false,
+            /// Visual-only placement of a peripheral side tile, refreshed by
+            /// `arrange`. Null draws the window at its logical geometry.
+            visual: ?render.VisualTransform = null,
         };
 
         pub const Snapshot = struct {
@@ -67,10 +71,14 @@ pub fn Policy(
         };
         const Eligibility = struct {
             policy: *const Self,
+            /// Peripheral side tiles are drawn as a grid, not as their tree,
+            /// so tree boundaries between them must not offer resizes.
+            center_only: bool = false,
 
             pub fn isEligible(filter: @This(), id: ToplevelId) bool {
                 const state = filter.policy.resolveConst(id) catch return false;
-                return filter.policy.layoutEligible(state.*);
+                if (!filter.policy.layoutEligible(state.*)) return false;
+                return !filter.center_only or filter.policy.tileRegion(id) == .center;
             }
         };
 
@@ -96,6 +104,10 @@ pub fn Policy(
         tiling: Tiling,
         placements: []Tiling.Placement,
         tiled_resize: ?Tiling.Resize = null,
+        /// A peripheral tile detached by an in-progress drag. Its former
+        /// center stays empty until release decides where it lands.
+        held: ?ToplevelId = null,
+        visual_changed: bool = false,
         output_workspaces: []OutputWorkspace,
         output_workspace_len: usize = 0,
         next_group_id: u64 = 1,
@@ -189,6 +201,7 @@ pub fn Policy(
                 if (policy.states[id.index].committed) policy.workspace_revision +%= 1;
                 policy.removeFocus(id);
                 policy.clearTiledResize(id);
+                _ = policy.releaseHeld(id);
                 policy.tiling.remove(id);
                 policy.removeTile(id);
                 policy.states[id.index] = .{};
@@ -361,12 +374,23 @@ pub fn Policy(
             if (!policy.isVisible(state.*) or state.fullscreen or state.maximized) return false;
             policy.tiled_resize = null;
             if (state.mode == .tiled) {
+                // A side tile is drawn somewhere else than its logical
+                // rectangle. Detach it centered where the pointer sees it so
+                // the drag continues from the drawn window, not the center.
+                const side_tile = policy.tileRegion(id) != .center;
+                var detached = current_geometry;
+                if (state.visual) |visual| {
+                    detached.x = std.math.add(i32, detached.x, visual.translation.x) catch return error.InvalidGeometry;
+                    detached.y = std.math.add(i32, detached.y, visual.translation.y) catch return error.InvalidGeometry;
+                }
                 switch (kind) {
                     .move => {
                         _ = try policy.setFloating(id, true);
-                        _ = try policy.setFloatingGeometry(id, current_geometry, null);
+                        _ = try policy.setFloatingGeometry(id, detached, null);
+                        if (policy.peripheral.enabled) policy.held = id;
                     },
                     .resize => |edge| {
+                        if (side_tile) return false;
                         if (policy.tiling.beginResize(id, edge)) |resize| {
                             policy.tiled_resize = resize;
                         } else {
@@ -376,7 +400,8 @@ pub fn Policy(
                     },
                     .reorder => if (policy.peripheral.enabled) {
                         _ = try policy.setFloating(id, true);
-                        _ = try policy.setFloatingGeometry(id, current_geometry, null);
+                        _ = try policy.setFloatingGeometry(id, detached, null);
+                        policy.held = id;
                     },
                 }
             } else if (kind == .reorder) return false;
@@ -386,7 +411,7 @@ pub fn Policy(
         }
 
         pub fn tiledBoundaryAt(policy: *const Self, point: geometry.Point) ?Tiling.BoundaryHit {
-            return policy.tiling.boundaryAt(point, 8, Eligibility{ .policy = policy });
+            return policy.tiling.boundaryAt(point, 8, Eligibility{ .policy = policy, .center_only = true });
         }
 
         const ReorderTarget = struct {
@@ -398,6 +423,8 @@ pub fn Policy(
         };
 
         // Preview and release resolve the same target without mutating layout.
+        // Peripheral outputs never reorder trees: their drags detach the
+        // window and `finishMove` chooses a band on release.
         fn reorderTarget(policy: *const Self, id: ToplevelId, point: geometry.Point, view: anytype) !?ReorderTarget {
             const state = try policy.resolveConst(id);
             if (!policy.layoutEligible(state.*)) return null;
@@ -410,16 +437,14 @@ pub fn Policy(
             }
             const index = output_index orelse return null;
             const output = view.output(index);
-            const regions = peripheral.tileRegions(policy.peripheral, output.geometry, policy.inner_gap, policy.outer_gap);
-            const region: peripheral.Region = if (regions) |bands| bands.at(point) else .center;
-            const area = if (regions) |bands| bands.areas[@intFromEnum(region)] else output.geometry;
-            const destination = LayoutOutput{ .output = output.id, .workspace = policy.activeWorkspace(output.id), .region = region };
+            if (peripheral.tileRegions(policy.peripheral, output.geometry, policy.inner_gap, policy.outer_gap) != null) return null;
+            const area = output.geometry;
+            const destination = LayoutOutput{ .output = output.id, .workspace = policy.activeWorkspace(output.id) };
             const source = policy.layoutOutput(state.*);
             const same_workspace = std.meta.eql(source, destination);
 
             // The outer horizontal strips are explicit output-root insertion.
-            // Peripheral bands are already independent roots, not half-output splits.
-            if (regions == null and (point.x < output.geometry.x + 32 or point.x >= output.geometry.x + output.geometry.width - 32)) {
+            if (point.x < output.geometry.x + 32 or point.x >= output.geometry.x + output.geometry.width - 32) {
                 const direction: layout.Direction = if (point.x < output.geometry.x + 32) .left else .right;
                 return .{ .destination = destination, .same_workspace = same_workspace, .direction = direction, .rect = output.geometry };
             }
@@ -496,11 +521,6 @@ pub fn Policy(
                     rect.height -= half;
                 },
             };
-            if (drop.destination.region != .center) {
-                const output = view.outputFor(drop.destination.output, rect);
-                if (peripheral.transform(policy.peripheral, rect, output.bounds orelse output.geometry)) |visual|
-                    return peripheral.renderedRect(visual, rect);
-            }
             return if (rect.width > 0 and rect.height > 0) rect else null;
         }
 
@@ -527,8 +547,11 @@ pub fn Policy(
             return changed;
         }
 
-        /// Peripheral moves are free drags; only a release in the center
-        /// returns the window to tiling. Cancellation never calls this path.
+        /// Peripheral moves are free drags. Releasing over the center makes
+        /// the window the center window; releasing over a side parks it in
+        /// that side's grid and promotes another window to the center. A lone
+        /// window dropped on a side stays floating, since the center would be
+        /// empty. Cancellation never calls this path.
         pub fn finishMove(policy: *Self, id: ToplevelId, point: geometry.Point, view: anytype) !bool {
             const state = try policy.resolve(id);
             if (!policy.peripheral.enabled or state.mode != .floating or
@@ -537,16 +560,45 @@ pub fn Policy(
                 const output = view.output(index);
                 if (!output.geometry.contains(point)) continue;
                 const regions = peripheral.tileRegions(policy.peripheral, output.geometry, policy.inner_gap, policy.outer_gap) orelse return false;
-                if (regions.at(point) != .center) return false;
+                const region = regions.at(point);
+                const destination = LayoutOutput{ .output = output.id, .workspace = policy.activeWorkspace(output.id), .region = region };
+                const center = LayoutOutput{ .output = output.id, .workspace = destination.workspace };
+                var replacement: ?ToplevelId = null;
+                if (region != .center and policy.regionOccupant(center) == null) {
+                    replacement = policy.recentInRegion(destination, id) orelse
+                        policy.recentInRegion(.{ .output = output.id, .workspace = destination.workspace, .region = if (region == .left) .right else .left }, id) orelse
+                        return false;
+                }
                 try policy.validateLayout(policy.layoutCount() + 1, view);
-                if (!std.meta.eql(state.output, @as(?OutputId, output.id)) or state.workspace != policy.activeWorkspace(output.id)) {
+                if (!std.meta.eql(state.output, @as(?OutputId, output.id)) or state.workspace != destination.workspace) {
                     state.output = output.id;
-                    state.workspace = policy.activeWorkspace(output.id);
+                    state.workspace = destination.workspace;
                     policy.workspace_revision +%= 1;
                 }
-                return policy.setFloating(id, false);
+                _ = try policy.setFloating(id, false);
+                policy.tiling.moveToOutput(id, destination, null);
+                if (replacement) |promoted| policy.tiling.moveToOutput(promoted, center, null);
+                return true;
             }
             return false;
+        }
+
+        /// Exchanges the focused window with the center window of its
+        /// output. A floating focused window is tiled into the center instead.
+        pub fn swapFocusedToCenter(policy: *Self, view: anytype) !bool {
+            const id = policy.focusedToplevel() orelse return false;
+            const state = try policy.resolve(id);
+            if (!policy.peripheral.enabled or !policy.isVisible(state.*) or state.fullscreen or state.maximized) return false;
+            if (state.mode == .floating) {
+                try policy.validateLayout(policy.layoutCount() + 1, view);
+                return policy.setFloating(id, false);
+            }
+            const source = policy.layoutOutput(state.*);
+            if (source.region == .center) return false;
+            const center = LayoutOutput{ .output = source.output, .workspace = source.workspace };
+            if (policy.regionOccupant(center)) |occupant| policy.tiling.moveToOutput(occupant, source, null);
+            policy.tiling.moveToOutput(id, center, null);
+            return true;
         }
 
         pub fn updateInteractive(policy: *Self, id: ToplevelId, rect: geometry.Rect, pointer: ?geometry.Point) !bool {
@@ -589,7 +641,8 @@ pub fn Policy(
             if (policy.tiled_resize) |resize| {
                 if (std.meta.eql(resize.id, id)) policy.tiled_resize = null;
             }
-            return policy.setResizing(id, false);
+            const released = policy.releaseHeld(id);
+            return (try policy.setResizing(id, false)) or released;
         }
 
         pub fn validateSnapshot(policy: *const Self, view: anytype, snapshot: *const Snapshot) !void {
@@ -775,6 +828,7 @@ pub fn Policy(
             state.mode = mode;
             state.floating_pointer = null;
             if (floating) {
+                policy.assignVisual(state, null);
                 policy.removeTile(id);
             } else {
                 policy.appendTile(id);
@@ -869,28 +923,58 @@ pub fn Policy(
             var placement_len: usize = 0;
             for (0..view.outputCount()) |area_index| {
                 const output = view.output(area_index);
+                const active = policy.activeWorkspace(output.id);
                 const regions = peripheral.tileRegions(policy.peripheral, output.geometry, policy.inner_gap, policy.outer_gap);
-                if (regions == null) {
-                    // Turning peripheral mode off (or shrinking an output too
-                    // far for three bands) returns every workspace to one tree.
-                    for (policy.states) |state| {
-                        if (!state.active or !state.committed or state.mode != .tiled or
-                            !std.meta.eql(state.output, @as(?OutputId, output.id))) continue;
-                        policy.tiling.moveToOutput(state.id, .{ .output = output.id, .workspace = state.workspace }, null);
-                    }
-                }
-                const areas = if (regions) |bands| bands.areas else [3]geometry.Rect{ output.geometry, output.geometry, output.geometry };
-                for (areas[0..if (regions != null) @as(usize, 3) else 1], 0..) |area, region| {
+                if (regions) |bands| {
+                    policy.balancePeripheral(output.id, active);
+                    const center = bands.areas[@intFromEnum(peripheral.Region.center)];
                     const plans = try policy.tiling.arrange(
-                        .{ .output = output.id, .workspace = policy.activeWorkspace(output.id), .region = @enumFromInt(region) },
-                        area,
+                        .{ .output = output.id, .workspace = active, .region = .center },
+                        center,
                         policy.inner_gap,
-                        if (regions != null) 0 else policy.outer_gap,
+                        0,
                         Eligibility{ .policy = policy },
                         policy.placements[placement_len..],
                     );
                     placement_len += plans.len;
+                    // Side tiles keep the center's logical rectangle, so a swap
+                    // into the center never reconfigures a client; only the
+                    // visual grid placement differs.
+                    for ([_]peripheral.Region{ .left, .right }) |region| {
+                        const destination = LayoutOutput{ .output = output.id, .workspace = active, .region = region };
+                        var count: usize = 0;
+                        for (policy.tiles[0..policy.tile_len]) |id| {
+                            if (policy.inRegion(id, destination)) count += 1;
+                        }
+                        const grid = peripheral.grid(bands.areas[@intFromEnum(region)], count, center, policy.inner_gap);
+                        var index: usize = 0;
+                        for (policy.tiles[0..policy.tile_len]) |id| {
+                            if (!policy.inRegion(id, destination)) continue;
+                            if (placement_len >= policy.placements.len) return error.Exhausted;
+                            policy.placements[placement_len] = .{ .id = id, .rect = center };
+                            placement_len += 1;
+                            policy.assignVisual(try policy.resolve(id), if (grid) |cells| cells.visual(index, center) else null);
+                            index += 1;
+                        }
+                    }
+                    continue;
                 }
+                // Turning peripheral mode off (or shrinking an output too
+                // far for three bands) returns every workspace to one tree.
+                for (policy.states) |state| {
+                    if (!state.active or !state.committed or state.mode != .tiled or
+                        !std.meta.eql(state.output, @as(?OutputId, output.id))) continue;
+                    policy.tiling.moveToOutput(state.id, .{ .output = output.id, .workspace = state.workspace }, null);
+                }
+                const plans = try policy.tiling.arrange(
+                    .{ .output = output.id, .workspace = active },
+                    output.geometry,
+                    policy.inner_gap,
+                    policy.outer_gap,
+                    Eligibility{ .policy = policy },
+                    policy.placements[placement_len..],
+                );
+                placement_len += plans.len;
             }
 
             for (policy.placements[0..placement_len]) |placement| {
@@ -901,6 +985,10 @@ pub fn Policy(
             var stacking: u32 = 0;
             for (policy.tiles[0..policy.tile_len]) |id| {
                 const state_value = try policy.resolve(id);
+                // Only a laid-out side tile keeps a grid placement; anything
+                // else is drawn at its logical geometry.
+                if (!policy.layoutEligible(state_value.*) or policy.tileRegion(id) == .center)
+                    policy.assignVisual(state_value, null);
                 if (!policy.isVisible(state_value.*)) {
                     try transaction.place(id, policy.target(
                         state_value.*,
@@ -1027,6 +1115,79 @@ pub fn Policy(
 
         pub fn tileRegion(policy: *const Self, id: ToplevelId) peripheral.Region {
             return if (policy.tiling.outputFor(id)) |output| output.region else .center;
+        }
+
+        fn assignVisual(policy: *Self, state: *State, visual: ?render.VisualTransform) void {
+            if (std.meta.eql(state.visual, visual)) return;
+            state.visual = visual;
+            policy.visual_changed = true;
+        }
+
+        /// Whether any window's visual placement changed since the last call.
+        /// A grid change never reconfigures a client, so the desktop must
+        /// republish the scene from this alone.
+        pub fn takeVisualChanged(policy: *Self) bool {
+            const changed = policy.visual_changed;
+            policy.visual_changed = false;
+            return changed;
+        }
+
+        /// Visual-only placement of a peripheral side tile, or null when the
+        /// window is drawn at its logical geometry.
+        pub fn tileVisual(policy: *const Self, id: ToplevelId) ?render.VisualTransform {
+            const state = policy.resolveConst(id) catch return null;
+            return if (state.mode == .tiled) state.visual else null;
+        }
+
+        fn inRegion(policy: *const Self, id: ToplevelId, destination: LayoutOutput) bool {
+            const state = policy.resolveConst(id) catch return false;
+            return policy.layoutEligible(state.*) and std.meta.eql(policy.layoutOutput(state.*), destination);
+        }
+
+        /// The first tile (in stacking order) laid out in `destination`.
+        fn regionOccupant(policy: *const Self, destination: LayoutOutput) ?ToplevelId {
+            for (policy.tiles[0..policy.tile_len]) |id| if (policy.inRegion(id, destination)) return id;
+            return null;
+        }
+
+        /// The most recently focused tile laid out in `destination`, other than `exclude`.
+        fn recentInRegion(policy: *const Self, destination: LayoutOutput, exclude: ?ToplevelId) ?ToplevelId {
+            for (policy.focus_order[0..policy.focus_len]) |id| {
+                if (exclude != null and std.meta.eql(id, exclude.?)) continue;
+                if (policy.inRegion(id, destination)) return id;
+            }
+            return null;
+        }
+
+        /// Keeps exactly one tile in the center of a peripheral workspace.
+        /// Extra center tiles move to the side holding fewer tiles (left on a
+        /// tie), keeping the most recently focused one; an empty center takes
+        /// the most recently focused side tile once no drag holds it open.
+        fn balancePeripheral(policy: *Self, output: OutputId, active: u8) void {
+            const center = LayoutOutput{ .output = output, .workspace = active };
+            const left = LayoutOutput{ .output = output, .workspace = active, .region = .left };
+            const right = LayoutOutput{ .output = output, .workspace = active, .region = .right };
+            const keeper = policy.recentInRegion(center, null) orelse {
+                // A drag in progress keeps its center open until release.
+                if (policy.held != null) return;
+                for (policy.focus_order[0..policy.focus_len]) |id| {
+                    if (!policy.inRegion(id, left) and !policy.inRegion(id, right)) continue;
+                    policy.tiling.moveToOutput(id, center, null);
+                    return;
+                }
+                return;
+            };
+            var counts = [2]usize{ 0, 0 };
+            for (policy.tiles[0..policy.tile_len]) |id| {
+                if (policy.inRegion(id, left)) counts[0] += 1;
+                if (policy.inRegion(id, right)) counts[1] += 1;
+            }
+            for (policy.tiles[0..policy.tile_len]) |id| {
+                if (std.meta.eql(id, keeper) or !policy.inRegion(id, center)) continue;
+                const side: usize = if (counts[1] < counts[0]) 1 else 0;
+                policy.tiling.moveToOutput(id, if (side == 0) left else right, null);
+                counts[side] += 1;
+            }
         }
 
         fn layoutOutput(policy: *const Self, state_value: State) LayoutOutput {
@@ -1244,6 +1405,16 @@ pub fn Policy(
             if (policy.tiled_resize) |resize| {
                 if (std.meta.eql(resize.id, id)) policy.tiled_resize = null;
             }
+        }
+
+        fn releaseHeld(policy: *Self, id: ToplevelId) bool {
+            if (policy.held) |held| {
+                if (std.meta.eql(held, id)) {
+                    policy.held = null;
+                    return true;
+                }
+            }
+            return false;
         }
     };
 }
