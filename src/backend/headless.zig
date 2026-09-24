@@ -7,6 +7,10 @@
 //! on the next simulated vblank of its CRTC, and the coordinator reads the
 //! timerfd as it would read DRM events. Only the Pixman renderer is supported;
 //! scanout images are dumb buffers and there is no GBM allocation.
+//!
+//! An optional input platform stands in for libinput: one virtual device with
+//! pointer and keyboard capabilities whose events arrive as text datagrams on
+//! a Unix socket, so bindings and compositor drags can be driven headlessly.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -16,6 +20,7 @@ const gamma = @import("drm/gamma.zig");
 const gbm = @import("gbm.zig");
 const framebuffer = @import("drm/framebuffer.zig");
 const atomic = @import("drm/atomic.zig");
+const input = @import("input/platform.zig");
 
 pub const max_outputs = 4;
 pub const device_path = "/dev/dri/headless";
@@ -85,7 +90,15 @@ pub const Config = struct {
     /// When set, every presented frame of the first output is written here
     /// as a binary PPM (P6), replacing the previous file atomically.
     frame_dump_path: ?[]const u8 = null,
+    /// When set, a Unix datagram socket is bound here and each datagram is
+    /// one input command: `motion DX DY`, `button CODE 0|1`, `key CODE 0|1`,
+    /// or `scroll VERTICAL HORIZONTAL` (wheel steps of 15 units).
+    input_socket_path: ?[]const u8 = null,
 };
+
+const input_device: input.DeviceRef = 1;
+const input_queue_capacity = 256;
+const max_input_datagram = 256;
 
 const Request = struct {
     crtc: u32 = 0,
@@ -135,6 +148,12 @@ pub const Backend = struct {
     next_framebuffer: u32 = 1,
     next_blob: u32 = 1,
     frames_dumped: usize = 0,
+    input_fd: linux.fd_t = -1,
+    input_path: ?[]const u8 = null,
+    input_queue: [input_queue_capacity]input.RawEvent = undefined,
+    input_head: usize = 0,
+    input_len: usize = 0,
+    input_dropped: usize = 0,
 
     pub fn create(allocator: std.mem.Allocator, config: Config) !*Backend {
         if (config.outputs.len == 0 or config.outputs.len > max_outputs) return error.InvalidOutputCount;
@@ -149,6 +168,8 @@ pub const Backend = struct {
         const timer = linux.timerfd_create(.MONOTONIC, .{ .NONBLOCK = true, .CLOEXEC = true });
         if (linux.errno(timer) != .SUCCESS) return error.TimerCreateFailed;
         self.timer_fd = @intCast(timer);
+        errdefer _ = linux.close(self.timer_fd);
+        if (config.input_socket_path) |path| try self.bindInput(path);
         return self;
     }
 
@@ -159,7 +180,19 @@ pub const Backend = struct {
         };
         if (self.timer_fd >= 0) _ = linux.close(self.timer_fd);
         if (self.seat_fd >= 0) _ = linux.close(self.seat_fd);
+        if (self.input_fd >= 0) _ = linux.close(self.input_fd);
+        if (self.input_path) |path| {
+            var storage: [std.fs.max_path_bytes]u8 = undefined;
+            if (std.fmt.bufPrintZ(&storage, "{s}", .{path})) |path_z| {
+                _ = linux.unlink(path_z.ptr);
+            } else |_| {}
+        }
         self.allocator.destroy(self);
+    }
+
+    /// Only meaningful when `Config.input_socket_path` was set.
+    pub fn inputPlatform(self: *Backend) input.Platform {
+        return .{ .context = self, .vtable = &input_vtable };
     }
 
     pub fn sessionPlatform(self: *Backend) session.Platform {
@@ -445,6 +478,130 @@ pub const Backend = struct {
         return null;
     }
 
+    // Input: a datagram socket parsed into libinput-shaped raw events.
+
+    const input_vtable: input.Platform.VTable = .{
+        .create = createInput,
+        .destroy = destroyInput,
+        .get_fd = inputFd,
+        .dispatch = dispatchInput,
+        .next_event = nextInputEvent,
+        .suspend_context = suspendInput,
+        .resume_context = resumeInput,
+        .device_configuration = inputDeviceConfiguration,
+        .apply_configuration = applyInputConfiguration,
+    };
+
+    fn bindInput(self: *Backend, path: []const u8) !void {
+        var address: linux.sockaddr.un = .{ .path = @splat(0) };
+        if (path.len == 0 or path.len >= address.path.len) return error.InputPathTooLong;
+        @memcpy(address.path[0..path.len], path);
+        const socket = linux.socket(linux.AF.UNIX, linux.SOCK.DGRAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
+        if (linux.errno(socket) != .SUCCESS) return error.InputSocketFailed;
+        const fd: linux.fd_t = @intCast(socket);
+        errdefer _ = linux.close(fd);
+        _ = linux.unlink(@ptrCast(&address.path));
+        if (linux.errno(linux.bind(fd, @ptrCast(&address), @sizeOf(linux.sockaddr.un))) != .SUCCESS) return error.InputBindFailed;
+        self.input_fd = fd;
+        self.input_path = path;
+    }
+
+    fn createInput(context: *anyopaque, _: *input.Restricted, _: [:0]const u8) !*anyopaque {
+        const self: *Backend = @ptrCast(@alignCast(context));
+        if (self.input_fd < 0) return error.InputUnavailable;
+        var info: input.DeviceInfo = .{ .capabilities = .{ .pointer = true, .keyboard = true } };
+        const name = "Ouro headless input";
+        @memcpy(info.name[0..name.len], name);
+        info.name_len = name.len;
+        self.pushInput(.{ .device_added = .{ .device = input_device, .info = info } });
+        return context;
+    }
+    fn destroyInput(context: *anyopaque, _: *anyopaque) void {
+        const self: *Backend = @ptrCast(@alignCast(context));
+        self.input_len = 0;
+        self.input_head = 0;
+    }
+    fn inputFd(context: *anyopaque, _: *anyopaque) !linux.fd_t {
+        const self: *Backend = @ptrCast(@alignCast(context));
+        return self.input_fd;
+    }
+    fn dispatchInput(context: *anyopaque, _: *anyopaque) !void {
+        const self: *Backend = @ptrCast(@alignCast(context));
+        var datagram: [max_input_datagram]u8 = undefined;
+        while (true) {
+            const result = linux.recvfrom(self.input_fd, &datagram, datagram.len, 0, null, null);
+            switch (linux.errno(result)) {
+                .SUCCESS => {},
+                .AGAIN, .INTR => return,
+                else => return error.InputReadFailed,
+            }
+            if (result == 0) return;
+            const line = std.mem.trim(u8, datagram[0..result], " \t\r\n");
+            const event = parseInputCommand(line, monotonicNs() / std.time.ns_per_us) catch |err| {
+                std.log.warn("headless input: ignoring '{s}': {t}", .{ line, err });
+                continue;
+            };
+            self.pushInput(event);
+        }
+    }
+    fn nextInputEvent(context: *anyopaque, _: *anyopaque) !?input.RawEvent {
+        const self: *Backend = @ptrCast(@alignCast(context));
+        if (self.input_len == 0) return null;
+        const event = self.input_queue[self.input_head];
+        self.input_head = (self.input_head + 1) % input_queue_capacity;
+        self.input_len -= 1;
+        return event;
+    }
+    fn suspendInput(_: *anyopaque, _: *anyopaque) !void {}
+    fn resumeInput(_: *anyopaque, _: *anyopaque) !void {}
+    fn inputDeviceConfiguration(_: *anyopaque, _: input.DeviceRef) !input.DeviceConfiguration {
+        return .{ .send_events = .{ .default = .{}, .current = .{} } };
+    }
+    fn applyInputConfiguration(_: *anyopaque, _: input.DeviceRef, _: input.Configuration) !input.ApplyResult {
+        return .{};
+    }
+
+    fn pushInput(self: *Backend, event: input.RawEvent) void {
+        if (self.input_len == input_queue_capacity) {
+            self.input_dropped += 1;
+            return;
+        }
+        self.input_queue[(self.input_head + self.input_len) % input_queue_capacity] = event;
+        self.input_len += 1;
+    }
+
+    fn parseInputCommand(line: []const u8, time_usec: u64) !input.RawEvent {
+        var words = std.mem.tokenizeAny(u8, line, " \t");
+        const command = words.next() orelse return error.EmptyCommand;
+        if (std.mem.eql(u8, command, "motion")) {
+            const dx = try std.fmt.parseFloat(f64, words.next() orelse return error.MissingArgument);
+            const dy = try std.fmt.parseFloat(f64, words.next() orelse return error.MissingArgument);
+            if (words.next() != null) return error.TrailingArgument;
+            return .{ .pointer_motion = .{ .device = input_device, .time_usec = time_usec, .dx = dx, .dy = dy, .dx_unaccel = dx, .dy_unaccel = dy } };
+        }
+        if (std.mem.eql(u8, command, "button") or std.mem.eql(u8, command, "key")) {
+            const code = try std.fmt.parseInt(u32, words.next() orelse return error.MissingArgument, 10);
+            const state = try std.fmt.parseInt(u1, words.next() orelse return error.MissingArgument, 10);
+            if (words.next() != null) return error.TrailingArgument;
+            if (command[0] == 'b')
+                return .{ .pointer_button = .{ .device = input_device, .time_usec = time_usec, .button = code, .pressed = state == 1 } };
+            return .{ .keyboard_key = .{ .device = input_device, .time_usec = time_usec, .key = code, .pressed = state == 1 } };
+        }
+        if (std.mem.eql(u8, command, "scroll")) {
+            const vertical = try std.fmt.parseFloat(f64, words.next() orelse return error.MissingArgument);
+            const horizontal = try std.fmt.parseFloat(f64, words.next() orelse return error.MissingArgument);
+            if (words.next() != null) return error.TrailingArgument;
+            return .{ .pointer_axis = .{
+                .device = input_device,
+                .time_usec = time_usec,
+                .source = .wheel,
+                .vertical = if (vertical != 0) .{ .value = vertical * 15, .value120 = vertical * 120 } else null,
+                .horizontal = if (horizontal != 0) .{ .value = horizontal * 15, .value120 = horizontal * 120 } else null,
+            } };
+        }
+        return error.UnknownCommand;
+    }
+
     // Atomic commits and simulated vblanks.
 
     const atomic_vtable: atomic.Platform.VTable = .{
@@ -722,4 +879,50 @@ test "headless: frame dump writes the scanned-out framebuffer as PPM" {
     const read = linux.read(fd, &contents, contents.len);
     try std.testing.expect(linux.errno(read) == .SUCCESS);
     try std.testing.expectEqualSlices(u8, "P6\n2 1\n255\n" ++ [_]u8{ 0xff, 0, 0, 0, 0, 0xff }, contents[0..read]);
+}
+
+test "headless: input datagrams become raw device events in order" {
+    const allocator = std.testing.allocator;
+    var path_storage: [96]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_storage, "/tmp/ouro-headless-input-{d}.sock", .{linux.getpid()});
+    const backend = try Backend.create(allocator, .{
+        .outputs = &.{.{ .width = 2, .height = 1 }},
+        .input_socket_path = path,
+    });
+    defer backend.destroy();
+    const platform = backend.inputPlatform();
+    var restricted: input.Restricted = undefined;
+    const context = try platform.createContext(&restricted, "seat0");
+    try std.testing.expectEqual(backend.input_fd, try platform.getFd(context));
+    // The device announces itself before any command arrives.
+    const added = (try platform.nextEvent(context)) orelse return error.MissingDevice;
+    try std.testing.expect(added == .device_added);
+    try std.testing.expect(added.device_added.info.capabilities.pointer and added.device_added.info.capabilities.keyboard);
+    try std.testing.expect((try platform.nextEvent(context)) == null);
+
+    const sender = linux.socket(linux.AF.UNIX, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    try std.testing.expect(linux.errno(sender) == .SUCCESS);
+    const sender_fd: linux.fd_t = @intCast(sender);
+    defer _ = linux.close(sender_fd);
+    var address: linux.sockaddr.un = .{ .path = @splat(0) };
+    @memcpy(address.path[0..path.len], path);
+    for ([_][]const u8{ "motion 12.5 -3", "key 125 1", "button 272 1", "bogus 1", "scroll -1 0", "button 272 0 extra" }) |line| {
+        const sent = linux.sendto(sender_fd, line.ptr, line.len, 0, @ptrCast(&address), @sizeOf(linux.sockaddr.un));
+        try std.testing.expectEqual(line.len, sent);
+    }
+    try platform.dispatch(context);
+    const motion = (try platform.nextEvent(context)) orelse return error.MissingEvent;
+    try std.testing.expectEqual(@as(f64, 12.5), motion.pointer_motion.dx);
+    try std.testing.expectEqual(@as(f64, -3), motion.pointer_motion.dy);
+    const key = (try platform.nextEvent(context)) orelse return error.MissingEvent;
+    try std.testing.expectEqual(@as(u32, 125), key.keyboard_key.key);
+    try std.testing.expect(key.keyboard_key.pressed);
+    const button = (try platform.nextEvent(context)) orelse return error.MissingEvent;
+    try std.testing.expectEqual(@as(u32, 272), button.pointer_button.button);
+    // Malformed datagrams are skipped without losing the ones after them.
+    const scroll = (try platform.nextEvent(context)) orelse return error.MissingEvent;
+    try std.testing.expectEqual(@as(f64, -15), scroll.pointer_axis.vertical.?.value);
+    try std.testing.expect(scroll.pointer_axis.horizontal == null);
+    try std.testing.expect((try platform.nextEvent(context)) == null);
+    platform.destroyContext(context);
 }

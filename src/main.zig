@@ -28,6 +28,7 @@ const Options = struct {
     headless_outputs: [ouro.backend_headless.max_outputs]ouro.backend_headless.OutputSpec = undefined,
     headless_output_count: usize = 0,
     headless_frame_dump: ?[]const u8 = null,
+    headless_input: ?[]const u8 = null,
     disable_hdr: bool = false,
     trace_pacing: bool = false,
     hardware_cursor: bool = true,
@@ -68,7 +69,7 @@ pub fn main(init: std.process.Init) !void {
     // `--headless` alone runs an in-process virtual card; with `--drm-device`
     // it drives a real (typically vkms) device without libseat or input.
     const virtual_card = options.headless and options.drm_device == null;
-    if (!virtual_card and (options.headless_output_count != 0 or options.headless_frame_dump != null)) {
+    if (!virtual_card and (options.headless_output_count != 0 or options.headless_frame_dump != null or options.headless_input != null)) {
         usage();
         return error.InvalidHeadlessOptions;
     }
@@ -86,6 +87,7 @@ pub fn main(init: std.process.Init) !void {
         headless_backend = try ouro.backend_headless.Backend.create(allocator, .{
             .outputs = if (options.headless_output_count == 0) &default_output else options.headless_outputs[0..options.headless_output_count],
             .frame_dump_path = options.headless_frame_dump,
+            .input_socket_path = options.headless_input,
         });
     }
     const managed_socket = if (options.socket == null and options.managed_session)
@@ -192,7 +194,7 @@ pub fn main(init: std.process.Init) !void {
     );
     const platforms: Runtime.Platforms = if (headless_backend) |backend| .{
         .session = backend.sessionPlatform(),
-        .input = null,
+        .input = if (options.headless_input != null) backend.inputPlatform() else null,
         .hotplug = null,
         .drm = backend.drmPlatform(),
         .gamma = backend.gammaPlatform(),
@@ -650,6 +652,9 @@ fn parseOptions(args: std.process.Args) !Options {
         } else if (std.mem.startsWith(u8, argument, "--headless-frame-dump=")) {
             options.headless_frame_dump = argument["--headless-frame-dump=".len..];
             if (options.headless_frame_dump.?.len == 0) return error.InvalidHeadlessFrameDump;
+        } else if (std.mem.startsWith(u8, argument, "--headless-input=")) {
+            options.headless_input = argument["--headless-input=".len..];
+            if (options.headless_input.?.len == 0) return error.InvalidHeadlessInput;
         } else if (std.mem.eql(u8, argument, "--disable-hdr")) {
             options.disable_hdr = true;
         } else if (std.mem.eql(u8, argument, "--trace-pacing")) {
@@ -665,7 +670,7 @@ fn parseOptions(args: std.process.Args) !Options {
 
 fn usage() void {
     std.debug.print(
-        \\usage: ouro [--socket=PATH] [--renderer=auto|pixman|vulkan] [--drm-device=PATH] [--config=PATH] [--managed-session] [--headless] [--headless-output=WxH[@HZ]]... [--headless-frame-dump=PATH]
+        \\usage: ouro [--socket=PATH] [--renderer=auto|pixman|vulkan] [--drm-device=PATH] [--config=PATH] [--managed-session] [--headless] [--headless-output=WxH[@HZ]]... [--headless-frame-dump=PATH] [--headless-input=PATH]
         \\
         \\  auto    try Vulkan, then fall back to Pixman at startup
         \\  pixman  require the CPU Pixman renderer
@@ -685,6 +690,8 @@ fn usage() void {
         \\                 card, otherwise scan out an in-process virtual card with Pixman
         \\  --headless-output=WxH[@HZ]  add a virtual output (repeatable, up to 4; default 1920x1080@60)
         \\  --headless-frame-dump=PATH  write each presented frame of the first virtual output as PPM
+        \\  --headless-input=PATH  bind a Unix datagram socket; each datagram is one device event:
+        \\                 "motion DX DY", "button CODE 0|1", "key CODE 0|1", "scroll V H"
         \\  SIGHUP        reload --config sources; ourosettings updates arrive automatically
         \\
     , .{});
