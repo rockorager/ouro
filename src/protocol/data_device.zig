@@ -503,7 +503,7 @@ pub fn Adapter(comptime protocol: type) type {
                     }
                 },
                 .destroy => {},
-                .accept => |payload| if (offer.kind == .drag and offer.current) {
+                .accept => |payload| if (offer.kind == .drag and (offer.current or offer.dropped)) {
                     const source = self.resolveSource(offer.source) catch
                         return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "drag source is gone");
                     const mime_index = if (payload.mime_type) |mime_type|
@@ -525,7 +525,7 @@ pub fn Adapter(comptime protocol: type) type {
                 .set_actions => |payload| {
                     const ask = protocol.wl_data_device_manager.dnd_action.ask.value;
                     const post_drop_ask = offer.dropped and offer.selected_action == ask;
-                    if (offer.kind == .selection or (!offer.current and !post_drop_ask))
+                    if (offer.kind == .selection or (!offer.current and !offer.dropped))
                         return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "offer is not an active drag target");
                     const valid_actions = dragActionMask();
                     const actions = payload.dnd_actions.value;
@@ -542,13 +542,13 @@ pub fn Adapter(comptime protocol: type) type {
                         return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_action.value, "ask drop requires a final source-supported action");
                     const selected = selectDragAction(source_actions, actions, preferred);
                     if (selected != offer.selected_action) {
-                        const needed: usize = if (post_drop_ask) 1 else 2;
+                        const needed: usize = if (offer.dropped) 1 else 2;
                         self.ensureOutbound(needed) catch return try self.noMemory(actor);
                         self.enqueue(source.peer, .{ .source_action = .{
                             .source = offer.source,
                             .action = selected,
                         } }) catch unreachable;
-                        if (!post_drop_ask)
+                        if (!offer.dropped)
                             self.enqueue(offer.peer, .{ .offer_action = .{
                                 .offer = self.offerId(offer),
                                 .action = selected,
@@ -1685,6 +1685,88 @@ test "data device: accepted drag drops once and retains finish publication" {
     try std.testing.expectEqual(@as(usize, 3), adapter.pendingOutbound());
     try std.testing.expectEqual(TestAdapter.Outbound.source_finished, std.meta.activeTag(adapter.outbound[2].value));
     try std.testing.expectError(error.InvalidFinish, adapter.finishOffer(offer));
+}
+
+test "data device: dropped offers accept final actions and MIME until finish" {
+    const action = test_protocol.wl_data_device_manager.dnd_action;
+    for ([_]u32{ action.copy.value, action.move.value, action.ask.value }) |initial_action| {
+        var adapter = try testAdapter(.{});
+        defer adapter.deinit();
+        var server_objects = try objects.ServerObjects.init(std.testing.allocator, 16, 8, &test_protocol.wl_display.info, null);
+        defer server_objects.deinit(std.testing.allocator);
+        var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 512, 8);
+        defer blocks.deinit(std.testing.allocator);
+        var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+        defer descriptors.deinit(std.testing.allocator);
+        var fragment_storage: [64]u8 = undefined;
+        var actor = wayring.connection.Actor.init(0, 1, &fragment_storage, &descriptors, 0, &blocks, 512, 0);
+        defer actor.deinit();
+        const peer: wayring.io_uring.Peer = .{ .slot = 0, .generation = 1 };
+        const source = try adapter.acquireSource();
+        source.peer = peer;
+        source.header.resource = try server_objects.insertClient(4, &test_protocol.wl_data_source.info, 3, source);
+        source.drag_actions = action.copy.value | action.move.value | action.ask.value;
+        try adapter.addMime(source, "text/uri-list");
+        try adapter.addMime(source, "text/plain");
+        const offer = try acquire(TestAdapter.OfferSlot, adapter.allocator, &adapter.offers, &adapter.offer_free);
+        offer.peer = peer;
+        offer.source = adapter.sourceId(source);
+        offer.kind = .drag;
+        offer.dropped = true;
+        offer.selected_action = initial_action;
+        offer.accepted_mime = 0;
+        offer.header.resource = try server_objects.createLocal(&test_protocol.wl_data_offer.info, 3, offer);
+
+        // GTK narrows the actions after drop, even when move was already selected.
+        const requests = [_]test_protocol.wl_data_offer.Request{
+            .{ .set_actions = .{ .dnd_actions = action.move, .preferred_action = action.move } },
+            .{ .set_actions = .{ .dnd_actions = action.move, .preferred_action = action.move } },
+            .{ .accept = .{ .serial = 1, .mime_type = "text/plain" } },
+            .{ .finish = .{} },
+        };
+        for (requests) |request| {
+            var input = wayring.tx.Queue.init(&blocks, 512, &descriptors, 0);
+            defer input.deinit();
+            try test_protocol.wl_data_offer.encodeRequest(&input, offer.header.resource.id, request);
+            var descriptor_scratch: [1]linux.fd_t = undefined;
+            var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+            const snapshot = try input.snapshot(&descriptor_scratch, &control);
+            const message = (try wayring.wire.Message.decode(snapshot.first)).?;
+            try std.testing.expectEqual(
+                wayring.dispatch.Control.continue_dispatch,
+                try adapter.offerRequest(&actor, &server_objects, offer, message, &input.descriptors),
+            );
+        }
+        try std.testing.expectEqual(action.move.value, offer.selected_action);
+        try std.testing.expectEqual(@as(?usize, 1), offer.accepted_mime);
+        try std.testing.expect(offer.finished);
+        try std.testing.expectEqual(wayring.connection.Lifecycle.open, actor.lifecycle);
+        const action_changed = initial_action != action.move.value;
+        try std.testing.expectEqual(@as(usize, if (action_changed) 3 else 2), adapter.pendingOutbound());
+        var output = wayring.tx.Queue.init(&blocks, 512, &descriptors, 0);
+        defer output.deinit();
+        _ = try adapter.flushOn(peer, &server_objects, &output);
+        var descriptor_scratch: [1]linux.fd_t = undefined;
+        var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+        const snapshot = try output.snapshot(&descriptor_scratch, &control);
+        var bytes = snapshot.first;
+        var count: usize = 0;
+        while (bytes.len != 0) : (count += 1) {
+            const message = (try wayring.wire.Message.decode(bytes)).?;
+            // No wl_data_offer.action is allowed after wl_data_device.drop.
+            try std.testing.expectEqual(source.header.resource.id, message.header.object_id);
+            const event = try test_protocol.wl_data_source.decodeEvent(message, &output.descriptors);
+            if (action_changed and count == 0) {
+                try std.testing.expectEqual(action.move.value, event.action.dnd_action.value);
+            } else if (count == @as(usize, @intFromBool(action_changed))) {
+                try std.testing.expectEqualStrings("text/plain", event.target.mime_type.?);
+            } else {
+                try std.testing.expectEqual(test_protocol.wl_data_source.Event.dnd_finished, std.meta.activeTag(event));
+            }
+            bytes = bytes[message.header.size..];
+        }
+        try std.testing.expectEqual(@as(usize, if (action_changed) 3 else 2), count);
+    }
 }
 
 test "data device: requests racing drag leave or cancellation are inert" {
