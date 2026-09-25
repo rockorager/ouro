@@ -7128,6 +7128,9 @@ pub fn Coordinator(comptime protocol: type) type {
             const cursor = if (output.hardware_cursor) |*value| value else return false;
             if (!output.accepting_frames) return false;
             const capture = physical.pending_screencopy != null or physical.pending_image_copy != null or
+                self.screencopy_adapter.outputCaptureActive(
+                    (@as(u64, physical.protocol_output.generation) << 32) | physical.protocol_output.index,
+                ) or
                 self.image_copy_capture_adapter.sourceCaptureActive();
             var sample: ?render.SurfaceSample = null;
             // Client cursor trees and rotated outputs retain the established

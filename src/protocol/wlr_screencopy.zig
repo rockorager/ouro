@@ -491,6 +491,18 @@ pub fn Adapter(comptime protocol: type) type {
             frame.phase = .finished;
         }
 
+        /// Screencopy has no session object. A manager's completed-output
+        /// baselines keep the software cursor stable between its frame requests,
+        /// until the manager is destroyed/disconnected or the output is removed.
+        pub fn outputCaptureActive(self: *const Self, output: u64) bool {
+            for (self.managers.entries.items) |manager| {
+                if (!manager.header.active) continue;
+                for (manager.baselines[0..manager.baseline_count]) |baseline|
+                    if (baseline.output == output) return true;
+            }
+            return false;
+        }
+
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
             for (self.outbound) |slot| {
                 if (!slot.active) continue;
@@ -960,6 +972,52 @@ test "screencopy: completion retains ordered success events" {
     try std.testing.expectEqual(@as(?u64, 4), adapter.managerBaseline(frame.manager, 3));
     adapter.outputRemoved(3);
     try std.testing.expectEqual(@as(?u64, null), adapter.managerBaseline(frame.manager, 3));
+}
+
+test "screencopy: capture keeps software cursors stable between frames until manager cleanup" {
+    const protocol = @import("core_protocol");
+    const A = Adapter(protocol);
+    var adapter = try A.init(std.testing.allocator, .{});
+    defer adapter.deinit();
+    const peer: wayring.io_uring.Peer = .{ .slot = 2, .generation = 7 };
+    const output: u64 = (@as(u64, 3) << 32) | 5;
+    const manager = try adapter.managers.acquire();
+    manager.peer = peer;
+    manager.resource = .{ .id = 12, .generation = 1 };
+    try std.testing.expect(!adapter.outputCaptureActive(output));
+
+    const frame = try adapter.acquireFrame();
+    frame.peer = peer;
+    frame.manager = adapter.managerId(manager);
+    frame.output_identity = output;
+    frame.phase = .capturing;
+    // Ordinary copy and cursor-excluding captures also need a stable path.
+    try adapter.complete(adapter.frameId(frame), 17, 4);
+    adapter.releaseFrame(frame.header.index);
+    try std.testing.expectEqual(@as(usize, 0), adapter.capture_count);
+    try std.testing.expect(adapter.outputCaptureActive(output));
+    try std.testing.expect(!adapter.outputCaptureActive(output + 1));
+    try std.testing.expect(!adapter.outputCaptureActive(output + (@as(u64, 1) << 32)));
+
+    const other = try adapter.managers.acquire();
+    other.peer = .{ .slot = 3, .generation = 7 };
+    try adapter.setManagerBaseline(adapter.managerId(other), output, 5);
+    try std.testing.expect(adapter.resourceRemoved(manager.resource, .{
+        .interface = &protocol.zwlr_screencopy_manager_v1.info,
+        .version = 3,
+        .context = manager,
+    }));
+    try std.testing.expect(adapter.outputCaptureActive(output));
+    adapter.disconnected(other.peer);
+    try std.testing.expect(!adapter.outputCaptureActive(output));
+
+    const replacement = try adapter.managers.acquire();
+    try std.testing.expect(!adapter.outputCaptureActive(output));
+    try adapter.setManagerBaseline(adapter.managerId(replacement), output, 6);
+    try adapter.setManagerBaseline(adapter.managerId(replacement), output + 1, 7);
+    adapter.outputRemoved(output);
+    try std.testing.expect(!adapter.outputCaptureActive(output));
+    try std.testing.expect(adapter.outputCaptureActive(output + 1));
 }
 
 test "screencopy: output removal releases queued damage waits" {
