@@ -317,7 +317,7 @@ case-sensitive, 1–128 ASCII letters, digits, underscores, hyphens, or dots;
 unqualified names are valid. Addresses support
 absolute Unix socket paths (`unix:/path`) and Linux abstract sockets
 (`unix:@name`), with no shell or environment-variable expansion. Each activation
-opens an independent nonblocking connection and consumes one reply; returned
+opens an independent asynchronous connection and consumes one reply; returned
 results are discarded and transport, JSON-RPC, or tool (`isError: true`) errors
 are logged. Unsupported interim results such as `input_required` fail rather
 than prompting or retrying. An absent `resultType` means complete as required
@@ -343,6 +343,13 @@ clients. Override the endpoint with `--mcp-socket=/absolute/path`. The parent
 directory must be private and owned by the effective UID. The socket is mode
 0600 and accepts only same-UID peers; this is user isolation, **not per-app
 authorization**. Existing socket paths are never unlinked on startup.
+
+Both MCP transports use native `connect`/`accept`, `send`, and `recv` operations
+on the compositor's shared io_uring, following Ourokit's socket ownership model.
+There is no nested epoll loop or private ring. The compositor turn remains the
+sole submitter; buffers stay owned until operation and cancellation completions
+drain. Server reads and writes progress independently, with immutable in-flight
+transmissions separate from queued replies and notifications.
 
 `server/discover`, `tools/list`, and `tools/call` expose these tools:
 
@@ -385,7 +392,8 @@ The server bounds clients and pending calls to 16 each, permits one outstanding
 tool call per connection, and limits frames to 4 MiB including the newline.
 Slow peers do not block other clients. A disconnected
 peer's queued calls are discarded; executed actions are never retried. The
-`exit` acknowledgment is best-effort before shutdown closes the connection.
+`exit` acknowledgment is best-effort: shutdown allows queued replies up to
+100 ms to flush before canceling stalled writes and closing the connection.
 
 Clients can send `subscriptions/listen` with
 `"notifications":{"toolsListChanged":true}`. Ouro acknowledges with

@@ -1,6 +1,27 @@
 //! The local MCP 2026-07-28 Unix-socket profile shared by Ouro's clients.
 const std = @import("std");
 
+/// Owned short-write cursor from Ourokit src/mcp/root.zig; see mcp.LICENSE.
+pub const Transmit = struct {
+    allocator: std.mem.Allocator,
+    bytes: []u8,
+    offset: usize = 0,
+    pub fn remaining(self: *const Transmit) []const u8 {
+        return self.bytes[self.offset..];
+    }
+    pub fn consume(self: *Transmit, count: usize) !void {
+        if (count > self.remaining().len) return error.InvalidTransmitCount;
+        self.offset += count;
+    }
+    pub fn complete(self: *const Transmit) bool {
+        return self.offset == self.bytes.len;
+    }
+    pub fn deinit(self: *Transmit) void {
+        self.allocator.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
 pub const maximum_frame_size = 4 * 1024 * 1024;
 pub const meta = .{
     .@"io.modelcontextprotocol/protocolVersion" = "2026-07-28",

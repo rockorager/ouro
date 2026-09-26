@@ -1,15 +1,15 @@
-//! Bounded, one-shot MCP tool calls. No retries: a lost reply may follow a
-//! successful side effect. One stable epoll FD integrates with the main ring.
+//! Bounded, one-shot MCP tool calls on the host's borrowed io_uring. No
+//! retries: a lost reply may follow a successful side effect.
+//! Socket state and cancellation follow Ourokit lua/mcp_client.zig at
+//! 13abbebbee43c439dfc39c7f50b052718cadba22, without Lua; see mcp.LICENSE.
 const std = @import("std");
 const mcp = @import("mcp.zig");
+const completion = @import("runtime/completion.zig");
 const linux = std.os.linux;
 const c = @cImport({
     @cInclude("errno.h");
-    @cInclude("sys/epoll.h");
     @cInclude("sys/socket.h");
-    @cInclude("sys/timerfd.h");
     @cInclude("sys/un.h");
-    @cInclude("time.h");
     @cInclude("unistd.h");
 });
 
@@ -70,42 +70,37 @@ fn socketAddress(text: []const u8) !struct { address: c.struct_sockaddr_un, leng
 }
 
 pub const Client = struct {
+    const Phase = enum { queued, connecting, sending, reading, closing };
+    const OpKind = enum { io, timeout };
+    const Operation = struct {
+        token: ?completion.Token = null,
+        cancel: ?completion.Token = null,
+        canceling: bool = false,
+        fn idle(self: Operation) bool {
+            return self.token == null and self.cancel == null;
+        }
+    };
     const Pending = struct {
-        fd: c_int,
+        fd: linux.fd_t = -1,
         call: Call,
-        state: enum { connecting, sending, reading } = .connecting,
+        address: c.struct_sockaddr_un,
+        address_length: c.socklen_t,
+        phase: Phase = .queued,
         sent: usize = 0,
         input: std.ArrayList(u8) = .empty,
+        recv_buffer: [16384]u8 = undefined,
         deadline: u64,
+        timeout: linux.kernel_timespec = undefined,
+        operations: [2]Operation = @splat(.{}),
     };
 
     allocator: std.mem.Allocator,
-    epoll_fd: c_int,
-    timer_fd: c_int,
     pending: [capacity]?Pending = @splat(null),
     stopping: bool = false,
 
+    /// May move the returned value only before the first prepare().
     pub fn init(allocator: std.mem.Allocator) !Client {
-        const ep = c.epoll_create1(c.EPOLL_CLOEXEC);
-        if (ep < 0) return error.EpollCreateFailed;
-        errdefer _ = c.close(ep);
-        const timer = c.timerfd_create(c.CLOCK_MONOTONIC, c.TFD_NONBLOCK | c.TFD_CLOEXEC);
-        if (timer < 0) return error.TimerCreateFailed;
-        errdefer _ = c.close(timer);
-        var event: c.struct_epoll_event = .{ .events = c.EPOLLIN, .data = .{ .u64 = 0 } };
-        if (c.epoll_ctl(ep, c.EPOLL_CTL_ADD, timer, &event) != 0) return error.EpollControlFailed;
-        return .{ .allocator = allocator, .epoll_fd = ep, .timer_fd = timer };
-    }
-
-    pub fn deinit(self: *Client) void {
-        for (0..capacity) |i| self.finish(i);
-        _ = c.close(self.timer_fd);
-        _ = c.close(self.epoll_fd);
-        self.* = undefined;
-    }
-
-    pub fn descriptor(self: *const Client) linux.fd_t {
-        return self.epoll_fd;
+        return .{ .allocator = allocator };
     }
 
     pub fn enqueue(self: *Client, call: Call) !void {
@@ -116,94 +111,137 @@ pub const Client = struct {
         const address = try socketAddress(call.address);
         const owned = try call.clone(self.allocator);
         errdefer owned.deinit(self.allocator);
-        const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_NONBLOCK | c.SOCK_CLOEXEC, 0);
-        if (fd < 0) return error.SocketFailed;
-        errdefer _ = c.close(fd);
-        const result = linux.connect(fd, &address.address, address.length);
-        if (linux.errno(result) != .SUCCESS and linux.errno(result) != .INPROGRESS) return error.ConnectFailed;
-        var event: c.struct_epoll_event = .{ .events = c.EPOLLOUT | c.EPOLLRDHUP, .data = .{ .u64 = index + 1 } };
-        if (c.epoll_ctl(self.epoll_fd, c.EPOLL_CTL_ADD, fd, &event) != 0) return error.EpollControlFailed;
-        errdefer _ = c.epoll_ctl(self.epoll_fd, c.EPOLL_CTL_DEL, fd, null);
-        self.pending[index] = .{ .fd = fd, .call = owned, .deadline = monotonicMs() + timeout_ms };
-        errdefer self.pending[index] = null;
-        try self.armTimer();
+        self.pending[index] = .{
+            .call = owned,
+            .address = address.address,
+            .address_length = address.length,
+            .deadline = monotonicMs() + timeout_ms,
+        };
     }
 
-    pub fn stop(self: *Client) !void {
-        self.stopping = true;
-        for (0..capacity) |i| self.finish(i);
-        // Wake, rather than close, the descriptor borrowed by the ring poll.
-        try self.armTimer();
+    /// Queues only; true means SQ/router pressure requires another turn.
+    pub fn prepare(self: *Client, ring: *linux.IoUring, router: *completion.Router) bool {
+        for (0..capacity) |i| self.prepareOne(i, ring, router) catch |err| switch (err) {
+            error.SubmissionQueueFull, error.Exhausted => return true,
+            else => {
+                self.fail(i, err);
+                return true;
+            },
+        };
+        return false;
     }
 
-    pub fn dispatch(self: *Client) !void {
-        var events: [capacity + 1]c.struct_epoll_event = undefined;
-        const n = c.epoll_wait(self.epoll_fd, &events, events.len, 0);
-        if (n < 0) {
-            if (c.__errno_location().* == c.EINTR) return;
-            return error.EpollWaitFailed;
+    fn prepareOne(self: *Client, index: usize, ring: *linux.IoUring, router: *completion.Router) !void {
+        const p = if (self.pending[index]) |*value| value else return;
+        if (p.phase != .closing and monotonicMs() >= p.deadline) self.fail(index, error.Timeout);
+        if (self.stopping and p.phase != .closing) p.phase = .closing;
+        if (p.phase == .closing) {
+            try self.cancel(index, ring, router, .io);
+            try self.cancel(index, ring, router, .timeout);
+            if (p.operations[0].idle() and p.operations[1].idle()) self.finish(index);
+            return;
         }
-        for (events[0..@intCast(n)]) |event| {
-            if (event.data.u64 == 0) {
-                var expirations: u64 = 0;
-                _ = c.read(self.timer_fd, &expirations, @sizeOf(u64));
-            } else {
-                const index: usize = @intCast(event.data.u64 - 1);
-                if (self.pending[index] != null) self.socketEvent(index, event.events) catch |err| {
-                    const call = self.pending[index].?.call;
-                    std.log.warn("MCP call {s} at {s} failed: {t}", .{ call.method, call.address, err });
-                    self.finish(index);
+        try self.prepareTimeout(p, ring, router);
+        const op = &p.operations[@intFromEnum(OpKind.io)];
+        if (!op.idle()) return;
+        if (p.phase == .queued) {
+            const fd = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+            if (linux.errno(fd) != .SUCCESS) return error.SocketFailed;
+            p.fd = @intCast(fd);
+            p.phase = .connecting;
+        }
+        const token = try router.acquire(.mcp);
+        errdefer router.retire(token) catch unreachable;
+        switch (p.phase) {
+            .connecting => _ = try ring.connect(token.encode(), p.fd, @ptrCast(&p.address), p.address_length),
+            .sending => {
+                const bytes = p.call.request[p.sent..];
+                _ = try ring.send(token.encode(), p.fd, bytes[0..@min(bytes.len, 16384)], linux.MSG.NOSIGNAL);
+            },
+            .reading => _ = try ring.recv(token.encode(), p.fd, .{ .buffer = &p.recv_buffer }, 0),
+            else => unreachable,
+        }
+        op.token = token;
+    }
+
+    fn prepareTimeout(self: *Client, p: *Pending, ring: *linux.IoUring, router: *completion.Router) !void {
+        _ = self;
+        const op = &p.operations[@intFromEnum(OpKind.timeout)];
+        if (!op.idle()) return;
+        const token = try router.acquire(.mcp);
+        errdefer router.retire(token) catch unreachable;
+        p.timeout = .{ .sec = @intCast(p.deadline / 1000), .nsec = @intCast((p.deadline % 1000) * std.time.ns_per_ms) };
+        _ = try ring.timeout(token.encode(), &p.timeout, 0, linux.IORING_TIMEOUT_ABS);
+        op.token = token;
+    }
+
+    fn cancel(self: *Client, index: usize, ring: *linux.IoUring, router: *completion.Router, kind: OpKind) !void {
+        const op = &self.pending[index].?.operations[@intFromEnum(kind)];
+        const target = op.token orelse return;
+        if (op.canceling) return;
+        const token = try router.acquire(.mcp);
+        errdefer router.retire(token) catch unreachable;
+        if (kind == .timeout) _ = try ring.timeout_remove(token.encode(), target.encode(), 0) else _ = try ring.cancel(token.encode(), target.encode(), 0);
+        op.cancel = token;
+        op.canceling = true;
+    }
+
+    pub fn complete(self: *Client, router: *completion.Router, token: completion.Token, result: i32) !void {
+        for (0..capacity) |i| if (self.pending[i]) |*p| {
+            inline for (std.meta.tags(OpKind)) |kind| {
+                const op = &p.operations[@intFromEnum(kind)];
+                if (op.cancel) |cancel_token| if (std.meta.eql(cancel_token, token)) {
+                    try router.retire(token);
+                    op.cancel = null;
+                    if (op.token == null) op.* = .{};
+                    if (result != 0 and result != negative(.NOENT) and result != negative(.ALREADY) and result != negative(.BUSY)) self.fail(i, error.CancellationFailed);
+                    return;
+                };
+                if (op.token) |target| if (std.meta.eql(target, token)) {
+                    const canceled = op.canceling;
+                    try router.retire(token);
+                    op.token = null;
+                    if (op.cancel == null) op.* = .{};
+                    if (p.phase == .closing or (kind == .timeout and canceled)) return;
+                    self.handle(i, kind, result) catch |err| self.fail(i, err);
+                    return;
                 };
             }
-        }
-        const now = monotonicMs();
-        for (self.pending, 0..) |pending, i| if (pending) |p| {
-            if (p.deadline <= now) {
-                std.log.warn("MCP call {s} at {s} timed out; not retrying", .{ p.call.method, p.call.address });
-                self.finish(i);
-            }
         };
-        if (!self.stopping) try self.armTimer();
+        return error.UnknownMcpCompletion;
     }
 
-    fn socketEvent(self: *Client, index: usize, flags: u32) !void {
+    fn handle(self: *Client, index: usize, kind: OpKind, result: i32) !void {
         const p = &self.pending[index].?;
-        if (p.state == .connecting and flags & c.EPOLLOUT != 0) {
-            var socket_error: c_int = 0;
-            var length: c.socklen_t = @sizeOf(c_int);
-            if (c.getsockopt(p.fd, c.SOL_SOCKET, c.SO_ERROR, &socket_error, &length) != 0 or socket_error != 0)
-                return error.ConnectFailed;
-            p.state = .sending;
+        if (kind == .timeout) {
+            if (result != negative(.TIME)) return error.UnexpectedTimeoutResult;
+            return error.Timeout;
         }
-        if (p.state == .sending and flags & c.EPOLLOUT != 0) {
-            const bytes = p.call.request[p.sent..];
-            const n = c.send(p.fd, bytes.ptr, @min(bytes.len, 16384), c.MSG_NOSIGNAL);
-            if (n > 0) p.sent += @intCast(n) else if (n < 0 and (c.__errno_location().* == c.EAGAIN or c.__errno_location().* == c.EINTR)) return else return error.SendFailed;
-            if (p.sent == p.call.request.len) {
-                p.state = .reading;
-                var event: c.struct_epoll_event = .{ .events = c.EPOLLIN | c.EPOLLRDHUP, .data = .{ .u64 = index + 1 } };
-                if (c.epoll_ctl(self.epoll_fd, c.EPOLL_CTL_MOD, p.fd, &event) != 0) return error.EpollControlFailed;
-            }
-        }
-        if (p.state == .reading and flags & (c.EPOLLIN | c.EPOLLHUP | c.EPOLLRDHUP) != 0) {
-            var bytes: [16384]u8 = undefined;
-            const n = c.recv(p.fd, &bytes, bytes.len, 0);
-            if (n > 0) {
-                const received = bytes[0..@intCast(n)];
-                const end = std.mem.indexOfScalar(u8, received, '\n');
-                const frame = received[0 .. end orelse received.len];
+        if (result == negative(.INTR) or result == negative(.AGAIN)) return;
+        switch (p.phase) {
+            .connecting => {
+                if (result < 0) return error.ConnectFailed;
+                p.phase = .sending;
+            },
+            .sending => {
+                if (result <= 0) return error.SendFailed;
+                p.sent += @intCast(result);
+                if (p.sent == p.call.request.len) p.phase = .reading;
+            },
+            .reading => {
+                if (result <= 0) return error.Disconnected;
+                const bytes = p.recv_buffer[0..@intCast(result)];
+                const end = std.mem.indexOfScalar(u8, bytes, '\n');
+                const frame = bytes[0 .. end orelse bytes.len];
                 if (p.input.items.len + frame.len >= maximum_frame_size) return error.ReplyTooLarge;
                 try p.input.appendSlice(self.allocator, frame);
                 if (end != null) {
                     try self.parseReply(p.call, p.input.items);
-                    self.finish(index);
+                    p.phase = .closing;
                 }
-                // Drain buffered data over later turns, even with HUP set.
-                return;
-            } else if (n < 0 and (c.__errno_location().* == c.EAGAIN or c.__errno_location().* == c.EINTR)) return;
-            return error.Disconnected;
+            },
+            else => unreachable,
         }
-        if (flags & (c.EPOLLERR | c.EPOLLHUP | c.EPOLLRDHUP) != 0) return error.Disconnected;
     }
 
     fn parseReply(self: *Client, call: Call, frame: []const u8) !void {
@@ -218,96 +256,51 @@ pub const Client = struct {
         }
     }
 
+    fn fail(self: *Client, index: usize, err: anyerror) void {
+        const p = if (self.pending[index]) |*value| value else return;
+        if (p.phase == .closing) return;
+        std.log.warn("MCP call {s} at {s} failed: {t}; not retrying", .{ p.call.method, p.call.address, err });
+        p.phase = .closing;
+    }
+
     fn finish(self: *Client, index: usize) void {
         if (self.pending[index]) |*p| {
-            _ = c.epoll_ctl(self.epoll_fd, c.EPOLL_CTL_DEL, p.fd, null);
-            _ = c.close(p.fd);
+            std.debug.assert(p.operations[0].idle() and p.operations[1].idle());
+            if (p.fd >= 0) _ = linux.close(p.fd);
             p.call.deinit(self.allocator);
             p.input.deinit(self.allocator);
             self.pending[index] = null;
         }
     }
 
-    fn armTimer(self: *Client) !void {
-        var deadline: ?u64 = if (self.stopping) monotonicMs() + 1 else null;
-        for (self.pending) |pending| if (pending) |p| {
-            deadline = @min(deadline orelse p.deadline, p.deadline);
-        };
-        const milliseconds = deadline orelse 0;
-        const spec: c.struct_itimerspec = .{ .it_interval = .{ .tv_sec = 0, .tv_nsec = 0 }, .it_value = .{
-            .tv_sec = @intCast(milliseconds / 1000),
-            .tv_nsec = @intCast((milliseconds % 1000) * std.time.ns_per_ms),
-        } };
-        if (c.timerfd_settime(self.timer_fd, c.TFD_TIMER_ABSTIME, &spec, null) != 0) return error.TimerArmFailed;
+    pub fn stop(self: *Client) void {
+        self.stopping = true;
+        for (0..capacity) |i| {
+            if (self.pending[i]) |*p| {
+                if (p.phase == .queued)
+                    self.finish(i)
+                else
+                    p.phase = .closing;
+            }
+        }
+    }
+    pub fn drained(self: *const Client) bool {
+        for (self.pending) |p| if (p != null) return false;
+        return true;
+    }
+    pub fn deinit(self: *Client) void {
+        for (0..capacity) |i| self.finish(i);
+        self.* = undefined;
     }
 };
 
+fn negative(err: linux.E) i32 {
+    return -@as(i32, @intFromEnum(err));
+}
 fn monotonicMs() u64 {
-    var now: c.struct_timespec = undefined;
-    if (c.clock_gettime(c.CLOCK_MONOTONIC, &now) != 0) unreachable;
-    return @as(u64, @intCast(now.tv_sec)) * 1000 + @as(u64, @intCast(now.tv_nsec)) / std.time.ns_per_ms;
-}
-
-// Linux autobinds a unique abstract socket when only sun_family is supplied.
-// The tests use real nonblocking sockets, not mocks or the user's services.
-const TestServer = struct {
-    listener: c_int,
-    address: []u8,
-
-    fn init() !TestServer {
-        const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_NONBLOCK | c.SOCK_CLOEXEC, 0);
-        if (fd < 0) return error.SocketFailed;
-        errdefer _ = c.close(fd);
-        var address = std.mem.zeroes(c.struct_sockaddr_un);
-        address.sun_family = c.AF_UNIX;
-        if (linux.errno(linux.bind(fd, @ptrCast(&address), @offsetOf(c.struct_sockaddr_un, "sun_path"))) != .SUCCESS) return error.BindFailed;
-        if (c.listen(fd, capacity) != 0) return error.ListenFailed;
-        var length: c.socklen_t = @sizeOf(c.struct_sockaddr_un);
-        if (c.getsockname(fd, @ptrCast(&address), &length) != 0) return error.AddressFailed;
-        const name = address.sun_path[1 .. length - @offsetOf(c.struct_sockaddr_un, "sun_path")];
-        return .{ .listener = fd, .address = try std.fmt.allocPrint(std.testing.allocator, "unix:@{s}", .{name}) };
-    }
-
-    fn deinit(self: TestServer) void {
-        _ = c.close(self.listener);
-        std.testing.allocator.free(self.address);
-    }
-
-    fn call(self: TestServer) Call {
-        return .{ .address = self.address, .method = "org.example.Shell.Toggle", .request = test_request };
-    }
-
-    fn accept(self: TestServer) !c_int {
-        const fd = linux.accept4(self.listener, null, null, linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC);
-        if (linux.errno(fd) != .SUCCESS) return error.AcceptFailed;
-        return @intCast(fd);
-    }
-};
-
-const test_request = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"org.example.Shell.Toggle\",\"arguments\":{\"output\":\"DP-2\",\"enabled\":false},\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{},\"io.modelcontextprotocol/clientInfo\":{\"name\":\"ouro\",\"version\":\"0.0.0\"}}}}\n";
-const test_reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"content\":[]}}\n";
-
-fn expectRequest(client: *Client, peer: c_int, expected: []const u8) !void {
-    const received = try std.testing.allocator.alloc(u8, expected.len);
-    defer std.testing.allocator.free(received);
-    var count: usize = 0;
-    const deadline = monotonicMs() + 2000;
-    while (count < received.len and monotonicMs() < deadline) {
-        try client.dispatch();
-        const n = c.recv(peer, received[count..].ptr, received.len - count, 0);
-        if (n > 0) count += @intCast(n) else if (n < 0 and c.__errno_location().* == c.EAGAIN) continue else return error.ReadFailed;
-    }
-    try std.testing.expectEqualStrings(expected, received[0..count]);
-}
-
-fn sendReply(peer: c_int, bytes: []const u8) !void {
-    try std.testing.expectEqual(@as(isize, @intCast(bytes.len)), c.send(peer, bytes.ptr, bytes.len, c.MSG_NOSIGNAL));
-}
-
-fn expectIdle(client: *Client) !void {
-    for (client.pending) |pending| try std.testing.expect(pending == null);
-    var fds = [_]linux.pollfd{.{ .fd = client.descriptor(), .events = linux.POLL.IN, .revents = 0 }};
-    try std.testing.expectEqual(@as(usize, 0), linux.poll(&fds, 1, 0));
+    var now: linux.timespec = undefined;
+    if (linux.errno(linux.clock_gettime(.MONOTONIC, &now)) != .SUCCESS) unreachable;
+    return @as(u64, @intCast(now.sec)) * 1000 + @as(u64, @intCast(now.nsec)) / std.time.ns_per_ms;
 }
 
 test "MCP preparation enforces exact address tool name and request size limits" {
@@ -355,38 +348,112 @@ test "MCP preparation enforces exact address tool name and request size limits" 
     try std.testing.expectError(error.CallTooLarge, Call.init(std.testing.allocator, "unix:/tmp/s", "org.example.Ping", parameters));
 }
 
-test "MCP fragmented reply, owned request, independent calls and idle readiness" {
+const test_io = @import("runtime/socket_test.zig");
+const test_request = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"}\n";
+const test_reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"content\":[]}}\n";
+
+// Ourokit's client tests also use a real abstract Unix listener. This peer
+// stays nonblocking so the test thread can drive the borrowed ring itself.
+const TestServer = struct {
+    listener: c_int,
+    address: []u8,
+
+    fn init() !TestServer {
+        const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_NONBLOCK | c.SOCK_CLOEXEC, 0);
+        if (fd < 0) return error.SocketFailed;
+        errdefer _ = c.close(fd);
+        var address = std.mem.zeroes(c.struct_sockaddr_un);
+        address.sun_family = c.AF_UNIX;
+        if (linux.errno(linux.bind(fd, @ptrCast(&address), @offsetOf(c.struct_sockaddr_un, "sun_path"))) != .SUCCESS) return error.BindFailed;
+        if (c.listen(fd, capacity) != 0) return error.ListenFailed;
+        var length: c.socklen_t = @sizeOf(c.struct_sockaddr_un);
+        if (c.getsockname(fd, @ptrCast(&address), &length) != 0) return error.AddressFailed;
+        const name = address.sun_path[1 .. length - @offsetOf(c.struct_sockaddr_un, "sun_path")];
+        return .{ .listener = fd, .address = try std.fmt.allocPrint(std.testing.allocator, "unix:@{s}", .{name}) };
+    }
+    fn deinit(self: TestServer) void {
+        _ = c.close(self.listener);
+        std.testing.allocator.free(self.address);
+    }
+    fn call(self: TestServer) Call {
+        return .{ .address = self.address, .method = "org.example.Toggle", .request = test_request };
+    }
+    fn accept(self: TestServer, client: *Client, io: *test_io.Loop) !c_int {
+        const deadline = monotonicMs() + 2000;
+        while (monotonicMs() < deadline) {
+            try io.tick(client);
+            const fd = linux.accept4(self.listener, null, null, linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC);
+            if (linux.errno(fd) == .SUCCESS) return @intCast(fd);
+            if (linux.errno(fd) != .AGAIN) return error.AcceptFailed;
+        }
+        return error.AcceptTimeout;
+    }
+};
+
+fn expectRequest(client: *Client, io: *test_io.Loop, peer: c_int, expected: []const u8) !void {
+    const bytes = try std.testing.allocator.alloc(u8, expected.len);
+    defer std.testing.allocator.free(bytes);
+    var count: usize = 0;
+    const deadline = monotonicMs() + 2000;
+    while (count < bytes.len and monotonicMs() < deadline) {
+        try io.tick(client);
+        const n = c.recv(peer, bytes[count..].ptr, bytes.len - count, 0);
+        if (n > 0) count += @intCast(n) else if (n < 0 and c.__errno_location().* == c.EAGAIN) continue else return error.ReadFailed;
+    }
+    try std.testing.expectEqualStrings(expected, bytes[0..count]);
+}
+fn sendReply(peer: c_int, bytes: []const u8) !void {
+    try std.testing.expectEqual(@as(isize, @intCast(bytes.len)), c.send(peer, bytes.ptr, bytes.len, c.MSG_NOSIGNAL));
+}
+fn waitIdle(client: *Client, io: *test_io.Loop) !void {
+    const deadline = monotonicMs() + 2000;
+    while (!client.drained()) {
+        if (monotonicMs() >= deadline) return error.CallTimeout;
+        try io.tick(client);
+    }
+    try std.testing.expectEqual(@as(usize, 0), io.router.active_count);
+}
+
+test "MCP native fragmented replies and owned requests progress independently" {
     var client = try Client.init(std.testing.allocator);
     defer client.deinit();
+    var io = try test_io.Loop.init(8);
+    defer io.deinit(&client);
     const server = try TestServer.init();
     defer server.deinit();
     var owned = try server.call().clone(std.testing.allocator);
     try client.enqueue(owned);
     @memset(@constCast(owned.request), '!');
     owned.deinit(std.testing.allocator);
-    const stalled = try server.accept();
+    const stalled = try server.accept(&client, &io);
     defer _ = c.close(stalled);
-    try expectRequest(&client, stalled, test_request);
+    try expectRequest(&client, &io, stalled, test_request);
     try client.enqueue(server.call());
-    const peer = try server.accept();
+    const peer = try server.accept(&client, &io);
     defer _ = c.close(peer);
-    try expectRequest(&client, peer, test_request);
+    try expectRequest(&client, &io, peer, test_request);
     try sendReply(peer, test_reply[0..25]);
-    try client.dispatch();
-    try std.testing.expect(client.pending[1] != null);
+    const deadline = monotonicMs() + 2000;
+    while (client.pending[1].?.input.items.len != 25) {
+        if (monotonicMs() >= deadline) return error.FragmentTimeout;
+        try io.tick(&client);
+    }
     try sendReply(peer, test_reply[25..]);
     _ = c.shutdown(peer, c.SHUT_WR);
-    try client.dispatch();
+    while (client.pending[1] != null) {
+        if (monotonicMs() >= deadline) return error.FragmentTimeout;
+        try io.tick(&client);
+    }
     try std.testing.expect(client.pending[0] != null);
-    try std.testing.expect(client.pending[1] == null);
     try sendReply(stalled, test_reply);
-    try client.dispatch();
-    try expectIdle(&client);
+    try waitIdle(&client, &io);
 }
 
-test "MCP distinguishes RPC tool and interim errors and never retries ambiguous calls" {
+test "MCP reply validation and terminal errors never replay a call" {
     var client = try Client.init(std.testing.allocator);
     defer client.deinit();
+    var io = try test_io.Loop.init(8);
+    defer io.deinit(&client);
     const server = try TestServer.init();
     defer server.deinit();
     const cases = [_]struct { reply: []const u8, err: ?anyerror = error.InvalidReply }{
@@ -406,29 +473,27 @@ test "MCP distinguishes RPC tool and interim errors and never retries ambiguous 
         .{ .reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":4}\n" },
         .{ .reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-1,\"message\":\"bad\"},\"result\":{}}\n" },
         .{ .reply = test_reply, .err = null },
-        .{ .reply = "{\"jsonrpc\":" }, // EOF after a side effect is terminal too.
+        .{ .reply = "{\"jsonrpc\":" },
     };
     for (cases) |case| {
         const frame = std.mem.sliceTo(case.reply, '\n');
-        if (case.err) |err| {
-            try std.testing.expectError(err, client.parseReply(server.call(), frame));
-        } else {
-            try client.parseReply(server.call(), frame);
-        }
+        if (case.err) |err| try std.testing.expectError(err, client.parseReply(server.call(), frame)) else try client.parseReply(server.call(), frame);
         try client.enqueue(server.call());
-        const peer = try server.accept();
-        try expectRequest(&client, peer, test_request);
+        const peer = try server.accept(&client, &io);
+        try expectRequest(&client, &io, peer, test_request);
         try sendReply(peer, case.reply);
         _ = c.close(peer);
-        for (0..3) |_| try client.dispatch();
-        try expectIdle(&client);
-        try std.testing.expectError(error.AcceptFailed, server.accept());
+        try waitIdle(&client, &io);
+        const extra = linux.accept4(server.listener, null, null, linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC);
+        try std.testing.expectEqual(linux.E.AGAIN, linux.errno(extra));
     }
 }
 
-test "MCP partial writes resume exactly and frame limit includes newline" {
+test "MCP native partial writes and exact newline-inclusive frame boundary" {
     var client = try Client.init(std.testing.allocator);
     defer client.deinit();
+    var io = try test_io.Loop.init(8);
+    defer io.deinit(&client);
     const server = try TestServer.init();
     defer server.deinit();
     const request = try std.testing.allocator.alloc(u8, maximum_frame_size);
@@ -439,67 +504,95 @@ test "MCP partial writes resume exactly and frame limit includes newline" {
     var call = server.call();
     call.request = request;
     try client.enqueue(call);
-    const peer = try server.accept();
+    const peer = try server.accept(&client, &io);
     defer _ = c.close(peer);
-    const buffer_size: c_int = 1024;
-    try std.testing.expectEqual(@as(c_int, 0), c.setsockopt(client.pending[0].?.fd, c.SOL_SOCKET, c.SO_SNDBUF, &buffer_size, @sizeOf(c_int)));
-    try client.dispatch();
-    try std.testing.expect(client.pending[0].?.sent > 0 and client.pending[0].?.sent < request.len);
-    const sent = client.pending[0].?.sent;
-    try client.dispatch();
-    try std.testing.expectEqual(sent, client.pending[0].?.sent);
-    try expectRequest(&client, peer, request);
+    const size: c_int = 1024;
+    try std.testing.expectEqual(@as(c_int, 0), c.setsockopt(client.pending[0].?.fd, c.SOL_SOCKET, c.SO_SNDBUF, &size, @sizeOf(c_int)));
+    for (0..32) |_| try io.tick(&client);
+    try std.testing.expect(client.pending[0].?.sent < request.len);
+    try expectRequest(&client, &io, peer, request);
     const reply = try std.testing.allocator.alloc(u8, maximum_frame_size);
     defer std.testing.allocator.free(reply);
     @memset(reply, ' ');
     @memcpy(reply[0 .. test_reply.len - 1], test_reply[0 .. test_reply.len - 1]);
     reply[reply.len - 1] = '\n';
-    // Each chunk is consumed separately; the final newline is its own read.
     var offset: usize = 0;
+    const deadline = monotonicMs() + 3000;
     while (offset < reply.len - 1) {
-        const end = @min(offset + 8192, reply.len - 1);
-        try sendReply(peer, reply[offset..end]);
-        try client.dispatch();
-        offset = end;
+        if (monotonicMs() >= deadline) return error.ReplyTimeout;
+        const n = c.send(peer, reply[offset..].ptr, @min(8192, reply.len - 1 - offset), c.MSG_NOSIGNAL);
+        if (n > 0) offset += @intCast(n) else if (c.__errno_location().* != c.EAGAIN) return error.SendFailed;
+        try io.tick(&client);
     }
-    try std.testing.expect(client.pending[0] != null);
+    while (client.pending[0].?.input.items.len != reply.len - 1) {
+        if (monotonicMs() >= deadline) return error.ReplyTimeout;
+        try io.tick(&client);
+    }
     try sendReply(peer, "\n");
-    try client.dispatch();
-    try expectIdle(&client);
+    try waitIdle(&client, &io);
     try client.enqueue(server.call());
-    const oversized = try server.accept();
+    const oversized = try server.accept(&client, &io);
     defer _ = c.close(oversized);
-    try expectRequest(&client, oversized, test_request);
+    try expectRequest(&client, &io, oversized, test_request);
     reply[reply.len - 1] = ' ';
     offset = 0;
-    while (offset < reply.len) : (offset += 8192) {
-        try sendReply(oversized, reply[offset .. offset + 8192]);
-        try client.dispatch();
+    while (offset < reply.len) {
+        if (monotonicMs() >= deadline) return error.ReplyTimeout;
+        const n = c.send(oversized, reply[offset..].ptr, @min(8192, reply.len - offset), c.MSG_NOSIGNAL);
+        if (n > 0) offset += @intCast(n) else if (c.__errno_location().* != c.EAGAIN) return error.SendFailed;
+        try io.tick(&client);
     }
-    try expectIdle(&client);
+    try waitIdle(&client, &io);
 }
 
-test "MCP call limit, real timeout readiness and stop discard outstanding calls" {
+test "MCP native deadline, capacity and cancellation under SQ pressure" {
     var client = try Client.init(std.testing.allocator);
     defer client.deinit();
+    var io = try test_io.Loop.init(2);
+    defer io.deinit(&client);
     const server = try TestServer.init();
     defer server.deinit();
     for (0..capacity) |_| try client.enqueue(server.call());
     try std.testing.expectError(error.TooManyCalls, client.enqueue(server.call()));
-    // Send every request, leaving only replies and the timer able to wake us.
-    try client.dispatch();
-    client.pending[7].?.deadline = monotonicMs() + 2;
-    try client.armTimer();
-    var fds = [_]linux.pollfd{.{ .fd = client.descriptor(), .events = linux.POLL.IN, .revents = 0 }};
-    try std.testing.expectEqual(@as(usize, 1), linux.poll(&fds, 1, 500));
-    try client.dispatch();
+    client.pending[7].?.deadline = monotonicMs() + 20;
+    const deadline = monotonicMs() + 2000;
+    while (client.pending[7] != null) {
+        if (monotonicMs() >= deadline) return error.TimeoutNotObserved;
+        try io.tick(&client);
+    }
     for (client.pending, 0..) |pending, i| try std.testing.expectEqual(i == 7, pending == null);
-    // The server still has the original connections, never replacement calls.
-    for (0..capacity) |_| _ = c.close(try server.accept());
-    try std.testing.expectError(error.AcceptFailed, server.accept());
-    try client.stop();
-    try std.testing.expectEqual(@as(usize, 1), linux.poll(&fds, 1, 500));
-    try client.dispatch();
+    try io.drain(&client);
     try std.testing.expectError(error.Stopping, client.enqueue(server.call()));
-    try expectIdle(&client);
+}
+
+test "MCP stop before submission retains storage for both cancellation CQE orders" {
+    for ([_]bool{ false, true }) |cancel_first| {
+        var client = try Client.init(std.testing.allocator);
+        defer client.deinit();
+        var io = try test_io.Loop.init(2);
+        defer io.deinit(&client);
+        try client.enqueue(.{ .address = "unix:/unused", .method = "test", .request = test_request });
+        const target = try io.router.acquire(.mcp);
+        const cancel = try io.router.acquire(.mcp);
+        const p = &client.pending[0].?;
+        p.phase = .reading;
+        p.operations[0] = .{ .token = target, .cancel = cancel, .canceling = true };
+        client.stop();
+        try client.complete(&io.router, if (cancel_first) cancel else target, if (cancel_first) 0 else negative(.CANCELED));
+        try std.testing.expect(!client.prepare(&io.ring, &io.router));
+        try std.testing.expect(client.pending[0] != null);
+        try client.complete(&io.router, if (cancel_first) target else cancel, if (cancel_first) negative(.CANCELED) else negative(.NOENT));
+        try std.testing.expect(!client.prepare(&io.ring, &io.router));
+        try std.testing.expect(client.drained());
+    }
+    var client = try Client.init(std.testing.allocator);
+    defer client.deinit();
+    var io = try test_io.Loop.init(2);
+    defer io.deinit(&client);
+    try client.enqueue(.{ .address = "unix:/unused", .method = "test", .request = test_request });
+    try std.testing.expect(!client.prepare(&io.ring, &io.router));
+    // Both SQEs exist but the host has not submitted either yet.
+    client.stop();
+    try std.testing.expect(client.prepare(&io.ring, &io.router));
+    try io.drain(&client);
 }

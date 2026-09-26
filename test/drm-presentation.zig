@@ -136,7 +136,7 @@ test "configuration pending wakes the idle loop and clears on shutdown" {
     try root.deinit();
 }
 
-test "MCP readiness sends a filesystem socket call and drains its final poll" {
+test "MCP readiness sends a filesystem socket call with native socket CQEs" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
     defer fixture.deinit();
@@ -161,6 +161,8 @@ test "MCP readiness sends a filesystem socket call and drains its final poll" {
     defer allocator.free(call.request);
     try loop.installMcp(&client);
     try client.enqueue(call);
+    _ = try loop.turn(coordinator);
+    try waitReady(&root.ring);
     const accepted = linux.accept4(listener, null, null, linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC);
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(accepted));
     const peer: linux.fd_t = @intCast(accepted);
@@ -175,10 +177,13 @@ test "MCP readiness sends a filesystem socket call and drains its final poll" {
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"toggle_launcher\",\"arguments\":{},\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{},\"io.modelcontextprotocol/clientInfo\":{\"name\":\"ouro\",\"version\":\"0.0.0\"}}}}\n", bytes[0..n]);
     const reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"content\":[]}}\n";
     try std.testing.expectEqual(@as(usize, reply.len), linux.write(peer, reply, reply.len));
-    try waitReady(&root.ring);
-    _ = try loop.turn(coordinator);
+    for (0..32) |_| {
+        _ = try loop.turn(coordinator);
+        if (loop.mcpDrained()) break;
+        try waitReady(&root.ring);
+    }
     try std.testing.expectEqual(@as(usize, 0), linux.read(peer, &bytes, bytes.len));
-    try std.testing.expect(!loop.mcpDrained());
+    try std.testing.expect(loop.mcpDrained());
     try coordinator.requestStop();
     try loop.requestShutdown();
     for (0..16) |_| {
@@ -194,7 +199,7 @@ test "MCP readiness sends a filesystem socket call and drains its final poll" {
     try root.deinit();
 }
 
-test "MCP readiness receives control calls without sleeping and retires the server poll" {
+test "MCP readiness receives control calls without sleeping and drains native I/O" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
     defer fixture.deinit();
@@ -208,7 +213,9 @@ test "MCP readiness receives control calls without sleeping and retires the serv
     const path = try std.fmt.allocPrint(allocator, "{s}/control.sock", .{directory});
     defer allocator.free(path);
     const root = try Compositor.create(allocator, try wayring.unix_socket.listen(display, 1), compositorConfig());
-    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+    var config = coordinatorConfig();
+    config.router_capacity += 12; // Concurrent read/write/timeout and cancel CQEs.
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
     var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
     var server = try ouro.mcp_server.Server.init(allocator, path, "{\"tools\":[]}");
     defer server.deinit();

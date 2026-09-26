@@ -192,7 +192,9 @@ pub fn main(init: std.process.Init) !void {
         .hotplug = if (options.headless) null else ouro.drm_hotplug.real,
     };
     const coordinator = Runtime.create(allocator, root, platforms, .{
-        .router_capacity = 26,
+        // MCP: 16 outbound calls (64 tokens), 16 inbound peers plus accept
+        // and shutdown timer (68), including simultaneous cancellation CQEs.
+        .router_capacity = 26 + 64 + 68,
         .timer_capacity = 6,
         .device_capacity = 36,
         .input = .{

@@ -93,9 +93,7 @@ pub fn Loop(comptime protocol: type) type {
         shutdown_token: ?completion.Token = null,
         shutdown_seen: bool = false,
         mcp: ?*mcp_client.Client = null,
-        mcp_token: ?completion.Token = null,
         control: ?*mcp_server.Server = null,
-        control_token: ?completion.Token = null,
         launch: ?*launcher.Systemd = null,
         /// A validated replacement is waiting for an output/input transaction.
         configuration_pending: bool = false,
@@ -148,8 +146,8 @@ pub fn Loop(comptime protocol: type) type {
         /// last turn.
         pub fn deinit(self: *Self) void {
             std.debug.assert(self.shutdown_token == null);
-            std.debug.assert(self.mcp_token == null);
-            std.debug.assert(self.control_token == null);
+            std.debug.assert(self.mcpDrained());
+            std.debug.assert(self.controlDrained());
             std.debug.assert(self.launcherDrained());
             std.debug.assert(self.pending_wayring_count == 0);
             self.driver.deinit(self.allocator);
@@ -172,21 +170,19 @@ pub fn Loop(comptime protocol: type) type {
         pub fn installMcp(self: *Self, client: *mcp_client.Client) !void {
             if (self.mcp != null) return error.AlreadyInstalled;
             self.mcp = client;
-            try self.armMcpPoll();
         }
 
         pub fn mcpDrained(self: *const Self) bool {
-            return self.mcp_token == null;
+            return if (self.mcp) |client| client.drained() else true;
         }
 
         pub fn installControl(self: *Self, server: *mcp_server.Server) !void {
             if (self.control != null) return error.AlreadyInstalled;
             self.control = server;
-            try self.armControlPoll();
         }
 
         pub fn controlDrained(self: *const Self) bool {
-            return self.control_token == null;
+            return if (self.control) |server| server.drained() else true;
         }
 
         pub fn installLauncher(self: *Self, client: *launcher.Systemd) !void {
@@ -196,20 +192,6 @@ pub fn Loop(comptime protocol: type) type {
 
         pub fn launcherDrained(self: *const Self) bool {
             return if (self.launch) |client| client.drained() else true;
-        }
-
-        fn armControlPoll(self: *Self) !void {
-            const token = try self.router.acquire(.control);
-            errdefer self.router.retire(token) catch unreachable;
-            _ = try self.compositor.ring.poll_add(token.encode(), self.control.?.descriptor(), linux.POLL.IN);
-            self.control_token = token;
-        }
-
-        fn armMcpPoll(self: *Self) !void {
-            const token = try self.router.acquire(.mcp);
-            errdefer self.router.retire(token) catch unreachable;
-            _ = try self.compositor.ring.poll_add(token.encode(), self.mcp.?.descriptor(), linux.POLL.IN);
-            self.mcp_token = token;
         }
 
         fn armSignalPoll(self: *Self) !void {
@@ -228,10 +210,9 @@ pub fn Loop(comptime protocol: type) type {
         /// processed until `Progress.wayring.shutdown_complete` is true.
         pub fn requestShutdown(self: *Self) !void {
             self.configuration_pending = false;
-            // Wake the stable descriptor instead of closing it underneath an
-            // in-flight poll. Its final CQE must retire before client teardown.
-            if (self.mcp) |client| try client.stop();
-            if (self.control) |server| try server.stop();
+            // Transports retain their buffers until target and cancel CQEs drain.
+            if (self.mcp) |client| client.stop();
+            if (self.control) |server| server.stop();
             if (self.launch) |client| client.stop();
             if (!self.shutdown_seen) if (self.shutdown) |watcher| watcher.request();
             try self.driver.requestShutdown();
@@ -331,27 +312,13 @@ pub fn Loop(comptime protocol: type) type {
                         continue;
                     }
                     if (token.kind == .control) {
-                        if (self.control_token == null or !std.meta.eql(self.control_token.?, token))
-                            return error.UnexpectedControlCompletion;
-                        try self.router.retire(token);
-                        self.control_token = null;
-                        if (cqe.res < 0 or @as(u32, @intCast(cqe.res)) & linux.POLL.IN == 0)
-                            return error.ControlPollFailed;
-                        const server = self.control.?;
-                        try server.dispatch();
-                        if (!server.stopping) try self.armControlPoll();
+                        const server = self.control orelse return error.UnexpectedControlCompletion;
+                        try server.complete(self.router, token, cqe.res);
                         continue;
                     }
                     if (token.kind == .mcp) {
-                        if (self.mcp_token == null or !std.meta.eql(self.mcp_token.?, token))
-                            return error.UnexpectedMcpCompletion;
-                        try self.router.retire(token);
-                        self.mcp_token = null;
-                        if (cqe.res < 0 or @as(u32, @intCast(cqe.res)) & linux.POLL.IN == 0)
-                            return error.McpPollFailed;
-                        const client = self.mcp.?;
-                        try client.dispatch();
-                        if (!client.stopping) try self.armMcpPoll();
+                        const client = self.mcp orelse return error.UnexpectedMcpCompletion;
+                        try client.complete(self.router, token, cqe.res);
                         continue;
                     }
                     if (token.kind == .shutdown) {
@@ -372,8 +339,8 @@ pub fn Loop(comptime protocol: type) type {
                         self.retained_reload_requested =
                             self.retained_reload_requested or events.reload;
                         self.shutdown_seen = self.shutdown_seen or events.shutdown;
-                        if (events.shutdown) if (self.mcp) |client| try client.stop();
-                        if (events.shutdown) if (self.control) |server| try server.stop();
+                        if (events.shutdown) if (self.mcp) |client| client.stop();
+                        if (events.shutdown) if (self.control) |server| server.stop();
                         if (events.shutdown) if (self.launch) |client| client.stop();
                         if (!self.shutdown_seen) try self.armSignalPoll();
                         continue;
@@ -468,6 +435,14 @@ pub fn Loop(comptime protocol: type) type {
                 client.prepare(&self.compositor.ring, self.router)
             else
                 false;
+            const mcp_pending = if (self.mcp) |client|
+                client.prepare(&self.compositor.ring, self.router)
+            else
+                false;
+            const server_pending = if (self.control) |server|
+                server.prepare(&self.compositor.ring, self.router)
+            else
+                false;
             const backend_drained = if (@hasDecl(@TypeOf(handler.*), "backendDrainComplete"))
                 handler.backendDrainComplete()
             else
@@ -487,7 +462,7 @@ pub fn Loop(comptime protocol: type) type {
             const control_pending = if (self.control) |server| server.hasCalls() else false;
             const can_wait = wait_on_idle and self.compositor.ring.cq_ready() == 0 and
                 !wayring_progress.pending and !self.retained_shutdown_requested and
-                !self.retained_reload_requested and !launcher_pending and
+                !self.retained_reload_requested and !launcher_pending and !mcp_pending and !server_pending and
                 !bindings_work_pending and !submission_work_pending and !configuration_ready and !control_pending and
                 !(wayring_progress.shutdown_complete and backend_drained and self.mcpDrained() and self.controlDrained() and self.launcherDrained());
             phase = .submit;
@@ -527,7 +502,7 @@ pub fn Loop(comptime protocol: type) type {
                 .needs_more_work = self.compositor.ring.cq_ready() != 0 or
                     hiddenCompletionsPending(&self.compositor.ring) or
                     self.pending_wayring_count != 0 or wayring_progress.pending or
-                    bindings_work_pending or submission_work_pending or configuration_ready or control_pending or launcher_pending,
+                    bindings_work_pending or submission_work_pending or configuration_ready or control_pending or launcher_pending or mcp_pending or server_pending,
             };
             self.retained_wayring_progress = .{};
             self.retained_shutdown_requested = false;
