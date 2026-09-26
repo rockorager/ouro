@@ -87,7 +87,13 @@ responsibilities:
   keyboard resources aggregate normalized physical input, retain keymap FD
   ownership, derive depressed and locked modifiers from the published keymap,
   and deliver generation-safe focus, user-action serials, and high-resolution
-  wheel or touch scrolling through resumable outbound commands.
+  wheel or touch scrolling through resumable outbound commands. Seat v11
+  distinguishes compositor-induced pointer relocation from physical motion;
+  older clients receive motion events instead.
+- [Input timestamps](src/protocol/input_timestamps.zig): `input-timestamps-v1`
+  retains backend microseconds for pointer, keyboard, and touch events on primary
+  and transient seats. Timestamp subscriptions and their core event are queued
+  atomically; synthetic events without a source timestamp omit the extension.
 - [Relative pointer](src/protocol/relative_pointer.zig): focused wl_pointer
   resources receive unclipped relative motion with exact microsecond timestamps
   through a bounded, backpressure-safe event queue.
@@ -98,7 +104,8 @@ responsibilities:
 - [Clipboard selection](src/protocol/data_device.zig): bounded data sources,
   devices, and offers validate exact seat action serials, publish selection on
   keyboard focus, and retain receive descriptors across transport backpressure.
-  Drag-and-drop is not yet implemented.
+  Drag-and-drop validates implicit-grab serials, negotiates MIME types and
+  actions, and tracks drop/finish lifetimes across clients.
 - [Wayland output](src/protocol/output.zig): clients discover the selected
   physical output's geometry, current and preferred DRM mode, refresh rate,
   scale, stable name, and description through version-correct `wl_output`
@@ -151,6 +158,16 @@ responsibilities:
   shadow; window management uses compositor bindings. Clients without this
   protocol can still draw their own decorations. Mode events are ordered before
   their matching XDG surface configure and retained across transport backpressure.
+- [GTK shell](src/protocol/gtk_shell.zig): v7 retains D-Bus and accessibility
+  metadata independently, gates configure states by client version, and routes
+  serial-validated double-clicks through maximize policy. Cursor offsets update
+  the hotspot shared by composition and capture, including detached commits and
+  absolute hotspot resets. Legacy timestamps/startup IDs do not authorize focus;
+  modal is a hint, and middle/right titlebar gestures have no compositor action.
+- [Wayland fixes](src/protocol/wayland_fixes.zig): v2 acknowledges registry
+  removals through Wayring. Removed globals retain bind context until every
+  registry offer is acknowledged or destroyed; global names are never reused.
+  Racing binds to retired seats, outputs, and DRM lease devices remain inert.
 - [Desktop interaction](src/input/interaction.zig): pointer motion hit-tests
   exact committed input regions against the copied desktop scene, retains
   default, button-grab, popup-grab, and validated interactive move/resize state
@@ -526,6 +543,35 @@ disable-while-typing/trackpointing, and rotation. Unsupported libinput settings
 are logged and leave that device unchanged rather than rejecting unrelated
 settings.
 
+`general.experimental_hotkeys` (default `false`) opts into the experimental
+`xx-hotkey-v1` Wayland protocol. Enabling it publishes the manager; disabling it
+withdraws the global and revokes existing bindings. It uses the same temporary,
+saved, and reload configuration paths as other general settings. This is not
+the GlobalShortcuts D-Bus portal. Application IDs are advisory, not permissions;
+opting in lets connected clients request bindings under the following policy:
+
+- Bindings are exclusive. Compositor bindings win, including after a config
+  change; rejected reconfiguration preserves the client's previous binding.
+- Key triggers require Ctrl, Alt, or Super, except F1–F35 and audio keysyms
+  `0x1008ff11`–`0x1008ff17`. Modifier taps are denied. Pointer triggers are limited
+  to auxiliary buttons (side, extra, forward, back, task), with exact modifiers.
+- Matching uses level zero in every layout and ignores lock modifiers. There
+  is no auto-repeat; releases remain paired when modifiers change. Destroying
+  a binding never leaks its consumed release to another client.
+- Session locks, focused shortcut inhibitors, and IME keyboard grabs suspend
+  triggering and invalidate activation grants. Held hotkeys are revoked at
+  these boundaries; their eventual physical releases remain consumed.
+- The primary seat's normalized input is supported; isolated transient seats
+  and virtual-keyboard injection do not trigger hotkeys. Hotkey serials grant
+  one-shot activation for five seconds without keyboard focus or `set_surface`.
+  They do not authorize selections, popup grabs, or window move/resize.
+
+The vendored XML is byte-for-byte upstream `experimental/xx-hotkey/xx-hotkey-v1.xml`
+from wayland-protocols commit
+[`819004adb3ab`](https://gitlab.freedesktop.org/wayland/wayland-protocols/-/commit/819004adb3ab7e46f3fa3caef05b96e20434b244),
+not the 1.49 release. Run `zig build test-hotkey` for focused protocol and
+generated-client activation coverage.
+
 Output rules match the stable `DRM-<connector-id>` name, connector ID/type/type
 ID, or physical dimensions. They use the same priority and merge semantics.
 Mode, position, scale, enablement, HDR, and ICC profile changes run through Ouro's
@@ -578,6 +624,14 @@ Ouro requires Zig 0.16. Run its unit and real-kernel integration tests with:
 zig build test
 ```
 
+Focused protocol checks are `test-seat`, `test-input-timestamps`, `test-gtk`,
+`test-hotkey`, `test-global-removal`, and `test-color-startup`. The generated
+client tests exercise cross-client DnD payload/EOF and action negotiation under
+backpressure, cursor/toplevel pixels, DMA-BUF capture negotiation/import failure,
+and UNORM16 low bits. The DMA-BUF capture renderer is deterministic, not a GPU
+test; DnD target selection is injected at the coordinator boundary, not routed
+through desktop geometry. Physical GPU/DRM acceptance remains separate.
+
 ## Physical-display compositor
 
 M3 composes the bounded shell, desktop, normalized input, seat, interaction,
@@ -622,15 +676,18 @@ both. Keep renderer, resolution, scale, pixel format, and workload identical;
 verify the actual KMS framebuffer modifier and rendering before profiling.
 Run these as separate compositor sessions, not inside an active desktop.
 
-Strict Vulkan mode also publishes `color-management-v1` and
-`color-representation-v1`. Client parametric descriptions and ICC v2/v4 RGB
+Auto and strict Vulkan modes publish `color-management-v1` and
+`color-representation-v1` only after a Vulkan device proves that its color
+pipeline is available. Auto may fall back to Pixman without advertising either
+global. Client parametric descriptions and ICC v2/v4 RGB
 Display or ColorSpace profiles are transformed in linear light. ICC parsing and
 33³ LUT generation run on a bounded worker rather than the compositor or render
 turn for client-provided profiles. Configured output profiles are validated and
 compiled before an atomic configuration replacement begins; their VCGT
 calibration is included when present. Auto and Pixman modes reject configured
-output profiles and do not advertise color-management behavior they cannot
-guarantee.
+output profiles; calibrated output profiles still require strict Vulkan mode.
+`zig build test-color-startup` exercises renderer selection, registry publication
+under backpressure, late clients, and output disable/re-enable.
 
 With `--renderer=vulkan`, SHM clients can use ARGB/XRGB/ABGR/XBGR8888, all four 2101010 variants,
 ABGR/XBGR16161616 (unsigned normalized integer), and ABGR/XBGR16161616F
