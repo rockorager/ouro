@@ -11,6 +11,7 @@ const input = @import("../backend/input/backend.zig");
 const input_platform = @import("../backend/input/platform.zig");
 const surface_state = @import("../surface.zig");
 const slot_pool = @import("slot_pool.zig");
+const input_timestamps = @import("input_timestamps.zig");
 
 const linux = std.os.linux;
 const objects = wayring.objects;
@@ -183,23 +184,23 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             seat_name: Id,
             pointer_enter: struct { pointer: Id, serial: u32, target: FocusTarget, point: Point },
             pointer_leave: struct { pointer: Id, serial: u32, target: FocusTarget },
-            pointer_motion: struct { pointer: Id, target: FocusTarget, time: u32, point: Point },
+            pointer_motion: struct { pointer: Id, target: FocusTarget, time: u32, time_usec: ?u64 = null, point: Point },
             pointer_warp: struct { pointer: Id, target: FocusTarget, time: u32, point: Point },
-            pointer_button: struct { pointer: Id, target: ?FocusTarget, serial: u32, time: u32, button: u32, pressed: bool },
+            pointer_button: struct { pointer: Id, target: ?FocusTarget, serial: u32, time: u32, time_usec: ?u64 = null, button: u32, pressed: bool },
             pointer_axis_source: struct { pointer: Id, target: FocusTarget, source: input_platform.AxisSource },
-            pointer_axis: struct { pointer: Id, target: FocusTarget, time: u32, axis: Axis, value: i32 },
-            pointer_axis_stop: struct { pointer: Id, target: FocusTarget, time: u32, axis: Axis },
+            pointer_axis: struct { pointer: Id, target: FocusTarget, time: u32, time_usec: ?u64 = null, axis: Axis, value: i32 },
+            pointer_axis_stop: struct { pointer: Id, target: FocusTarget, time: u32, time_usec: ?u64 = null, axis: Axis },
             pointer_axis_value120: struct { pointer: Id, target: FocusTarget, axis: Axis, value120: i32 },
             pointer_frame: struct { pointer: Id, target: ?FocusTarget },
             keyboard_keymap: Id,
             keyboard_repeat: Id,
             keyboard_enter: struct { keyboard: Id, serial: u32, target: FocusTarget, pressed_keys: [state_words]u64 },
             keyboard_leave: struct { keyboard: Id, serial: u32, target: FocusTarget },
-            keyboard_key: struct { keyboard: Id, serial: u32, target: FocusTarget, time: u32, key: u32, pressed: bool },
+            keyboard_key: struct { keyboard: Id, serial: u32, target: FocusTarget, time: u32, time_usec: ?u64 = null, key: u32, pressed: bool },
             keyboard_modifiers: struct { keyboard: Id, serial: u32, target: FocusTarget, state: ModifierState },
-            touch_down: struct { touch: Id, serial: u32, time: u32, id: i32, target: FocusTarget, point: Point },
-            touch_up: struct { touch: Id, serial: u32, time: u32, id: i32 },
-            touch_motion: struct { touch: Id, time: u32, id: i32, point: Point },
+            touch_down: struct { touch: Id, serial: u32, time: u32, time_usec: ?u64 = null, id: i32, target: FocusTarget, point: Point },
+            touch_up: struct { touch: Id, serial: u32, time: u32, time_usec: ?u64 = null, id: i32 },
+            touch_motion: struct { touch: Id, time: u32, time_usec: ?u64 = null, id: i32, point: Point },
             touch_frame: struct { touch: Id, client: ClientId },
             touch_cancel: struct { touch: Id, client: ClientId },
         };
@@ -229,6 +230,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         allocator: std.mem.Allocator,
         core: *CoreSurface,
+        timestamps: ?*input_timestamps.Adapter(protocol) = null,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
         global_version: u32,
@@ -613,6 +615,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (object.interface == &Pointer.info) {
                 const slot = adapter.pointers.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(slot.resource, handle)) return false;
+                adapter.invalidateTimestamps(slot);
                 adapter.dropOutboundResource(.pointer, adapter.pointerIndex(slot), slot.header.generation);
                 adapter.pointers.release(slot);
                 return true;
@@ -620,6 +623,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (object.interface == &Keyboard.info) {
                 const slot = adapter.keyboards.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(slot.resource, handle)) return false;
+                adapter.invalidateTimestamps(slot);
                 adapter.dropOutboundResource(.keyboard, adapter.keyboardIndex(slot), slot.header.generation);
                 adapter.keyboards.release(slot);
                 return true;
@@ -627,6 +631,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (object.interface == &Touch.info) {
                 const slot = adapter.touches.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(slot.resource, handle)) return false;
+                adapter.invalidateTimestamps(slot);
                 adapter.dropOutboundResource(.touch, adapter.touchIndex(slot), slot.header.generation);
                 const owner = slot.client;
                 adapter.touches.release(slot);
@@ -1198,7 +1203,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         /// Starts a contact on an exact generation-checked surface. The fixed
         /// offset retains its down-time coordinate space for the implicit grab.
-        pub fn touchDown(adapter: *Self, contact: TouchContactId, target: FocusTarget, time_ms: u32, point: Point, offset: Point) !?u32 {
+        /// Times retain the backend's microsecond clock, including epoch bits.
+        pub fn touchDown(adapter: *Self, contact: TouchContactId, target: FocusTarget, time_usec: u64, point: Point, offset: Point) !?u32 {
             if (adapter.touch_devices == 0) return error.TouchUnavailable;
             _ = try adapter.core.getSurfaceById(target.surface);
             if (adapter.findContact(contact) != null) return error.DuplicateContact;
@@ -1224,7 +1230,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 adapter.enqueue(target.client, .{ .touch_down = .{
                     .touch = .{ .index = @intCast(index), .generation = touch.header.generation },
                     .serial = serial,
-                    .time = time_ms,
+                    .time = millis(time_usec),
+                    .time_usec = time_usec,
                     .id = contact.id,
                     .target = target,
                     .point = point,
@@ -1235,7 +1242,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return serial;
         }
 
-        pub fn touchMotion(adapter: *Self, contact: TouchContactId, time_ms: u32, point: Point) !void {
+        pub fn touchMotion(adapter: *Self, contact: TouchContactId, time_usec: u64, point: Point) !void {
             const active = adapter.findContact(contact) orelse return error.StaleContact;
             const target = active.target orelse return;
             const count = adapter.touchResourceCountForContact(active);
@@ -1243,7 +1250,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             for (adapter.touches.entries.items, 0..) |touch, index| if (adapter.touchParticipates(touch, active)) {
                 adapter.enqueue(target.client, .{ .touch_motion = .{
                     .touch = .{ .index = @intCast(index), .generation = touch.header.generation },
-                    .time = time_ms,
+                    .time = millis(time_usec),
+                    .time_usec = time_usec,
                     .id = contact.id,
                     .point = point,
                 } }) catch unreachable;
@@ -1258,7 +1266,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return .{ .focus = active.target orelse return null, .offset = active.offset };
         }
 
-        pub fn touchUp(adapter: *Self, contact: TouchContactId, time_ms: u32) !?u32 {
+        pub fn touchUp(adapter: *Self, contact: TouchContactId, time_usec: u64) !?u32 {
             const active = adapter.findContact(contact) orelse return error.StaleContact;
             const target = active.target orelse {
                 active.active = false;
@@ -1271,7 +1279,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 adapter.enqueue(target.client, .{ .touch_up = .{
                     .touch = .{ .index = @intCast(index), .generation = touch.header.generation },
                     .serial = serial,
-                    .time = time_ms,
+                    .time = millis(time_usec),
+                    .time_usec = time_usec,
                     .id = contact.id,
                 } }) catch unreachable;
                 touch.pending_frame_events +|= 1;
@@ -1356,6 +1365,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     .pointer = id,
                     .target = target,
                     .time = millis(value.time_usec),
+                    .time_usec = value.time_usec,
                     .point = adapter.pointer_point,
                 } }) catch unreachable;
                 adapter.enqueue(target.client, .{ .pointer_frame = .{
@@ -1487,7 +1497,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .pointer_motion => |v| {
                     const slot = adapter.resolvePointer(v.pointer) catch return true;
                     _ = adapter.surfaceObject(server_objects, v.target) catch return true;
-                    try Pointer.encodeEvent(queue, slot.resource.id, .{ .motion = .{
+                    try adapter.sendTimestamped(Pointer, queue, slot, v.time_usec, .{ .motion = .{
                         .time = v.time,
                         .surface_x = v.point.x,
                         .surface_y = v.point.y,
@@ -1513,7 +1523,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .pointer_button => |v| {
                     const slot = adapter.resolvePointer(v.pointer) catch return true;
                     if (v.target) |target| _ = adapter.surfaceObject(server_objects, target) catch return true;
-                    try Pointer.encodeEvent(queue, slot.resource.id, .{ .button = .{
+                    try adapter.sendTimestamped(Pointer, queue, slot, v.time_usec, .{ .button = .{
                         .serial = v.serial,
                         .time = v.time,
                         .button = v.button,
@@ -1535,7 +1545,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .pointer_axis => |v| {
                     const slot = adapter.resolvePointer(v.pointer) catch return true;
                     _ = adapter.surfaceObject(server_objects, v.target) catch return true;
-                    try Pointer.encodeEvent(queue, slot.resource.id, .{ .axis = .{
+                    try adapter.sendTimestamped(Pointer, queue, slot, v.time_usec, .{ .axis = .{
                         .time = v.time,
                         .axis = protocolAxis(v.axis, Pointer),
                         .value = v.value,
@@ -1545,7 +1555,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     const slot = adapter.resolvePointer(v.pointer) catch return true;
                     _ = adapter.surfaceObject(server_objects, v.target) catch return true;
                     const object = server_objects.namespace.resolve(slot.resource) orelse return true;
-                    if (object.version >= 5) try Pointer.encodeEvent(queue, slot.resource.id, .{
+                    if (object.version >= 5) try adapter.sendTimestamped(Pointer, queue, slot, v.time_usec, .{
                         .axis_stop = .{ .time = v.time, .axis = protocolAxis(v.axis, Pointer) },
                     });
                 },
@@ -1620,7 +1630,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .keyboard_key => |v| {
                     const slot = adapter.resolveKeyboard(v.keyboard) catch return true;
                     _ = adapter.surfaceObject(server_objects, v.target) catch return true;
-                    try Keyboard.encodeEvent(queue, slot.resource.id, .{ .key = .{
+                    try adapter.sendTimestamped(Keyboard, queue, slot, v.time_usec, .{ .key = .{
                         .serial = v.serial,
                         .time = v.time,
                         .key = v.key,
@@ -1641,7 +1651,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .touch_down => |v| {
                     const slot = adapter.resolveTouch(v.touch) catch return true;
                     const surface = adapter.surfaceObject(server_objects, v.target) catch return true;
-                    try Touch.encodeEvent(queue, slot.resource.id, .{ .down = .{
+                    try adapter.sendTimestamped(Touch, queue, slot, v.time_usec, .{ .down = .{
                         .serial = v.serial,
                         .time = v.time,
                         .surface = surface.id,
@@ -1652,11 +1662,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 },
                 .touch_up => |v| {
                     const slot = adapter.resolveTouch(v.touch) catch return true;
-                    try Touch.encodeEvent(queue, slot.resource.id, .{ .up = .{ .serial = v.serial, .time = v.time, .id = v.id } });
+                    try adapter.sendTimestamped(Touch, queue, slot, v.time_usec, .{ .up = .{ .serial = v.serial, .time = v.time, .id = v.id } });
                 },
                 .touch_motion => |v| {
                     const slot = adapter.resolveTouch(v.touch) catch return true;
-                    try Touch.encodeEvent(queue, slot.resource.id, .{ .motion = .{ .time = v.time, .id = v.id, .x = v.point.x, .y = v.point.y } });
+                    try adapter.sendTimestamped(Touch, queue, slot, v.time_usec, .{ .motion = .{ .time = v.time, .id = v.id, .x = v.point.x, .y = v.point.y } });
                 },
                 .touch_frame => |v| {
                     const slot = adapter.resolveTouch(v.touch) catch return true;
@@ -1668,6 +1678,17 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 },
             }
             return true;
+        }
+
+        fn sendTimestamped(adapter: *Self, comptime Interface: type, queue: *wayring.tx.Queue, slot: anytype, time_usec: ?u64, event: Interface.Event) !void {
+            if (adapter.timestamps) |timestamps| {
+                try timestamps.send(Interface, queue, .{ .slot = @intCast(slot.client.slot), .generation = slot.client.generation }, slot.resource, time_usec, event);
+            } else try Interface.encodeEvent(queue, slot.resource.id, event);
+        }
+
+        fn invalidateTimestamps(adapter: *Self, slot: anytype) void {
+            if (adapter.timestamps) |timestamps|
+                timestamps.invalidate(.{ .slot = @intCast(slot.client.slot), .generation = slot.client.generation }, slot.resource);
         }
 
         fn addDevice(adapter: *Self, id: input.DeviceId, capabilities: @import("../backend/input/platform.zig").Capabilities) !void {
@@ -1781,6 +1802,18 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             }
             adapter.enqueueCapabilities(old, current) catch unreachable;
             if (slot.capabilities.pointer and pointer_devices == 0)
+                for (adapter.pointers.entries.items) |pointer| {
+                    if (pointer.header.active) adapter.invalidateTimestamps(pointer);
+                };
+            if (slot.capabilities.keyboard and keyboard_devices == 0)
+                for (adapter.keyboards.entries.items) |keyboard| {
+                    if (keyboard.header.active) adapter.invalidateTimestamps(keyboard);
+                };
+            if (slot.capabilities.touch and touch_devices == 0)
+                for (adapter.touches.entries.items) |touch| {
+                    if (touch.header.active) adapter.invalidateTimestamps(touch);
+                };
+            if (slot.capabilities.pointer and pointer_devices == 0)
                 advanceCapabilityGeneration(&adapter.pointer_capability_generation);
             if (slot.capabilities.keyboard and keyboard_devices == 0)
                 advanceCapabilityGeneration(&adapter.keyboard_capability_generation);
@@ -1819,6 +1852,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     .target = delivery,
                     .serial = serial,
                     .time = millis(value.time_usec),
+                    .time_usec = value.time_usec,
                     .button = value.button,
                     .pressed = value.pressed,
                 } }) catch unreachable;
@@ -1868,6 +1902,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                                 .pointer = pointer,
                                 .target = target,
                                 .time = time,
+                                .time_usec = value.time_usec,
                                 .axis = entry[0],
                             },
                         }) catch unreachable;
@@ -1883,6 +1918,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                             .pointer = pointer,
                             .target = target,
                             .time = time,
+                            .time_usec = value.time_usec,
                             .axis = entry[0],
                             .value = fixedFromDelta(present.value),
                         } }) catch unreachable;
@@ -1952,6 +1988,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     .serial = serial,
                     .target = delivery,
                     .time = millis(value.time_usec),
+                    .time_usec = value.time_usec,
                     .key = value.key,
                     .pressed = value.pressed,
                 } }) catch unreachable;

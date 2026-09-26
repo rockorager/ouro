@@ -76,6 +76,7 @@ pub const xdg_toplevel_tag = @import("protocol/xdg_toplevel_tag.zig");
 pub const wayland_fixes = @import("protocol/wayland_fixes.zig");
 pub const xdg_system_bell = @import("protocol/xdg_system_bell.zig");
 pub const relative_pointer = @import("protocol/relative_pointer.zig");
+pub const input_timestamps = @import("protocol/input_timestamps.zig");
 pub const pointer_gestures = @import("protocol/pointer_gestures.zig");
 pub const tablet_v2 = @import("protocol/tablet_v2.zig");
 pub const idle_inhibit = @import("protocol/idle_inhibit.zig");
@@ -190,6 +191,7 @@ test {
     _ = xdg_toplevel_icon;
     _ = xdg_toplevel_tag;
     _ = relative_pointer;
+    _ = input_timestamps;
     _ = pointer_gestures;
     _ = tablet_v2;
     _ = idle_inhibit;

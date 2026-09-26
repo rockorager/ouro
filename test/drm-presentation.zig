@@ -3934,7 +3934,7 @@ const SessionLockClientHandler = struct {
                     if (std.mem.eql(u8, global.interface, protocol.wl_shm.info.name))
                         self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_shm.info, @min(global.version, 2), null);
                     if (std.mem.eql(u8, global.interface, protocol.wl_output.info.name)) {
-                        self.output = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_output.info, @min(global.version, 4), null);
+                        _ = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_output.info, @min(global.version, 4), null);
                         self.output_count += 1;
                     }
                     if (std.mem.eql(u8, global.interface, protocol.wl_seat.info.name))
@@ -3962,6 +3962,11 @@ const SessionLockClientHandler = struct {
             _ = try protocol.wl_shm.decodeEvent(message, fds);
         } else if (target.object.interface == &protocol.wl_output.info) {
             switch (try protocol.wl_output.decodeEvent(message, fds)) {
+                .name => |value| {
+                    const desired = if (self.minimum_outputs == 2) "VGA-2" else "ouro-0";
+                    if (std.mem.eql(u8, value.name, desired))
+                        self.output = self.objects.namespace.lookupHandle(message.header.object_id);
+                },
                 .done => {
                     if (self.output != null and message.header.object_id == self.output.?.id)
                         self.output_ready = true;
@@ -4481,7 +4486,7 @@ const OutputPowerClientHandler = struct {
                 .global => |global| {
                     if (std.mem.eql(u8, global.interface, protocol.wl_output.info.name)) {
                         if (self.output_count >= self.outputs.len) return error.UnexpectedOutput;
-                        self.outputs[self.output_count] = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_output.info, @min(global.version, 4), null);
+                        _ = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_output.info, @min(global.version, 4), null);
                         self.output_count += 1;
                     }
                     if (std.mem.eql(u8, global.interface, protocol.zwlr_output_power_manager_v1.info.name))
@@ -4492,6 +4497,10 @@ const OutputPowerClientHandler = struct {
             try self.maybeCreatePowers();
         } else if (target.object.interface == &protocol.wl_output.info) {
             switch (try protocol.wl_output.decodeEvent(message, fds)) {
+                .name => |value| {
+                    const index: usize = if (std.mem.eql(u8, value.name, "ouro-0")) 0 else if (std.mem.eql(u8, value.name, "VGA-2")) 1 else return error.UnexpectedOutput;
+                    self.outputs[index] = self.objects.namespace.lookupHandle(message.header.object_id);
+                },
                 .done => {
                     self.output_ready[
                         self.outputIndex(target.object) orelse
@@ -4590,7 +4599,6 @@ const GammaClientHandler = struct {
     manager: ?wayring.objects.Handle = null,
     output: ?wayring.objects.Handle = null,
     desired_output_index: usize,
-    output_count: usize = 0,
     control: ?wayring.objects.Handle = null,
     output_ready: bool = false,
     gamma_sizes: usize = 0,
@@ -4604,11 +4612,8 @@ const GammaClientHandler = struct {
         if (target.object.interface == &ClientCore.Registry.info) {
             switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
                 .global => |global| {
-                    if (std.mem.eql(u8, global.interface, protocol.wl_output.info.name)) {
-                        if (self.output_count == self.desired_output_index)
-                            self.output = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_output.info, @min(global.version, 4), null);
-                        self.output_count += 1;
-                    }
+                    if (std.mem.eql(u8, global.interface, protocol.wl_output.info.name))
+                        _ = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_output.info, @min(global.version, 4), null);
                     if (std.mem.eql(u8, global.interface, protocol.zwlr_gamma_control_manager_v1.info.name))
                         self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.zwlr_gamma_control_manager_v1.info, 1, null);
                 },
@@ -4617,8 +4622,15 @@ const GammaClientHandler = struct {
             try self.maybeCreateControl();
         } else if (target.object.interface == &protocol.wl_output.info) {
             switch (try protocol.wl_output.decodeEvent(message, fds)) {
+                .name => |value| {
+                    // Registry enumeration has no output ordering guarantee.
+                    const desired = if (self.desired_output_index == 0) "ouro-0" else "VGA-2";
+                    if (std.mem.eql(u8, value.name, desired))
+                        self.output = self.objects.namespace.lookupHandle(message.header.object_id);
+                },
                 .done => {
-                    self.output_ready = true;
+                    if (self.output != null and message.header.object_id == self.output.?.id)
+                        self.output_ready = true;
                     try self.maybeCreateControl();
                 },
                 else => {},
@@ -5470,7 +5482,8 @@ pub fn coordinatorConfig() Coordinator.Config {
     return .{ .cursor_directory = "/dev/null", .router_capacity = 12, .timer_capacity = 6, .device_capacity = 1, .shm = .{ .limits = .{ .max_pool_bytes = 4096 }, .pool_capacity = 1, .buffer_capacity = 1, .formats = &shm_formats }, .surface = .{ .surface_capacity = 1, .region_capacity = 1, .viewport_capacity = 1, .presentation_resource_capacity = 1, .presentation_feedback_capacity = 2, .region_operation_capacity = 1, .frame_callback_capacity = 1, .release_callback_capacity = 1, .content_update_capacity = 1, .dependency_capacity = 1, .attachment_capacity = 1, .copy_capacity = 1, .max_copy_bytes = pixels.len }, .drm = .{ .card_capacity = 1, .connector_capacity = 3, .mode_capacity = 3, .connector_encoder_capacity = 3, .encoder_capacity = 3, .crtc_capacity = 3, .plane_capacity = 3, .format_capacity = 3, .event_capacity = 4 }, .output = .{ .output_id = .{ .index = 0, .generation = 1 }, .scheduler = .{ .refresh_ns = 4 * std.time.ns_per_ms, .render_budget_ns = std.time.ns_per_ms }, .renderer = .pixman, .image_count = 2, .max_samples = 2, .max_source_bytes = pixels.len, .max_source_width = 3, .max_source_height = 2, .kms = .{ .event_capacity = 2 } } };
 }
 pub fn compositorConfig() Compositor.Config {
-    return .{ .ring = .{ .entries = 32 }, .reactor = clientReactorConfig(), .runtime = .{ .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .object_capacity = 32, .object_quota = 32, .buckets_per_client = 32, .max_globals = 64, .registry_capacity = 1 } };
+    // Leave room for output globals retained during connector rebuilds.
+    return .{ .ring = .{ .entries = 32 }, .reactor = clientReactorConfig(), .runtime = .{ .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .object_capacity = 32, .object_quota = 32, .buckets_per_client = 32, .max_globals = 128, .registry_capacity = 1 } };
 }
 pub fn clientReactorConfig() wayring.io_uring.Config {
     return .{ .receive_buffer_size = 4096, .receive_buffer_count = 4, .receive_control_capacity = 256, .fragment_block_size = 256, .fragment_block_count = 4, .transmit_block_size = 512, .transmit_block_count = 8, .descriptor_count = 4, .send_descriptor_capacity = 2 };

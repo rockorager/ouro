@@ -63,6 +63,7 @@ const protocol_xdg_toplevel_icon = @import("../protocol/xdg_toplevel_icon.zig");
 const protocol_wayland_fixes = @import("../protocol/wayland_fixes.zig");
 const protocol_xdg_system_bell = @import("../protocol/xdg_system_bell.zig");
 const protocol_relative_pointer = @import("../protocol/relative_pointer.zig");
+const protocol_input_timestamps = @import("../protocol/input_timestamps.zig");
 const protocol_pointer_gestures = @import("../protocol/pointer_gestures.zig");
 const protocol_idle_inhibit = @import("../protocol/idle_inhibit.zig");
 const protocol_idle_notify = @import("../protocol/idle_notify.zig");
@@ -389,6 +390,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const WaylandFixesAdapter = protocol_wayland_fixes.Adapter(protocol);
         const SystemBellAdapter = protocol_xdg_system_bell.Adapter(protocol);
         const RelativePointerAdapter = protocol_relative_pointer.Adapter(protocol, SeatAdapter);
+        const InputTimestampsAdapter = protocol_input_timestamps.Adapter(protocol);
         const PointerGesturesAdapter = protocol_pointer_gestures.Adapter(protocol);
         const IdleInhibitAdapter = protocol_idle_inhibit.Adapter(protocol, Adapter);
         const IdleNotifyAdapter = protocol_idle_notify.Adapter(protocol);
@@ -1037,6 +1039,7 @@ pub fn Coordinator(comptime protocol: type) type {
         wayland_fixes_adapter: WaylandFixesAdapter,
         system_bell_adapter: SystemBellAdapter,
         relative_pointer_adapter: RelativePointerAdapter,
+        input_timestamps_adapter: InputTimestampsAdapter,
         pointer_gestures_adapter: PointerGesturesAdapter,
         idle_inhibit_adapter: IdleInhibitAdapter,
         idle_notify_adapter: IdleNotifyAdapter,
@@ -1563,6 +1566,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.protocol_seat,
             );
             errdefer self.seat_adapter.deinit();
+            self.input_timestamps_adapter = try InputTimestampsAdapter.init(allocator);
+            errdefer self.input_timestamps_adapter.deinit();
+            self.seat_adapter.timestamps = &self.input_timestamps_adapter;
             self.transient_seat_adapter = try TransientSeatAdapter.init(
                 allocator,
                 .{},
@@ -2059,6 +2065,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.relative_pointer_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.input_timestamps_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.pointer_gestures_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -2504,6 +2513,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.tablet_adapter.deinit();
             self.tablet_state.deinit();
             self.seat_adapter.deinit();
+            self.input_timestamps_adapter.deinit();
             self.subcompositor_adapter.deinit();
             self.interaction.deinit();
             self.settings.deinit();
@@ -2892,6 +2902,8 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try self.wayland_fixes_adapter.request(peer, target, message, fds)) |control|
                 return control;
             if (try self.system_bell_adapter.request(peer, target, message, fds)) |control|
+                return control;
+            if (try self.input_timestamps_adapter.request(peer, target, message, fds)) |control|
                 return control;
             if (try self.relative_pointer_adapter.request(peer, target, message, fds)) |control| {
                 if (self.relative_pointer_adapter.pendingOutbound(peer))
@@ -4353,7 +4365,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     _ = try self.seat_adapter.touchDown(
                         touchContact(value),
                         target,
-                        @truncate(value.time_usec / 1000),
+                        value.time_usec,
                         point,
                         delivery.offset,
                     );
@@ -4362,7 +4374,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     const point = delivery.point orelse return;
                     self.seat_adapter.touchMotion(
                         touchContact(value),
-                        @truncate(value.time_usec / 1000),
+                        value.time_usec,
                         point,
                     ) catch |err| switch (err) {
                         error.StaleContact => {},
@@ -4372,7 +4384,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .touch_up => |value| {
                     _ = self.seat_adapter.touchUp(
                         touchContact(value),
-                        @truncate(value.time_usec / 1000),
+                        value.time_usec,
                     ) catch |err| switch (err) {
                         error.StaleContact => return,
                         else => return err,
@@ -6908,6 +6920,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .name = "transient",
                 .keymap = protocol_seat.default_keymap,
             });
+            adapter.timestamps = &self.input_timestamps_adapter;
         }
 
         fn resolveVirtualPointerOutput(
@@ -14382,6 +14395,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.wayland_fixes_adapter.resourceRemoved(handle, object);
             _ = self.system_bell_adapter.resourceRemoved(handle, object);
             _ = self.relative_pointer_adapter.resourceRemoved(handle, object);
+            _ = self.input_timestamps_adapter.resourceRemoved(handle, object);
             _ = self.pointer_gestures_adapter.resourceRemoved(handle, object);
             const idle_inhibit_removed = self.idle_inhibit_adapter.resourceRemoved(handle, object);
             const idle_notify_removed = self.idle_notify_adapter.resourceRemoved(handle, object);
