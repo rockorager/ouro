@@ -1119,8 +1119,30 @@ test "physical coordinator rebuilds an output when its modes change" {
     const unchanged_management_head = coordinator.physical_outputs[1].management_head;
     const drains_before = coordinator.stats.output_drains;
     const serial_before = coordinator.output_management_adapter.lifecycle.serial;
+    // Keep a flip outstanding so the refresh must wait across several turns.
+    fixture.held_crtc = 30;
+    const changed_kms = coordinator.physical_outputs[0].kms_output.?;
+    try changed_kms.request(.damage, 1);
+    coordinator.physical_outputs[0].damage_requested +%= 1;
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (changed_kms.in_flight_frame != null) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expect(changed_kms.in_flight_frame != null);
     fixture.first_mode_width = 4;
     try fixture.signalHotplug();
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.topology_refresh_wait == .output_drain) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expectEqual(.output_drain, coordinator.topology_refresh_wait);
+    const wait_started = coordinator.topology_refresh_wait_started.?;
+    try coordinator.prepare();
+    try coordinator.prepare();
+    try std.testing.expectEqual(wait_started, coordinator.topology_refresh_wait_started.?);
+    try fixture.releaseHeldFlips();
     for (0..512) |_| {
         _ = try loop.turn(coordinator);
         if (!coordinator.topology_refresh_pending and
@@ -1137,6 +1159,8 @@ test "physical coordinator rebuilds an output when its modes change" {
         coordinator.physical_outputs[0].protocol_output,
     );
     try std.testing.expectEqual(@as(?i32, 4), snapshot.width);
+    try std.testing.expectEqual(.none, coordinator.topology_refresh_wait);
+    try std.testing.expect(coordinator.topology_refresh_wait_started == null);
     try std.testing.expect(std.meta.eql(physical_id, coordinator.physical_outputs[0].id));
     try std.testing.expect(std.meta.eql(
         protocol_output,

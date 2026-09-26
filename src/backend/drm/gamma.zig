@@ -1,5 +1,6 @@
 //! Replaceable legacy DRM gamma boundary and exact-original restoration owner.
 const std = @import("std");
+const diagnostics = @import("../../diagnostics.zig");
 const c = @cImport({
     @cInclude("xf86drmMode.h");
 });
@@ -57,6 +58,11 @@ pub const Owner = struct {
         if (generation != self.generation) return error.StaleGeneration;
         const saved = self.original.?;
         const n = saved.len / 3;
+        diagnostics.logDisplay("gamma-restore-begin crtc={d} generation={d}", .{ self.crtc, generation });
+        const started = diagnostics.Stamp.now();
+        defer diagnostics.logDisplayDuration(started, "gamma-restore-end crtc={d} generation={d} restored={}", .{
+            self.crtc, generation, !self.dirty,
+        });
         try self.platform.set_fn(self.platform.context, self.fd, self.crtc, saved[0..n], saved[n..][0..n], saved[2 * n ..]);
         self.dirty = false;
     }

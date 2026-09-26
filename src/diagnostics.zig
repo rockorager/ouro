@@ -80,6 +80,18 @@ pub fn logDisplay(comptime format: []const u8, args: anytype) void {
     } ++ args);
 }
 
+/// End a cold-path display interval without making clock failures fatal.
+/// CPU time separates work on this thread from blocking or descheduling.
+pub fn logDisplayDuration(start: ?Stamp, comptime format: []const u8, args: anytype) void {
+    const end = Stamp.now();
+    const elapsed = if (start != null and end != null) end.?.ns -| start.?.ns else null;
+    const cpu = if (start != null and end != null and start.?.cpu_ns != null and end.?.cpu_ns != null)
+        end.?.cpu_ns.? -| start.?.cpu_ns.?
+    else
+        null;
+    logDisplay(format ++ " elapsed_ns={?d} cpu_ns={?d}", args ++ .{ elapsed, cpu });
+}
+
 /// Stack-owned context installed only while processing a candidate. No client
 /// pointers, strings, pixel data, titles, or input events enter the recorder.
 pub const Scope = struct {

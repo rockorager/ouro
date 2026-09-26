@@ -2,6 +2,7 @@
 //! Ouro-owned scalar or fixed-size record; no udev/libdrm pointer escapes.
 
 const std = @import("std");
+const diagnostics = @import("../../diagnostics.zig");
 
 const c = @cImport({
     @cInclude("libudev.h");
@@ -314,6 +315,11 @@ fn realEnableClientCaps(_: *anyopaque, fd: std.posix.fd_t) !void {
 }
 
 fn realReadTopology(_: *anyopaque, fd: std.posix.fd_t, out: *TopologyBuffer) !void {
+    diagnostics.logDisplay("drm-topology-begin fd={d}", .{fd});
+    const started = diagnostics.Stamp.now();
+    var failed = false;
+    defer diagnostics.logDisplayDuration(started, "drm-topology-end fd={d} failed={}", .{ fd, failed });
+    errdefer failed = true;
     out.reset();
     const resources = c.drmModeGetResources(fd) orelse return error.GetResourcesFailed;
     defer c.drmModeFreeResources(resources);
@@ -349,8 +355,14 @@ fn realReadTopology(_: *anyopaque, fd: std.posix.fd_t, out: *TopologyBuffer) !vo
     index = 0;
     while (index < @as(usize, @intCast(resources.*.count_connectors))) : (index += 1) {
         if (out.connector_count == out.connectors.len) return error.ConnectorCapacityExceeded;
-        const connector = c.drmModeGetConnector(fd, resources.*.connectors[index]) orelse
-            return error.GetConnectorFailed;
+        const connector_id = resources.*.connectors[index];
+        diagnostics.logDisplay("drm-connector-probe-begin fd={d} connector={d}", .{ fd, connector_id });
+        const probe_started = diagnostics.Stamp.now();
+        const probed = c.drmModeGetConnector(fd, connector_id);
+        diagnostics.logDisplayDuration(probe_started, "drm-connector-probe-end fd={d} connector={d} success={} connected={}", .{
+            fd, connector_id, probed != null, if (probed) |value| value.*.connection == c.DRM_MODE_CONNECTED else false,
+        });
+        const connector = probed orelse return error.GetConnectorFailed;
         defer c.drmModeFreeConnector(connector);
         const mode_start = out.mode_count;
         var mode_index: usize = 0;

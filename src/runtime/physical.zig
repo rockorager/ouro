@@ -503,6 +503,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const TabletAdapter = protocol_tablet_v2.Adapter(protocol, SeatAdapter);
 
         const Imported = struct {};
+        const TopologyRefreshWait = enum { none, output_removal, lease_cleanup, output_drain };
         const OutputReconfigure = struct {
             previous: protocol_output_management.HeadState,
             desired: protocol_output_management.HeadState,
@@ -989,6 +990,8 @@ pub fn Coordinator(comptime protocol: type) type {
         drm_remove_pending: bool = false,
         topology_refresh_pending: bool = false,
         topology_refresh_draining: bool = false,
+        topology_refresh_wait: TopologyRefreshWait = .none,
+        topology_refresh_wait_started: ?diagnostics.Stamp = null,
         output_global_index: usize = 1,
         pending_output_removals: usize = 0,
         output_reconfigure: ?OutputReconfigureTransaction = null,
@@ -1479,6 +1482,8 @@ pub fn Coordinator(comptime protocol: type) type {
             self.drm_remove_pending = false;
             self.topology_refresh_pending = false;
             self.topology_refresh_draining = false;
+            self.topology_refresh_wait = .none;
+            self.topology_refresh_wait_started = null;
             self.output_global_index = 1;
             self.pending_output_removals = 0;
             self.output_reconfigure = null;
@@ -13800,7 +13805,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 if (!pending) return;
             }
-            if (self.stopping) try self.processInput();
+            if (self.stopping) {
+                self.traceTopologyRefreshWait(.none);
+                try self.processInput();
+            }
             if (self.input) |input| {
                 _ = input.quiesceComplete();
             }
@@ -13898,13 +13906,34 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.session.beginDrain(&self.router, &self.root.ring);
         }
 
+        fn traceTopologyRefreshWait(self: *Self, reason: TopologyRefreshWait) void {
+            if (reason == self.topology_refresh_wait) return;
+            if (self.topology_refresh_wait != .none)
+                diagnostics.logDisplayDuration(self.topology_refresh_wait_started, "refresh-wait-end reason={t} stopping={}", .{
+                    self.topology_refresh_wait, self.stopping,
+                });
+            self.topology_refresh_wait = reason;
+            self.topology_refresh_wait_started = null;
+            if (reason != .none) {
+                diagnostics.logDisplay("refresh-wait-begin reason={t}", .{reason});
+                self.topology_refresh_wait_started = diagnostics.Stamp.now();
+            }
+        }
+
         fn advanceTopologyRefresh(self: *Self) !void {
             for (self.physical_outputs[0..self.physical_output_count]) |physical|
-                if (physical.removing) return;
+                if (physical.removing) {
+                    self.traceTopologyRefreshWait(.output_removal);
+                    return;
+                };
             try self.advanceDrmLeaseGlobal();
             if (self.drm_lease_global_update != .none or
                 self.drm_lease_adapter.installed() or
-                self.drm_lease_adapter.retryRevocations()) return;
+                self.drm_lease_adapter.retryRevocations())
+            {
+                self.traceTopologyRefreshWait(.lease_cleanup);
+                return;
+            }
             if (self.anyKmsOutput()) {
                 if (self.topology_refresh_draining and
                     self.hotplug_updated_connector_count != 0)
@@ -13914,15 +13943,23 @@ pub fn Coordinator(comptime protocol: type) type {
                             u32,
                             self.hotplug_updated_connector_ids[0..self.hotplug_updated_connector_count],
                             physical.connector_id,
-                        ) != null and physical.kms_output != null) return;
+                        ) != null and physical.kms_output != null) {
+                            self.traceTopologyRefreshWait(.output_drain);
+                            return;
+                        }
                     }
+                    self.traceTopologyRefreshWait(.none);
                     try self.refreshChangedTopology();
                 } else if (!self.topology_refresh_draining) {
+                    self.traceTopologyRefreshWait(.none);
                     try self.refreshActiveTopology();
+                } else {
+                    self.traceTopologyRefreshWait(.output_drain);
                 }
                 return;
             }
 
+            self.traceTopologyRefreshWait(.none);
             try self.retireGammaOwners();
             const handle = (self.manager.rescan() catch |cause| switch (cause) {
                 error.NoConnectedOutput => return,

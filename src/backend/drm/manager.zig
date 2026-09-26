@@ -439,11 +439,22 @@ pub const Manager = struct {
         refreshed_handles: ?[]ClaimHandle,
         invalidate_unpreserved: bool,
     ) !?Handle {
+        diagnostics.logDisplay("drm-rescan-begin generation={d} preserving={} replacing={}", .{
+            self.generation, preserved_handles != null, invalidate_unpreserved,
+        });
+        const started = diagnostics.Stamp.now();
+        var failed = false;
+        defer diagnostics.logDisplayDuration(started, "drm-rescan-end generation={d} failed={}", .{ self.generation, failed });
+        errdefer failed = true;
         if (self.hasActiveLease()) return error.LeasesActive;
         const preserved = preserved_handles orelse &.{};
         const rebound = try self.allocator.alloc(ScanoutCandidate, preserved.len);
         defer self.allocator.free(rebound);
-        const card_count = try self.platform.discover(self.cards, self.seat[0..self.seat_len]);
+        const card_count = discover: {
+            const discovery_started = diagnostics.Stamp.now();
+            defer diagnostics.logDisplayDuration(discovery_started, "drm-discovery-end", .{});
+            break :discover try self.platform.discover(self.cards, self.seat[0..self.seat_len]);
+        };
         if (card_count > self.cards.len) return error.InvalidPlatformResult;
         const selected_card = selectCard(
             self.cards[0..card_count],
@@ -627,6 +638,11 @@ pub const Manager = struct {
         desktop_output: []u32,
         updated_output: []u32,
     ) !struct { desktop: []const u32, desktop_updated: []const u32, lease_changed: bool } {
+        diagnostics.logDisplay("drm-probe-begin generation={d}", .{handle.generation});
+        const started = diagnostics.Stamp.now();
+        var failed = false;
+        defer diagnostics.logDisplayDuration(started, "drm-probe-end generation={d} failed={}", .{ handle.generation, failed });
+        errdefer failed = true;
         if (!self.present or handle.generation != self.generation)
             return error.StaleSnapshot;
         const fd = try self.session.deviceFd(self.device orelse return error.StaleSnapshot);

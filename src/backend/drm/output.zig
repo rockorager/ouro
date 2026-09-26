@@ -141,6 +141,7 @@ const CommitRecord = struct {
     overlay_image: ?framebuffer.Handle = null,
     callback_count: u32 = 0,
     fact: FlipFact = undefined,
+    modeset_started: ?diagnostics.Stamp = null,
 };
 
 const Queued = struct {
@@ -484,6 +485,10 @@ pub const Output = struct {
             .nonblock = true,
             .page_flip_event = true,
         };
+        if (modeset) diagnostics.logDisplay("kms-modeset-begin connector={d} crtc={d} topology={d} kms_generation={d}", .{
+            self.connector.id, self.crtc.id, self.snapshot_handle.generation, self.output_generation,
+        });
+        record.modeset_started = if (modeset) diagnostics.Stamp.now() else null;
         self.platform.commit(fd, record.request, flags, record) catch |err| {
             std.log.warn("DRM scanout commit rejected: connector={d} crtc={d} plane={d} framebuffer={d} modeset={} overlay={} error={t}", .{
                 self.connector.id, self.crtc.id, self.plane.id, image.framebuffer_id, modeset, queued.overlay != null, err,
@@ -492,7 +497,7 @@ pub const Output = struct {
             try self.rollbackRecordAndQueued(record);
             return err;
         };
-        if (modeset) diagnostics.logDisplay("kms-modeset-submitted connector={d} crtc={d} plane={d} topology={d} kms_generation={d}", .{
+        if (modeset) diagnostics.logDisplayDuration(record.modeset_started, "kms-modeset-submitted connector={d} crtc={d} plane={d} topology={d} kms_generation={d}", .{
             self.connector.id, self.crtc.id, self.plane.id, self.snapshot_handle.generation, self.output_generation,
         });
         // validateSubmit above makes this infallible under the single-thread
@@ -590,6 +595,15 @@ pub const Output = struct {
             return self.failCallback(.callback_mismatch);
         if (self.event_count == self.events_buffer.len) return error.EventQueueFull;
 
+        // This measures submission to userspace dispatch, not panel light-up.
+        // Keep the kernel event timestamp separate: its clock may differ.
+        if (record.modeset_started) |started| {
+            diagnostics.logDisplayDuration(started, "kms-modeset-first-flip connector={d} crtc={d} topology={d} kms_generation={d} sequence={d} event_sec={d} event_usec={d}", .{
+                self.connector.id,    self.crtc.id,        self.snapshot_handle.generation, self.output_generation,
+                record.fact.sequence, record.fact.seconds, record.fact.microseconds,
+            });
+            record.modeset_started = null;
+        }
         const previous = self.current;
         const previous_overlay = self.current_overlay;
         if (previous) |old| try releaseDisplayed(self.images, old);
@@ -941,6 +955,7 @@ pub const Output = struct {
     fn rollbackRecordAndQueued(self: *Output, record: *CommitRecord) !void {
         self.platform.resetRequest(record.request);
         record.state = .free;
+        record.modeset_started = null;
         try self.rollbackQueued();
     }
 
@@ -1002,6 +1017,7 @@ fn retireRecord(platform: atomic.Platform, record: *CommitRecord) void {
     platform.resetRequest(record.request);
     record.callback_count = 0;
     record.overlay_image = null;
+    record.modeset_started = null;
     if (record.generation == std.math.maxInt(u32)) {
         record.state = .retired;
     } else {
@@ -1053,6 +1069,7 @@ test "kms: real commit failure rolls back and discards" {
     try std.testing.expectEqual(@as(usize, 0), fixture.images_state.submit_count);
     try std.testing.expect(fixture.atomic_state.commits[0].flags.test_only);
     try std.testing.expect(!fixture.atomic_state.commits[1].flags.test_only);
+    for (output.records) |record| try std.testing.expect(record.modeset_started == null);
     try fixture.destroy(output);
 }
 
@@ -1433,22 +1450,36 @@ test "kms: flips present new and release only previous scanout" {
     const first = fixture.acquire(0);
     try output.queue(first, null);
     try output.commitQueued();
+    const first_record = &output.records[output.in_flight_slot.?];
+    try std.testing.expect(first_record.modeset_started != null);
     try std.testing.expectEqual(@as(usize, 1), fixture.images_state.submit_count);
     try std.testing.expectEqual(@as(usize, 0), fixture.images_state.release_count);
     fixture.flip(output, fixture.crtc[0].id, false);
     try output.processCallbacks();
+    try std.testing.expect(first_record.modeset_started == null);
     try std.testing.expectEqual(first, output.current.?);
     try std.testing.expectEqual(@as(usize, 0), fixture.images_state.release_count);
 
     const second = fixture.acquire(1);
     try output.queue(second, null);
     try output.commitQueued();
+    try std.testing.expect(output.records[output.in_flight_slot.?].modeset_started == null);
     fixture.flip(output, fixture.crtc[0].id, false);
     try output.processCallbacks();
     try std.testing.expectEqual(second, output.current.?);
     try std.testing.expectEqualSlices(framebuffer.Handle, &.{first}, fixture.images_state.released[0..fixture.images_state.release_count]);
     try output.requestPause();
     try std.testing.expectEqualSlices(framebuffer.Handle, &.{ first, second }, fixture.images_state.released[0..fixture.images_state.release_count]);
+    output.clearEvents();
+    // A resume is another modeset, unlike the ordinary second frame above.
+    try output.queue(fixture.acquire(0), null);
+    try output.commitQueued();
+    const resumed_record = &output.records[output.in_flight_slot.?];
+    try std.testing.expect(resumed_record.modeset_started != null);
+    fixture.flip(output, fixture.crtc[0].id, false);
+    try output.processCallbacks();
+    try std.testing.expect(resumed_record.modeset_started == null);
+    try output.requestPause();
     try fixture.drainAndDestroy(output);
 }
 
