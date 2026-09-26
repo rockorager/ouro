@@ -2344,21 +2344,30 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     coordinator.session_lock_adapter.fail_closed = false;
 
     const motion_before_warp = handler.pointer_motion;
+    const warp_before_request = handler.pointer_warp;
+    const frames_before_warp = handler.pointer_frame;
+    const previous_point = coordinator.seat_adapter.pointerState().point;
+    try std.testing.expect(previous_point.x != 384 or previous_point.y != 128);
     try handler.queuePointerWarp();
     try submitClient(&client_reactor, &driver, &handler);
     for (0..64) |_| {
         client_progress = try drainClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
         const point = coordinator.seat_adapter.pointerState().point;
-        if (point.x == 256 and point.y == 256) break;
+        if (point.x == 384 and point.y == 128 and handler.pointer_warp > warp_before_request and
+            handler.pointer_frame > frames_before_warp) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
     try std.testing.expectEqual(
-        ouro.seat.Adapter(protocol, ouro.core_surface.Adapter(protocol)).Point{ .x = 256, .y = 256 },
+        ouro.seat.Adapter(protocol, ouro.core_surface.Adapter(protocol)).Point{ .x = 384, .y = 128 },
         coordinator.seat_adapter.pointerState().point,
     );
     try std.testing.expectEqual(motion_before_warp, handler.pointer_motion);
+    try std.testing.expectEqual(warp_before_request + 1, handler.pointer_warp);
+    try std.testing.expectEqual(@as(i32, 384), handler.pointer_warp_x);
+    try std.testing.expectEqual(@as(i32, 128), handler.pointer_warp_y);
+    try std.testing.expectEqual(frames_before_warp + 1, handler.pointer_frame);
     for (0..64) |_| {
         if (coordinator.stats.presented >= 4) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
@@ -9495,6 +9504,9 @@ const Handler = struct {
     pointer_warp_queued: bool = false,
     test_pointer_warp: bool = false,
     pointer_motion: usize = 0,
+    pointer_warp: usize = 0,
+    pointer_warp_x: i32 = 0,
+    pointer_warp_y: i32 = 0,
     pointer_button: usize = 0,
     virtual_pointer_button_times: u4 = 0,
     zero_time_pointer_buttons: usize = 0,
@@ -9814,6 +9826,11 @@ const Handler = struct {
                     }
                 },
                 .motion => self.pointer_motion += 1,
+                .warp => |value| {
+                    self.pointer_warp += 1;
+                    self.pointer_warp_x = value.surface_x;
+                    self.pointer_warp_y = value.surface_y;
+                },
                 .button => |value| {
                     self.pointer_button += 1;
                     if (value.time >= 13 and value.time <= 16)
@@ -10074,7 +10091,7 @@ const Handler = struct {
         if (std.mem.eql(u8, value.interface, protocol.xdg_wm_base.info.name))
             self.wm_base = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_wm_base.info, @min(value.version, 7), null);
         if (std.mem.eql(u8, value.interface, protocol.wl_seat.info.name))
-            self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_seat.info, @min(value.version, 9), null);
+            self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_seat.info, @min(value.version, 11), null);
         if (self.test_text_input and std.mem.eql(u8, value.interface, protocol.zwp_text_input_manager_v3.info.name))
             self.text_input_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwp_text_input_manager_v3.info, 1, null);
         if (self.test_text_input) {
@@ -10544,8 +10561,8 @@ const Handler = struct {
             .{ .warp_pointer = .{
                 .surface = self.surface.?.id,
                 .pointer = self.pointer.?.id,
-                .x = 256,
-                .y = 256,
+                .x = 384,
+                .y = 128,
                 .serial = self.pointer_enter_serial,
             } },
         );

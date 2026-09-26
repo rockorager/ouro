@@ -80,6 +80,7 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
         };
         pub const Command = union(enum) {
             pointer_focus: ?Target,
+            pointer_relocated: ?Target,
             keyboard_focus: Target,
             cancel: Cancellation,
             key_consumed,
@@ -369,9 +370,13 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             return self.output_areas[0..self.output_area_len];
         }
 
+        pub fn canWarpPointer(self: *const Self, x_fixed: i64, y_fixed: i64) bool {
+            return fixedPointInAreas(x_fixed, y_fixed, self.outputAreas());
+        }
+
         /// Applies a validated surface-local warp without synthesizing input.
         pub fn warpPointer(self: *Self, target: Target, x_fixed: i64, y_fixed: i64) bool {
-            if (!fixedPointInAreas(x_fixed, y_fixed, self.outputAreas())) return false;
+            if (!self.canWarpPointer(x_fixed, y_fixed)) return false;
             self.x_fixed = x_fixed;
             self.y_fixed = y_fixed;
             self.hover = target;
@@ -608,7 +613,13 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             if (self.mode != .default) return;
             const target = try self.targetAtPointer(desktop, surfaces, self.x_fixed, self.y_fixed);
             try self.ensureCommandCapacity(1);
-            if (!std.meta.eql(self.hover, target)) self.enqueue(.{ .pointer_focus = target });
+            if (!std.meta.eql(self.hover, target)) {
+                if (self.hover != null and target != null and
+                    std.meta.eql(self.hover.?.surface, target.?.surface))
+                {
+                    self.enqueue(.{ .pointer_relocated = target });
+                } else self.enqueue(.{ .pointer_focus = target });
+            }
             self.hover = target;
             self.pointer_inside = target != null;
             self.resize_handle = if (target != null and !target.?.managed) null else try desktop.resizeHandleAt(self.pointerPosition());
@@ -1043,7 +1054,7 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             while (offset < self.command_len) : (offset += 1) {
                 const command = self.commands[(self.command_head + offset) % self.commands.len];
                 switch (command) {
-                    .pointer_focus, .keyboard_focus => continue,
+                    .pointer_focus, .pointer_relocated, .keyboard_focus => continue,
                     else => {},
                 }
                 self.commands[(self.command_head + retained) % self.commands.len] = command;
@@ -1152,7 +1163,7 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             surface: ?SurfaceId,
         ) bool {
             return switch (command) {
-                .pointer_focus => |target| matches(target, toplevel, surface),
+                .pointer_focus, .pointer_relocated => |target| matches(target, toplevel, surface),
                 .keyboard_focus => |target| matches(target, toplevel, surface),
                 .cancel => false,
                 .key_consumed => false,
@@ -1746,6 +1757,21 @@ test "interaction: stationary pointer reflow does not override policy keyboard f
     interaction.dropCommand();
     try std.testing.expectEqual(desktop.windows[0].surface, interaction.keyboard_focus.?.surface);
     try std.testing.expectEqual(desktop.windows[0].id, desktop.focused.?);
+
+    // Moving the same surface beneath a stationary pointer is relocation,
+    // not device motion or a new enter, and keeps policy-selected focus.
+    const position = interaction.pointerPositionFixed();
+    desktop.windows[1].geometry.x = 11;
+    try interaction.reconcilePointer(&desktop, &surfaces);
+    const relocated = interaction.peekCommand().?.pointer_relocated.?;
+    try std.testing.expectEqual(desktop.windows[1].surface, relocated.surface);
+    // Initial (1, 1) plus physical motion (12, 7), minus window (11, 5).
+    try std.testing.expectEqual(@as(i32, 2 * 256), relocated.point.x);
+    try std.testing.expectEqual(@as(i32, 3 * 256), relocated.point.y);
+    try std.testing.expectEqual(position, interaction.pointerPositionFixed());
+    interaction.dropCommand();
+    try interaction.reconcilePointer(&desktop, &surfaces);
+    try std.testing.expectEqual(@as(usize, 0), interaction.pendingCommands());
 
     // Actual movement still follows the mouse.
     try interaction.consume(&desktop, &surfaces, .{ .pointer_motion = .{

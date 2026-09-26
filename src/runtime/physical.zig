@@ -6288,7 +6288,7 @@ pub fn Coordinator(comptime protocol: type) type {
             var applied = false;
             while (self.interaction.peekCommand()) |command| {
                 switch (command) {
-                    .pointer_focus => |target| {
+                    .pointer_focus, .pointer_relocated => |target| {
                         const seat_target = if (target) |value|
                             try self.seatTarget(value.surface)
                         else
@@ -6305,7 +6305,13 @@ pub fn Coordinator(comptime protocol: type) type {
                             ) orelse self.seat_adapter.pointerState().point,
                             .idle => {},
                         }
-                        try self.seat_adapter.setPointerFocus(seat_target, delivery_point);
+                        if (command == .pointer_relocated) {
+                            try self.seat_adapter.relocatePointerFocus(
+                                seat_target,
+                                delivery_point,
+                                @truncate((try monotonicNs()) / std.time.ns_per_ms),
+                            );
+                        } else try self.seat_adapter.setPointerFocus(seat_target, delivery_point);
                         try self.pointer_constraints_adapter.updateFocus(
                             if (target) |value| value.surface else null,
                             .{ .x = focus_point.x, .y = focus_point.y },
@@ -6700,8 +6706,12 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             const global_x = @as(i64, origin_x) * 256 + x;
             const global_y = @as(i64, origin_y) * 256 + y;
-            if (!self.interaction.warpPointer(target, global_x, global_y)) return;
-            if (!self.seat_adapter.applyPointerWarp(surface, .{ .x = x, .y = y })) unreachable;
+            if (!self.interaction.canWarpPointer(global_x, global_y)) return;
+            const time_ms: u32 = @truncate((monotonicNs() catch return) / std.time.ns_per_ms);
+            if (!(self.seat_adapter.applyPointerWarp(surface, .{ .x = x, .y = y }, time_ms) catch return)) return;
+            const warped = self.interaction.warpPointer(target, global_x, global_y);
+            std.debug.assert(warped);
+            if (self.seat_adapter.pendingOutbound() != 0) self.markProtocolAll(ProtocolReady.seat);
             self.requestCursorRedraw() catch {};
         }
 

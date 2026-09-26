@@ -59,7 +59,7 @@ pub const Config = struct {
     keymap: []const u8,
     repeat_rate: i32 = 25,
     repeat_delay: i32 = 600,
-    global_version: u32 = 10,
+    global_version: u32 = 11,
     initial_serial: u32 = 1,
 
     fn validate(config: Config) !void {
@@ -184,6 +184,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             pointer_enter: struct { pointer: Id, serial: u32, target: FocusTarget, point: Point },
             pointer_leave: struct { pointer: Id, serial: u32, target: FocusTarget },
             pointer_motion: struct { pointer: Id, target: FocusTarget, time: u32, point: Point },
+            pointer_warp: struct { pointer: Id, target: FocusTarget, time: u32, point: Point },
             pointer_button: struct { pointer: Id, target: ?FocusTarget, serial: u32, time: u32, button: u32, pressed: bool },
             pointer_axis_source: struct { pointer: Id, target: FocusTarget, source: input_platform.AxisSource },
             pointer_axis: struct { pointer: Id, target: FocusTarget, time: u32, axis: Axis, value: i32 },
@@ -730,11 +731,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 std.meta.eql(delivery.surface, surface);
         }
 
-        pub fn applyPointerWarp(adapter: *Self, surface: SurfaceId, point: Point) bool {
+        pub fn applyPointerWarp(adapter: *Self, surface: SurfaceId, point: Point, time_ms: u32) !bool {
             const delivery = adapter.deliveryTarget() orelse return false;
             if (!std.meta.eql(delivery.surface, surface)) return false;
-            adapter.pointer_point = point;
-            adapter.pointer_focus = delivery;
+            try adapter.relocatePointerFocus(delivery, point, time_ms);
             return true;
         }
 
@@ -1056,6 +1056,30 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             adapter.pointer_point = point;
             try adapter.transitionPointer(target);
             adapter.pointer_focus = target;
+        }
+
+        /// Publishes compositor-induced relocation separately from input motion.
+        /// A new focus gets enter only; a retained focus gets its own warp frame.
+        pub fn relocatePointerFocus(adapter: *Self, target: ?FocusTarget, point: Point, time_ms: u32) !void {
+            const relocated = target != null and optionalTargetEqual(adapter.deliveryTarget(), target) and
+                !std.meta.eql(adapter.pointer_point, point);
+            if (relocated) try adapter.ensureOutbound(adapter.pointerResourceCount(target.?.client) * 2);
+            try adapter.setPointerFocus(target, point);
+            if (!relocated) return;
+            const delivery = target.?;
+            for (adapter.pointers.entries.items, 0..) |slot, index| if (adapter.pointerBelongs(slot, delivery.client)) {
+                const id: Id = .{ .index = @intCast(index), .generation = slot.header.generation };
+                adapter.enqueue(delivery.client, .{ .pointer_warp = .{
+                    .pointer = id,
+                    .target = delivery,
+                    .time = time_ms,
+                    .point = point,
+                } }) catch unreachable;
+                adapter.enqueue(delivery.client, .{ .pointer_frame = .{
+                    .pointer = id,
+                    .target = delivery,
+                } }) catch unreachable;
+            };
         }
 
         pub fn setKeyboardFocus(adapter: *Self, target: ?FocusTarget) !void {
@@ -1468,6 +1492,23 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         .surface_x = v.point.x,
                         .surface_y = v.point.y,
                     } });
+                },
+                .pointer_warp => |v| {
+                    const slot = adapter.resolvePointer(v.pointer) catch return true;
+                    _ = adapter.surfaceObject(server_objects, v.target) catch return true;
+                    const object = server_objects.namespace.resolve(slot.resource) orelse return true;
+                    if (object.version >= 11) {
+                        try Pointer.encodeEvent(queue, slot.resource.id, .{ .warp = .{
+                            .surface_x = v.point.x,
+                            .surface_y = v.point.y,
+                        } });
+                    } else {
+                        try Pointer.encodeEvent(queue, slot.resource.id, .{ .motion = .{
+                            .time = v.time,
+                            .surface_x = v.point.x,
+                            .surface_y = v.point.y,
+                        } });
+                    }
                 },
                 .pointer_button => |v| {
                     const slot = adapter.resolvePointer(v.pointer) catch return true;
@@ -2405,6 +2446,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     .pointer_enter => |v| if (kind == .pointer) v.pointer else null,
                     .pointer_leave => |v| if (kind == .pointer) v.pointer else null,
                     .pointer_motion => |v| if (kind == .pointer) v.pointer else null,
+                    .pointer_warp => |v| if (kind == .pointer) v.pointer else null,
                     .pointer_button => |v| if (kind == .pointer) v.pointer else null,
                     .pointer_axis_source => |v| if (kind == .pointer) v.pointer else null,
                     .pointer_axis => |v| if (kind == .pointer) v.pointer else null,
@@ -2558,6 +2600,7 @@ fn outboundTargets(value: anytype, surface: anytype) bool {
         .pointer_enter => |v| std.meta.eql(v.target.surface, surface),
         .pointer_leave => |v| std.meta.eql(v.target.surface, surface),
         .pointer_motion => |v| std.meta.eql(v.target.surface, surface),
+        .pointer_warp => |v| std.meta.eql(v.target.surface, surface),
         .pointer_button => |v| v.target != null and std.meta.eql(v.target.?.surface, surface),
         .pointer_axis_source => |v| std.meta.eql(v.target.surface, surface),
         .pointer_axis => |v| std.meta.eql(v.target.surface, surface),
@@ -2627,6 +2670,88 @@ fn testAdapterWithCapacity(core: *FakeCore, outbound_capacity: usize, event_capa
 
 fn clearTestOutbound(adapter: *TestAdapter) void {
     for (adapter.outbound) |*slot| if (slot.active) adapter.removeOutbound(slot);
+}
+
+test "seat: relocation emits versioned events in separate frames across backpressure" {
+    for ([_]u32{ 10, 11 }) |version| {
+        var core: FakeCore = .{};
+        var adapter = try testAdapter(&core);
+        defer adapter.deinit();
+        var server_objects = try wayring.objects.ServerObjects.init(std.testing.allocator, 16, 4, &TestCore.Display.info, null);
+        defer server_objects.deinit(std.testing.allocator);
+        var surface_context: u8 = 0;
+        const surface = try server_objects.insertClient(10, &test_protocol.wl_surface.info, 7, &surface_context);
+        core.generation = surface.generation;
+        const peer: wayring.io_uring.Peer = .{ .slot = 0, .generation = 3 };
+        const target = try adapter.makeTarget(peer, .{ .index = 0, .generation = surface.generation });
+        const pointer = try adapter.pointers.acquire();
+        pointer.client = clientId(peer);
+        pointer.resource = try server_objects.insertClient(3, &test_protocol.wl_pointer.info, version, pointer);
+
+        try adapter.relocatePointerFocus(target, .{ .x = 256, .y = 512 }, 19);
+        try adapter.relocatePointerFocus(target, .{ .x = 1793, .y = -769 }, 23);
+        try adapter.relocatePointerFocus(target, .{ .x = 1793, .y = -769 }, 24);
+        try std.testing.expectEqual(@as(usize, 4), adapter.pendingOutbound());
+
+        var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 2);
+        defer blocks.deinit(std.testing.allocator);
+        var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+        defer descriptors.deinit(std.testing.allocator);
+        var blocked = wayring.tx.Queue.init(&blocks, 8, &descriptors, 0);
+        defer blocked.deinit();
+        try std.testing.expectEqual(@as(usize, 0), try adapter.flushOn(peer, &server_objects, &blocked));
+        try std.testing.expectEqual(@as(usize, 4), adapter.pendingOutbound());
+        var output = wayring.tx.Queue.init(&blocks, 256, &descriptors, 0);
+        defer output.deinit();
+        try std.testing.expectEqual(@as(usize, 4), try adapter.flushOn(peer, &server_objects, &output));
+        var descriptor_scratch: [1]linux.fd_t = undefined;
+        var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+        const snapshot = try output.snapshot(&descriptor_scratch, &control);
+        var bytes = snapshot.first;
+        const expected = [_]std.meta.Tag(test_protocol.wl_pointer.Event){ .enter, .frame, if (version == 11) .warp else .motion, .frame };
+        for (expected) |tag| {
+            const message = (try wayring.wire.Message.decode(bytes)).?;
+            const event = try test_protocol.wl_pointer.decodeEvent(message, &output.descriptors);
+            try std.testing.expectEqual(tag, std.meta.activeTag(event));
+            switch (event) {
+                .enter => |value| {
+                    try std.testing.expectEqual(@as(i32, 256), value.surface_x);
+                    try std.testing.expectEqual(@as(i32, 512), value.surface_y);
+                },
+                .warp => |value| {
+                    try std.testing.expectEqual(@as(i32, 1793), value.surface_x);
+                    try std.testing.expectEqual(@as(i32, -769), value.surface_y);
+                },
+                .motion => |value| {
+                    try std.testing.expectEqual(@as(u32, 23), value.time);
+                    try std.testing.expectEqual(@as(i32, 1793), value.surface_x);
+                    try std.testing.expectEqual(@as(i32, -769), value.surface_y);
+                },
+                else => {},
+            }
+            bytes = bytes[message.header.size..];
+        }
+        try std.testing.expectEqual(@as(usize, 0), bytes.len);
+        try std.testing.expectEqual(@as(usize, 0), adapter.pendingOutbound());
+    }
+}
+
+test "seat: relocation admission failure preserves coordinates and removal drops pending warp" {
+    var core: FakeCore = .{};
+    var adapter = try testAdapterWithCapacity(&core, 2, 2);
+    defer adapter.deinit();
+    const peer: wayring.io_uring.Peer = .{ .slot = 0, .generation = 3 };
+    const target = try adapter.makeTarget(peer, .{ .index = 0, .generation = 1 });
+    const pointer = try adapter.pointers.acquire();
+    pointer.client = clientId(peer);
+    try adapter.setPointerFocus(target, .{ .x = 31, .y = 47 });
+    try std.testing.expectError(error.Exhausted, adapter.relocatePointerFocus(target, .{ .x = 53, .y = 71 }, 11));
+    try std.testing.expectEqual(TestAdapter.Point{ .x = 31, .y = 47 }, adapter.pointerState().point);
+    clearTestOutbound(&adapter);
+    try adapter.relocatePointerFocus(target, .{ .x = 53, .y = 71 }, 11);
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_warp));
+    adapter.surfaceRemoved(target.surface);
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingOutbound());
 }
 
 test "seat: pointer focus transitions complete frames atomically" {
@@ -3028,9 +3153,10 @@ test "seat: relative pointer lookup retains exact resource generation and focus"
         .{ .index = 1, .generation = 1 },
         44,
     ));
-    try std.testing.expect(adapter.applyPointerWarp(
+    try std.testing.expect(try adapter.applyPointerWarp(
         adapter.pointer_delivery.?.surface,
         .{ .x = 7 * 256, .y = 9 * 256 },
+        17,
     ));
     try std.testing.expectEqual(TestAdapter.Point{ .x = 7 * 256, .y = 9 * 256 }, adapter.pointerState().point);
     try std.testing.expect(!adapter.validateCursorShapeOn(
