@@ -2917,6 +2917,29 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
             try std.testing.expectEqual(expected.x, info.hotspot.x);
             try std.testing.expectEqual(expected.y, info.hotspot.y);
         }
+        // The dragged application is shifted one pixel left. Check the actual
+        // Pixman scanout, including erasure of the previous cursor position.
+        var expected_rows = [2][12]u8{
+            .{ 0x40, 0x50, 0x60, 0xff, 0x70, 0x80, 0x90, 0xff, 0, 0, 0, 0xff },
+            .{ 0xd0, 0xe0, 0xf0, 0xff, 0x11, 0x22, 0x33, 0xff, 0, 0, 0, 0xff },
+        };
+        if (step == 0) @memcpy(expected_rows[1][0..4], &[_]u8{ 0x23, 0x71, 0xc9, 0xff });
+        if (step == 1 or step == 3) @memcpy(expected_rows[0][8..12], &[_]u8{ 0x23, 0x71, 0xc9, 0xff });
+        const cursor_output = coordinator.primaryKmsOutput().?;
+        for (0..256) |_| {
+            _ = try drainClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            const current = cursor_output.kms_output.current.?;
+            const bytes = cursor_output.pool.slots[current.slot].dumb.?.bytes;
+            if (std.mem.eql(u8, &expected_rows[0], bytes[0..12]) and
+                std.mem.eql(u8, &expected_rows[1], bytes[16..28])) break;
+            const pause: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = linux.nanosleep(&pause, null);
+        }
+        const current = cursor_output.kms_output.current.?;
+        const bytes = cursor_output.pool.slots[current.slot].dumb.?.bytes;
+        try std.testing.expectEqualSlices(u8, &expected_rows[0], bytes[0..12]);
+        try std.testing.expectEqualSlices(u8, &expected_rows[1], bytes[16..28]);
     }
     try wayring.client.sendRequest(protocol.wl_buffer, &client.objects, &actor.transmit, cursor_buffer, .{ .destroy = .{} });
     try wayring.client.sendRequest(protocol.wl_shm_pool, &client.objects, &actor.transmit, cursor_pool.id, .{ .destroy = .{} });

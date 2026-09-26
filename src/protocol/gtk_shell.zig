@@ -171,10 +171,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 if (slot.configure_pending) {
                     var sb: [20]u8 = undefined;
                     var eb: [16]u8 = undefined;
-                    try Surface.encodeEvent(queue, slot.handle.id, .{ .configure = .{ .states = encodeSet(slot.states[0..if (slot.version >= 2) 5 else 1], &sb) } });
+                    const configure: Surface.Event = .{ .configure = .{ .states = encodeSet(slot.states[0..if (slot.version >= 2) 5 else 1], &sb) } };
+                    const edges = [_]bool{slot.floating} ** 4;
+                    const configure_edges: Surface.Event = .{ .configure_edges = .{ .constraints = encodeSet(&edges, &eb) } };
+                    // Retry both events together; never replay configure after
+                    // backpressure prevented its matching configure_edges.
+                    try queue.ensureCapacity(try Surface.eventSize(configure) +
+                        if (slot.version >= 2) try Surface.eventSize(configure_edges) else 0, 0);
+                    try Surface.encodeEvent(queue, slot.handle.id, configure);
                     if (slot.version >= 2) {
-                        const edges = [_]bool{slot.floating} ** 4;
-                        try Surface.encodeEvent(queue, slot.handle.id, .{ .configure_edges = .{ .constraints = encodeSet(&edges, &eb) } });
+                        try Surface.encodeEvent(queue, slot.handle.id, configure_edges);
                     }
                     slot.configure_pending = false;
                     count += 1;
@@ -404,9 +410,20 @@ test "gtk generated version gates configure states and authenticated titlebar ac
             try std.testing.expectEqual(version >= gate.since, accepted);
         }
         a.queueConfigure(sid, .{ .tiled_left = true, .tiled_right = false, .tiled_top = true, .tiled_bottom = false });
-        try std.testing.expectEqual(@as(usize, 1), try a.flushOn(peer, &server, &actor.transmit));
         var fd_scratch: [1]std.os.linux.fd_t = undefined;
         var control: [64]u8 align(@alignOf(std.os.linux.cmsghdr)) = undefined;
+        if (version >= 2) {
+            actor.transmit.byte_budget = 64;
+            for (0..3) |_| try protocol.gtk_shell1.encodeEvent(&actor.transmit, 7, .{ .capabilities = .{ .capabilities = 0 } });
+            // 28 free bytes fit configure (24), but not its edges (12).
+            try std.testing.expectError(error.ByteBudgetExceeded, a.flushOn(peer, &server, &actor.transmit));
+            try std.testing.expectEqual(@as(usize, 36), actor.transmit.queuedBytes());
+            try std.testing.expect(a.pendingOutbound(peer));
+            const blocked = try actor.transmit.snapshot(&fd_scratch, &control);
+            try actor.transmit.begin(blocked);
+            try actor.transmit.complete(blocked.byteCount());
+        }
+        try std.testing.expectEqual(@as(usize, 1), try a.flushOn(peer, &server, &actor.transmit));
         const snapshot = try actor.transmit.snapshot(&fd_scratch, &control);
         const configure = (try wayring.wire.Message.decode(snapshot.first)).?;
         const states = (try Surface.decodeEvent(configure, &fds)).configure.states;
