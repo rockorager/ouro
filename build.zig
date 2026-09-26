@@ -749,6 +749,21 @@ pub fn build(b: *std.Build) void {
     timestamp_test_step.dependOn(&b.addRunArtifact(timestamp_tests).step);
     timestamp_test_step.dependOn(&b.addRunArtifact(timestamp_client_tests).step);
 
+    const global_removal_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/global-removal.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wayring", .module = wayring },
+                .{ .name = "ouro", .module = ouro },
+                .{ .name = "core_protocol", .module = core_protocol },
+            },
+        }),
+    });
+    const run_global_removal_tests = b.addRunArtifact(global_removal_tests);
+    b.step("test-global-removal", "Run retained-global adapter lifetime tests").dependOn(&run_global_removal_tests.step);
+
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_integration_tests.step);
@@ -756,4 +771,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_drm_presentation_tests.step);
     test_step.dependOn(&run_color_startup_tests.step);
     test_step.dependOn(&run_shell_input_tests.step);
+    test_step.dependOn(&run_global_removal_tests.step);
 }

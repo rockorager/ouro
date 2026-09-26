@@ -1,4 +1,4 @@
-//! wl_fixes v1 adapter for explicitly retiring wl_registry resources.
+//! wl_fixes v2 adapter for registry destruction and global-removal acknowledgment.
 
 const wayring = @import("wayring");
 const objects = wayring.objects;
@@ -16,7 +16,7 @@ pub fn Adapter(comptime protocol: type) type {
             if (self.runtime != null) return error.AlreadyInstalled;
             self.runtime = runtime;
             errdefer self.runtime = null;
-            const global = try runtime.addGlobalWithBinder(&Fixes.info, 1, self, bind);
+            const global = try runtime.addGlobalWithBinder(&Fixes.info, 2, self, bind);
             self.global = global;
             return global;
         }
@@ -45,9 +45,22 @@ pub fn Adapter(comptime protocol: type) type {
                         return error.StaleHandle;
                     _ = try runtime.removeRegistry(peer, registry);
                 },
-                // Version 2 is deliberately not advertised until global-removal
-                // acknowledgment state is implemented and validated.
-                .ack_global_remove => return error.UnsupportedVersion,
+                .ack_global_remove => |payload| {
+                    const registry = server_objects.namespace.lookupHandle(payload.registry) orelse
+                        return error.StaleHandle;
+                    runtime.ackGlobalRemove(peer, registry, payload.name) catch |err| switch (err) {
+                        error.InvalidAckRemove => {
+                            try wayring.server.Core(protocol).postError(
+                                actor,
+                                decoded.handle.id,
+                                Fixes.@"error".invalid_ack_remove.value,
+                                "global removal was not pending on this registry",
+                            );
+                            return .stop;
+                        },
+                        else => return err,
+                    };
+                },
             }
             try decoded.finish(protocol, server_objects, &actor.transmit);
             return .continue_dispatch;

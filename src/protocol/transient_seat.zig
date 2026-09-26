@@ -185,7 +185,7 @@ pub fn Adapter(comptime protocol: type, comptime SeatAdapter: type) type {
         pub fn advance(self: *Self) !void {
             for (self.seats) |*seat| if (seat.state == .retired and seat.transient == null) {
                 if (!seat.initialized) unreachable;
-                if (seat.adapter.globalName() != null or seat.adapter.resourceCount() != 0 or seat.adapter.deviceCount() != 0) continue;
+                if (seat.adapter.globalBindingsPending() or seat.adapter.resourceCount() != 0 or seat.adapter.deviceCount() != 0) continue;
                 seat.adapter.deinit();
                 const generation = nextGeneration(seat.generation);
                 self.setState(seat, .free);

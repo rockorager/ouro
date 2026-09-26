@@ -132,6 +132,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
+            inert: bool = false,
             last_implicit_grab_serial: u32 = 0,
             last_user_action_serial: u32 = 0,
             last_user_action_target: ?FocusTarget = null,
@@ -233,6 +234,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         timestamps: ?*input_timestamps.Adapter(protocol) = null,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
+        pending_global_removals: usize = 0,
         global_version: u32,
         name: []u8,
         keymap_fd: linux.fd_t,
@@ -373,8 +375,23 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         pub fn removeGlobal(adapter: *Self) !void {
             const runtime = adapter.runtime orelse return error.NotInstalled;
             const global = adapter.global orelse return error.NotInstalled;
-            try runtime.removeGlobal(global);
+            // Register ownership before removal: withdrawal may be synchronous.
+            adapter.pending_global_removals += 1;
+            errdefer adapter.pending_global_removals -= 1;
+            try runtime.removeGlobalWithCallback(global, globalWithdrawn);
             adapter.global = null;
+        }
+
+        fn globalWithdrawn(context: ?*anyopaque, _: objects.Handle) void {
+            const adapter: *Self = @ptrCast(@alignCast(context.?));
+            std.debug.assert(adapter.pending_global_removals != 0);
+            adapter.pending_global_removals -= 1;
+        }
+
+        /// The adapter remains a possible bind target until all registry offers
+        /// for every removed installation have been acknowledged or destroyed.
+        pub fn globalBindingsPending(adapter: *const Self) bool {
+            return adapter.global != null or adapter.pending_global_removals != 0;
         }
 
         pub fn globalName(adapter: *const Self) ?u32 {
@@ -402,6 +419,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 return error.OutOfMemory;
             slot.resource = binding.resource;
             slot.peer = binding.peer;
+            slot.inert = adapter.global == null or !std.meta.eql(adapter.global.?, binding.global);
             const id = adapter.seatId(slot);
             const client = clientId(binding.peer);
             adapter.ensureOutbound(2) catch {
@@ -410,7 +428,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             };
             adapter.enqueue(client, .{ .seat_capabilities = .{
                 .seat = id,
-                .value = adapter.capabilityBits(),
+                .value = if (slot.inert) 0 else adapter.capabilityBits(),
             } }) catch unreachable;
             adapter.enqueue(client, .{ .seat_name = id }) catch unreachable;
             return slot;
@@ -466,15 +484,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const decoded = try wayring.server.decodeRequest(Seat, server_objects, message, fds);
             switch (decoded.value) {
                 .get_pointer => |payload| {
-                    if (!adapter.pointer_ever_available)
+                    if (!seat.inert and !adapter.pointer_ever_available)
                         return try adapter.protocolError(actor, decoded.handle.id, Seat.@"error".missing_capability.value, "pointer capability unavailable");
                     const slot = adapter.pointers.acquire() catch
                         return try adapter.noMemory(actor);
                     slot.seat_index = adapter.seatIndex(seat);
                     slot.seat_generation = seat.header.generation;
                     slot.client = clientId(seat.peer);
-                    slot.capability_generation = adapter.pointer_capability_generation;
-                    const focused = adapter.pointer_delivery != null and
+                    slot.capability_generation = if (seat.inert) 0 else adapter.pointer_capability_generation;
+                    const focused = !seat.inert and adapter.pointer_delivery != null and
                         sameClient(clientId(seat.peer), adapter.pointer_delivery.?.client);
                     if (focused) adapter.ensureOutbound(2) catch {
                         adapter.pointers.release(slot);
@@ -502,14 +520,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     };
                 },
                 .get_keyboard => |payload| {
-                    if (!adapter.keyboard_ever_available)
+                    if (!seat.inert and !adapter.keyboard_ever_available)
                         return try adapter.protocolError(actor, decoded.handle.id, Seat.@"error".missing_capability.value, "keyboard capability unavailable");
                     const slot = adapter.keyboards.acquire() catch
                         return try adapter.noMemory(actor);
                     slot.seat_index = adapter.seatIndex(seat);
                     slot.seat_generation = seat.header.generation;
                     slot.client = clientId(seat.peer);
-                    slot.capability_generation = adapter.keyboard_capability_generation;
+                    slot.capability_generation = if (seat.inert) 0 else adapter.keyboard_capability_generation;
                     const extra: usize = if (adapter.keyboard_focus != null) 4 else 2;
                     adapter.ensureOutbound(extra) catch {
                         adapter.keyboards.release(slot);
@@ -523,7 +541,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     const client = clientId(seat.peer);
                     adapter.enqueue(client, .{ .keyboard_keymap = adapter.keyboardId(slot) }) catch unreachable;
                     adapter.enqueue(client, .{ .keyboard_repeat = adapter.keyboardId(slot) }) catch unreachable;
-                    if (adapter.keyboard_focus) |focus| if (sameClient(client, focus.client)) {
+                    if (adapter.keyboard_focus) |focus| if (!seat.inert and sameClient(client, focus.client)) {
                         const serial = adapter.issueSerial();
                         adapter.enqueue(client, .{ .keyboard_enter = .{
                             .keyboard = adapter.keyboardId(slot),
@@ -540,7 +558,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     };
                 },
                 .get_touch => |payload| {
-                    if (!adapter.touch_ever_available)
+                    if (!seat.inert and !adapter.touch_ever_available)
                         return try adapter.protocolError(actor, decoded.handle.id, Seat.@"error".missing_capability.value, "touch capability unavailable");
                     const slot = adapter.touches.acquire() catch return try adapter.noMemory(actor);
                     slot.seat_index = adapter.seatIndex(seat);
@@ -549,7 +567,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     slot.resource_generation = adapter.next_touch_resource_generation;
                     adapter.next_touch_resource_generation +%= 1;
                     if (adapter.next_touch_resource_generation == 0) adapter.next_touch_resource_generation = 1;
-                    slot.capability_generation = adapter.touch_capability_generation;
+                    slot.capability_generation = if (seat.inert) 0 else adapter.touch_capability_generation;
                     slot.pending_frame_events = 0;
                     const admitted = Seat.admit_get_touch(server_objects, decoded.handle, payload, .{ .id = slot }) catch |err| {
                         adapter.touches.release(slot);
@@ -2113,7 +2131,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         fn capabilityPublicationCount(adapter: *const Self, old: u32, current: u32) usize {
             if (old == current) return 0;
             var count: usize = 0;
-            for (adapter.seats.entries.items) |seat| if (seat.header.active) {
+            for (adapter.seats.entries.items) |seat| if (seat.header.active and !seat.inert) {
                 count += 1;
             };
             return count;
@@ -2121,7 +2139,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         fn enqueueCapabilities(adapter: *Self, old: u32, current: u32) !void {
             if (old == current) return;
-            for (adapter.seats.entries.items, 0..) |seat, index| if (seat.header.active)
+            for (adapter.seats.entries.items, 0..) |seat, index| if (seat.header.active and !seat.inert)
                 adapter.enqueue(clientId(seat.peer), .{ .seat_capabilities = .{
                     .seat = .{ .index = @intCast(index), .generation = seat.header.generation },
                     .value = current,
@@ -2264,7 +2282,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const object = server_objects.namespace.resolve(handle) orelse return null;
             if (object.interface != &Seat.info) return null;
             const seat = adapter.seats.fromContext(object.context) orelse return null;
-            if (!std.meta.eql(seat.resource, handle) or !std.meta.eql(seat.peer, peer)) return null;
+            if (seat.inert or !std.meta.eql(seat.resource, handle) or !std.meta.eql(seat.peer, peer)) return null;
             return seat;
         }
 

@@ -412,7 +412,7 @@ test "shell-input: core compatibility extensions cross generated runtime" {
         _ = linux.sched_yield();
     }
     try std.testing.expect(handler.fixes != null);
-    try std.testing.expectEqual(@as(u32, 1), handler.fixes_version);
+    try std.testing.expectEqual(@as(u32, 2), handler.fixes_version);
     try std.testing.expect(handler.system_bell != null);
     try std.testing.expectEqual(@as(u32, 1), handler.system_bell_version);
     try std.testing.expect(handler.toplevel_drag_manager != null);
