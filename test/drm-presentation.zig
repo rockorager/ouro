@@ -784,11 +784,13 @@ test "physical coordinator waits for peer output after a retired latching attemp
     try root.deinit();
 }
 
-test "physical coordinator retires a disconnected secondary output" {
+test "physical coordinator preserves programmed primary color state across secondary unplug and reconnect" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
     defer fixture.deinit();
     fixture.second_desktop = true;
+    fixture.first_max_bpc = .{ .id = 18, .inherited = 12, .minimum = 8, .maximum = 12 };
+    fixture.first_gamma_lut = .{ .id = 19, .inherited = 436 };
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-output-remove-{d}.sock", .{linux.getpid()});
     wayring.unix_socket.unlink(path) catch {};
@@ -810,14 +812,44 @@ test "physical coordinator retires a disconnected secondary output" {
     const protocol_output = coordinator.physical_outputs[1].protocol_output;
     const management_head = coordinator.physical_outputs[1].management_head;
     const physical_id = coordinator.physical_outputs[1].id;
+    const primary_kms = coordinator.physical_outputs[0].kms_output.?;
+    const primary_scanout_id = primary_kms.outputId();
+    const primary_physical_id = coordinator.physical_outputs[0].id;
+    const primary_protocol_output = coordinator.physical_outputs[0].protocol_output;
+    const primary_management_head = coordinator.physical_outputs[0].management_head;
+    // Put both outputs on screen: checking only object identity could miss a
+    // disable/re-enable of the same object, or a recycled allocation address.
+    try primary_kms.request(.damage, 1);
+    coordinator.physical_outputs[0].damage_requested +%= 1;
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (physicalOutputsSettled(coordinator)) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expect(physicalOutputsSettled(coordinator));
+    try std.testing.expectEqual(.active, primary_kms.kms_output.state);
+    try std.testing.expectEqual(.active, coordinator.physical_outputs[1].kms_output.?.kms_output.state);
+    const disables_before_unplug = fixture.disable_attempts;
+    const drains_before_unplug = coordinator.stats.output_drains;
+    // A new kernel probe sees our programmed values, not the inherited startup
+    // values. These are the exact differences observed on the laptop.
+    fixture.first_max_bpc.inherited = 8;
+    fixture.first_gamma_lut.inherited = 437;
     fixture.second_desktop = false;
     try fixture.signalHotplug();
     for (0..256) |_| {
         _ = try loop.turn(coordinator);
         if (!coordinator.physical_outputs[1].connected and
-            !coordinator.physical_outputs[1].removing) break;
+            !coordinator.physical_outputs[1].removing and
+            !coordinator.topology_refresh_pending) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
+    try std.testing.expectEqual(drains_before_unplug + 1, coordinator.stats.output_drains);
+    try std.testing.expectEqual(disables_before_unplug + 1, fixture.disable_attempts);
+    try std.testing.expect(coordinator.physical_outputs[0].kms_output.? == primary_kms);
+    try std.testing.expectEqual(primary_scanout_id, primary_kms.outputId());
+    try std.testing.expect(primary_kms.accepting_frames);
+    try std.testing.expectEqual(primary_management_head, coordinator.physical_outputs[0].management_head);
     try std.testing.expect(!coordinator.physical_outputs[1].connected);
     try std.testing.expect(!coordinator.physical_outputs[1].removing);
     try std.testing.expect(coordinator.physical_outputs[1].kms_output == null);
@@ -834,10 +866,6 @@ test "physical coordinator retires a disconnected secondary output" {
     try std.testing.expectEqual(@as(?i32, 3), primary.width);
 
     fixture.second_desktop = true;
-    const primary_kms = coordinator.physical_outputs[0].kms_output.?;
-    const primary_physical_id = coordinator.physical_outputs[0].id;
-    const primary_protocol_output = coordinator.physical_outputs[0].protocol_output;
-    const primary_management_head = coordinator.physical_outputs[0].management_head;
     const drains_before_reconnect = coordinator.stats.output_drains;
     const serial_before_reconnect = coordinator.output_management_adapter.lifecycle.serial;
     try fixture.signalHotplug();
@@ -875,6 +903,8 @@ test "physical coordinator retires a disconnected secondary output" {
         coordinator.physical_outputs[0].management_head,
     ));
     try std.testing.expectEqual(drains_before_reconnect, coordinator.stats.output_drains);
+    try std.testing.expectEqual(disables_before_unplug + 1, fixture.disable_attempts);
+    try std.testing.expectEqual(primary_scanout_id, primary_kms.outputId());
     try std.testing.expectEqual(
         serial_before_reconnect + 2,
         coordinator.output_management_adapter.lifecycle.serial,
@@ -5004,6 +5034,8 @@ pub const Fixture = struct {
     discover_cards: bool = true,
     first_desktop: bool = true,
     first_mode_width: u16 = 3,
+    first_max_bpc: ouro.drm_platform.RangeProperty = .{},
+    first_gamma_lut: ouro.drm_platform.BlobProperty = .{},
     mode_height: u16 = 2,
     second_desktop: bool = false,
     second_mode_width: u16 = 3,
@@ -5241,6 +5273,8 @@ pub const Fixture = struct {
         out.connector_encoders[0] = 20;
         out.encoders[0] = .{ .id = 20, .crtc_id = 30, .possible_crtcs = 1 };
         out.crtcs[0] = .{ .id = 30, .index = 0, .properties = .{ .active = 2, .mode_id = 3, .vrr_enabled = if (self.vrr_supported) 15 else 0 } };
+        out.connectors[0].properties.max_bpc = self.first_max_bpc;
+        out.crtcs[0].properties.gamma_lut = self.first_gamma_lut;
         out.planes[0] = .{ .id = 40, .possible_crtcs = 1, .plane_type_value = 1, .format_start = 0, .format_count = 1, .properties = .{ .plane_type = 4, .fb_id = 5, .crtc_id = 6, .src_x = 7, .src_y = 8, .src_w = 9, .src_h = 10, .crtc_x = 11, .crtc_y = 12, .crtc_w = 13, .crtc_h = 14 } };
         if (self.capture_vulkan) out.planes[0].properties.in_fence_fd = 17;
         out.formats[0] = .{ .fourcc = ouro.gbm.format_xrgb8888, .modifier = ouro.gbm.modifier_linear };
