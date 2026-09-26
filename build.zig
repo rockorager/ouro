@@ -642,6 +642,24 @@ pub fn build(b: *std.Build) void {
     );
     drm_presentation_test_step.dependOn(&run_drm_presentation_tests.step);
 
+    const color_startup_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/color-startup.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wayring", .module = wayring },
+                .{ .name = "ouro", .module = ouro },
+                .{ .name = "core_protocol", .module = xdg_protocol },
+            },
+        }),
+        .filters = &.{"color startup:"},
+    });
+    const run_color_startup_tests = b.addRunArtifact(color_startup_tests);
+    const color_startup_step = b.step("test-color-startup", "Run renderer selection and color registry lifecycle tests");
+    color_startup_step.dependOn(&run_color_startup_tests.step);
+    drm_presentation_test_step.dependOn(&run_color_startup_tests.step);
+
     const shm_tests = b.addTest(.{
         .root_module = ouro,
         .filters = &.{ "high precision", "UNORM16", "capture normalizes", "mixed SHM widths", "single pixel buffers", "modern RGB" },
@@ -711,5 +729,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_headless_presentation_tests.step);
     test_step.dependOn(&run_drm_presentation_tests.step);
+    test_step.dependOn(&run_color_startup_tests.step);
     test_step.dependOn(&run_shell_input_tests.step);
 }

@@ -226,6 +226,9 @@ pub const RenderDevice = struct {
     card: drm.Card,
     content: render_content.Store,
     renderer: ?Renderer,
+    /// Proven by successful Vulkan creation with require_color_management.
+    /// Stays valid across output recreation; Pixman never has this capability.
+    color_management_enabled: bool = false,
 
     pub fn rendererKind(self: *const RenderDevice) ?RendererKind {
         return if (self.renderer) |value| std.meta.activeTag(value) else null;
@@ -891,6 +894,7 @@ pub const Output = struct {
             .card = snapshot.card,
             .content = content,
             .renderer = path.renderer,
+            .color_management_enabled = config.enable_color_management and path.renderer == .vulkan,
         };
         render_device_owned = false;
         content_owned = false;

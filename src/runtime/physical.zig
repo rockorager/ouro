@@ -888,6 +888,8 @@ pub fn Coordinator(comptime protocol: type) type {
             background_effect: protocol_background_effect.Config = .{},
             pointer_warp: protocol_pointer_warp.Config = .{},
             security_context: protocol_security_context.Config = .{},
+            /// Require the color pipeline on Vulkan and publish color globals
+            /// only after selection proves it. Auto may still fall back to Pixman.
             enable_color_protocols: bool = false,
             protocol_output: protocol_output.Config = .{},
             xdg_output: protocol_xdg_output.Config = .{},
@@ -1165,6 +1167,8 @@ pub fn Coordinator(comptime protocol: type) type {
             self.root = root;
             self.platforms = platforms;
             self.output_config = config.output;
+            self.output_config.enable_color_management = config.output.enable_color_management or
+                config.enable_color_protocols;
             self.syncobj_config = config.linux_drm_syncobj;
             self.desktop_transaction_timeout_ns = config.desktop_transaction_timeout_ns;
             self.virtual_keyboard_reconciles_focus = config.virtual_keyboard_reconciles_focus;
@@ -1347,7 +1351,7 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer allocator.free(self.inhibitor_surface_ids);
             self.desktop_timer = null;
             self.desktop_timer_canceling = false;
-            self.color_protocols_enabled = config.enable_color_protocols and config.output.renderer == .vulkan;
+            self.color_protocols_enabled = config.enable_color_protocols;
             self.icc_poll = null;
             self.icc_poll_canceling = false;
             self.idle_timer = null;
@@ -1913,14 +1917,6 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.fractional_scale_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
-            if (self.color_protocols_enabled) {
-                _ = try self.color_management_adapter.install(&root.runtime);
-                if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
-                    return error.GlobalPublicationIncomplete;
-                _ = try self.color_representation_adapter.install(&root.runtime);
-                if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
-                    return error.GlobalPublicationIncomplete;
-            }
             _ = try self.alpha_modifier_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -7287,6 +7283,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.advancePhysicalOutputRemovals();
             try self.advanceOutputGlobals();
             try self.advanceDrmLeaseGlobal();
+            try self.ensureColorProtocols();
             while (try self.manager.pollRevokedLease()) |token| {
                 self.drm_lease_adapter.leaseRevoked(token) catch continue;
                 self.markProtocolAll(ProtocolReady.drm_lease);
@@ -8907,6 +8904,38 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.dmabuf_adapter.install(&self.root.runtime, device);
             if (try self.root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+        }
+
+        /// Color globals belong to the shared render device, not a connector.
+        /// It survives output disable/re-enable and never switches renderer on
+        /// recreation, so bound color resources remain valid while outputs sleep.
+        fn ensureColorProtocols(self: *Self) !void {
+            if (!self.color_protocols_enabled or self.stopping) return;
+            const device = self.render_device orelse return;
+            if (!device.color_management_enabled) return;
+            // Installation is not publication completion. Driver.prepare runs
+            // after coordinator preparation on every loop turn and resumes a
+            // blocked final global, including after both handles are installed.
+            if (self.color_management_adapter.global != null and
+                self.color_representation_adapter.global != null) return;
+            inline for (.{ &self.color_management_adapter, &self.color_representation_adapter }) |adapter| {
+                if (adapter.global == null) {
+                    _ = adapter.install(&self.root.runtime) catch |err| switch (err) {
+                        error.GlobalUpdateActive => return,
+                        else => return err,
+                    };
+                }
+                while (true) switch (try self.root.runtime.publishNext()) {
+                    .sent => |peer| {
+                        if (self.loop) |loop| _ = try loop.driver.schedule(peer);
+                    },
+                    .blocked => |peer| {
+                        if (self.loop) |loop| _ = try loop.driver.schedule(peer);
+                        return;
+                    },
+                    .complete => break,
+                };
+            }
         }
 
         /// The global is advertised only after the selected renderer/KMS DRM
