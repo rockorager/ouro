@@ -80,6 +80,7 @@ pub fn Adapter(comptime protocol: type) type {
         const SourceSlot = struct {
             header: Header = .{},
             peer: wayring.io_uring.Peer = undefined,
+            version: u32 = 3,
             mime_count: usize = 0,
             mime_lengths: []u16 = &.{},
             mime_storage: []u8 = &.{},
@@ -370,6 +371,7 @@ pub fn Adapter(comptime protocol: type) type {
                         return try self.failure(actor, decoded.handle.id, err);
                     };
                     source.header.resource = admitted.id;
+                    source.version = server_objects.namespace.resolve(admitted.id).?.version;
                 },
                 .get_data_device => |payload| {
                     const device = acquire(DeviceSlot, self.allocator, &self.devices, &self.device_free) catch
@@ -537,7 +539,7 @@ pub fn Adapter(comptime protocol: type) type {
                         return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_action.value, "invalid preferred drag action");
                     const source = self.resolveSource(offer.source) catch
                         return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "drag source is gone");
-                    const source_actions = sourceActions(server_objects, source);
+                    const source_actions = sourceActions(source);
                     if (post_drop_ask and (preferred == 0 or preferred == ask or preferred & source_actions == 0))
                         return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_action.value, "ask drop requires a final source-supported action");
                     const selected = selectDragAction(source_actions, actions, preferred);
@@ -975,13 +977,14 @@ pub fn Adapter(comptime protocol: type) type {
                     }
                     if (value.phase == 1) {
                         const object = server_objects.namespace.resolve(offer.header.resource) orelse return true;
-                        value.phase = 2;
                         if (object.version >= 3) {
                             try wayring.server.sendEvent(protocol, Offer, server_objects, queue, offer.header.resource, .{ .source_actions = .{
-                                .source_actions = .fromWire(sourceActions(server_objects, source)),
+                                .source_actions = .fromWire(sourceActions(source)),
                             } });
+                            value.phase = 2;
                             return false;
                         }
+                        value.phase = 2;
                     }
                     try wayring.server.sendEvent(protocol, Device, server_objects, queue, device.header.resource, .{ .enter = .{
                         .serial = value.serial,
@@ -1404,9 +1407,10 @@ pub fn Adapter(comptime protocol: type) type {
                 protocol.wl_data_device_manager.dnd_action.ask.value;
         }
 
-        fn sourceActions(server_objects: anytype, source: *const SourceSlot) u32 {
-            const object = server_objects.namespace.resolve(source.header.resource) orelse return 0;
-            return if (object.version < 3)
+        fn sourceActions(source: *const SourceSlot) u32 {
+            // Offers are published and handled in the destination namespace,
+            // which cannot resolve the source client's resource.
+            return if (source.version < 3)
                 protocol.wl_data_device_manager.dnd_action.copy.value
             else
                 source.drag_actions;

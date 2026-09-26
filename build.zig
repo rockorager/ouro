@@ -732,6 +732,15 @@ pub fn build(b: *std.Build) void {
     hotkey_step.dependOn(&b.addRunArtifact(hotkey_units).step);
     hotkey_step.dependOn(&b.addRunArtifact(hotkey_clients).step);
 
+    const gtk_tests = b.addTest(.{ .root_module = ouro, .filters = &.{"gtk "} });
+    const gtk_runtime_tests = b.addTest(.{
+        .root_module = shell_input_tests.root_module,
+        .filters = &.{ "core compatibility extensions", "gtk ", "pollable backend retains" },
+    });
+    const gtk_test_step = b.step("test-gtk", "Run GTK version, metadata, policy and surface-offset tests");
+    gtk_test_step.dependOn(&b.addRunArtifact(gtk_tests).step);
+    gtk_test_step.dependOn(&b.addRunArtifact(gtk_runtime_tests).step);
+
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_integration_tests.step);

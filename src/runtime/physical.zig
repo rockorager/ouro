@@ -1140,6 +1140,7 @@ pub fn Coordinator(comptime protocol: type) type {
         consumer_timer_canceling: bool = false,
         consumer_timer_deadline_ns: ?u64 = null,
         cursor_layer: Layer,
+        cursor_offset_sequence: u64 = 0,
         drag_icon_root: ?Adapter.SurfaceId = null,
         output_power_transition: ?OutputPowerAdapter.Command = null,
         stopping: bool = false,
@@ -1375,6 +1376,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.consumer_timer_canceling = false;
             self.consumer_timer_deadline_ns = null;
             self.cursor_layer = .{};
+            self.cursor_offset_sequence = 0;
             const cursor_path_requirement = std.math.add(
                 usize,
                 config.cursor_directory.len,
@@ -1715,6 +1717,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 .context = self,
                 .validateFn = validateInteractiveGrab,
             });
+            self.gtk_shell_adapter.titlebar_policy = .{
+                .context = self,
+                .toggleMaximizedFn = gtkToggleMaximized,
+            };
             self.wayland_fixes_adapter = .{};
             self.system_bell_adapter = .{};
             self.fractional_scale_adapter = try FractionalScaleAdapter.init(
@@ -2872,6 +2878,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 return control;
             }
             if (try self.gtk_shell_adapter.request(peer, target, message, fds)) |control| {
+                try self.advanceShell();
                 if (self.gtk_shell_adapter.pendingOutbound(peer)) self.markProtocol(peer, ProtocolReady.gtk_shell);
                 try self.flushProtocol();
                 return control;
@@ -6656,6 +6663,14 @@ pub fn Coordinator(comptime protocol: type) type {
             return self.seat_adapter.validateInteractiveGrab(peer, seat_object, serial, surface);
         }
 
+        fn gtkToggleMaximized(context: *anyopaque, surface: Adapter.SurfaceId) !void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            if (self.sessionLockActive()) return;
+            const scene = self.desktop.toplevelSceneForSurface(surface) catch return;
+            const state = try self.desktop.stateSnapshot(scene.id);
+            try self.desktop.setToplevelState(scene.id, .maximized, !state.maximized);
+        }
+
         fn adoptLayerPopup(
             context: *anyopaque,
             peer: wayring.io_uring.Peer,
@@ -7135,8 +7150,18 @@ pub fn Coordinator(comptime protocol: type) type {
                             request_value.surface,
                             .{ .x = request_value.hotspot.x, .y = request_value.hotspot.y },
                         );
-                        try self.applyReady();
+                        // set_cursor supplies an absolute hotspot. Older
+                        // commits waiting for admission must not offset it.
+                        self.cursor_offset_sequence = if (request_value.surface) |id|
+                            (try self.adapter.getSurfaceById(id)).sequence
+                        else
+                            0;
                         try self.requestCursorRedraw();
+                        self.seat_adapter.dropEvent();
+                        // Admission may update the hotspot. Do not replay the
+                        // absolute request if later content work has to retry.
+                        try self.applyReady();
+                        continue;
                     },
                     .pointer_grab_cancelled => {
                         // Retain the event until cancellation fits, and let
@@ -9971,6 +9996,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.applied_updates,
             );
             std.debug.assert(applied.len == ready.len);
+            // Consume every cursor-root delta exactly once, before attachment
+            // forwarding or discard can erase detached/superseded commits.
+            applyCursorOffsets(&self.interaction.cursor, self.cursor_offset_sequence, applied);
             forwardEffectiveAttachments(applied);
             for (applied, 0..) |*update, index| {
                 const id = update.surface;
@@ -15146,6 +15174,24 @@ fn lastSurfaceOccurrence(surfaces: anytype, index: usize) bool {
     return true;
 }
 
+fn applyCursorOffsets(cursor: anytype, since: u64, applied: anytype) void {
+    const root = cursor.surface orelse return;
+    for (applied) |*update| {
+        if (!std.meta.eql(update.surface, root)) continue;
+        const state = &update.payload.surface;
+        if (state.sequence > since) {
+            const attach_x: i64 = if (state.attachment) |attachment| attachment.offset.x else 0;
+            const attach_y: i64 = if (state.attachment) |attachment| attachment.offset.y else 0;
+            cursor.hotspot.x = translatedCoordinate(cursor.hotspot.x, -attach_x - @as(i64, state.offset.x));
+            cursor.hotspot.y = translatedCoordinate(cursor.hotspot.y, -attach_y - @as(i64, state.offset.y));
+        }
+        // Cursor placement now has one source of truth, shared by screen
+        // composition and capture metadata. Do not also move its buffer.
+        state.offset = .{ .x = 0, .y = 0 };
+        if (state.attachment) |*attachment| attachment.offset = .{ .x = 0, .y = 0 };
+    }
+}
+
 /// A later commit without wl_surface.attach retains the attachment transition
 /// from the preceding same-surface commit. When both are admitted together,
 /// move that transition to the final candidate so superseding the earlier
@@ -16091,6 +16137,46 @@ test "physical: retained candidate matches only its exact pending owner" {
         .id = Id{ .index = 5, .generation = 8 },
         .handle = Handle{ .id = 15, .generation = 18 },
     }));
+}
+
+test "gtk cursor offsets consume all commits before coalescing and respect absolute resets" {
+    const Cursor = @import("../scene/cursor.zig").Cursor(u8);
+    const Applied = struct {
+        surface: u8,
+        payload: struct {
+            surface: struct {
+                sequence: u64,
+                offset: geometry.Point = .{ .x = 0, .y = 0 },
+                attachment: ?struct { buffer: ?u8, offset: geometry.Point = .{ .x = 0, .y = 0 } } = null,
+            },
+        },
+    };
+    var cursor: Cursor = .{ .surface = 1, .hotspot = .{ .x = 7, .y = 11 } };
+    var updates = [_]Applied{
+        // This commit predates set_cursor's absolute hotspot, even if its
+        // renderer work has not yet run. Its delta must not be replayed.
+        .{ .surface = 1, .payload = .{ .surface = .{ .sequence = 4, .offset = .{ .x = 100, .y = -100 } } } },
+        .{ .surface = 1, .payload = .{ .surface = .{ .sequence = 5, .offset = .{ .x = 3, .y = -2 } } } },
+        // A detached commit still updates the hotspot, and another surface
+        // (including a subsurface) must retain its own offset unchanged.
+        .{ .surface = 1, .payload = .{ .surface = .{ .sequence = 6, .offset = .{ .x = -5, .y = 4 }, .attachment = .{ .buffer = null } } } },
+        .{ .surface = 2, .payload = .{ .surface = .{ .sequence = 7, .offset = .{ .x = 9, .y = 13 } } } },
+        .{ .surface = 1, .payload = .{ .surface = .{ .sequence = 7, .attachment = .{ .buffer = 2, .offset = .{ .x = 1, .y = 6 } } } } },
+    };
+    applyCursorOffsets(&cursor, 4, &updates);
+    try std.testing.expectEqual(geometry.Point{ .x = 8, .y = 3 }, cursor.hotspot);
+    try std.testing.expectEqual(geometry.Point{ .x = 9, .y = 13 }, updates[3].payload.surface.offset);
+    for (updates) |update| if (update.surface == 1) {
+        try std.testing.expectEqual(geometry.Point{ .x = 0, .y = 0 }, update.payload.surface.offset);
+        if (update.payload.surface.attachment) |attachment|
+            try std.testing.expectEqual(geometry.Point{ .x = 0, .y = 0 }, attachment.offset);
+    };
+    // Retrying later render work cannot apply already-consumed deltas twice.
+    applyCursorOffsets(&cursor, 4, &updates);
+    try std.testing.expectEqual(geometry.Point{ .x = 8, .y = 3 }, cursor.hotspot);
+    cursor.request(1, .{ .x = 2, .y = 5 });
+    applyCursorOffsets(&cursor, 7, &updates);
+    try std.testing.expectEqual(geometry.Point{ .x = 2, .y = 5 }, cursor.hotspot);
 }
 
 test "physical: superseded attachment transitions advance to the final commit" {

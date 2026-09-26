@@ -418,9 +418,12 @@ test "shell-input: core compatibility extensions cross generated runtime" {
     try std.testing.expect(handler.toplevel_drag_manager != null);
     try std.testing.expect(handler.toplevel_icon_manager != null);
     try std.testing.expectEqual(@as(usize, 1), handler.toplevel_icon_done);
-    try std.testing.expectEqual(@as(u32, 5), handler.gtk_shell_version);
+    try std.testing.expectEqual(@as(u32, 7), handler.gtk_shell_version);
     try std.testing.expectEqual(@as(usize, 1), handler.gtk_capabilities);
 
+    try wayring.client.sendRequest(protocol.gtk_surface1, &client.objects, &actor.transmit, handler.gtk_surface.?, .{
+        .set_a11y_properties = .{ .a11y_dbus_name = ":1.42", .toplevel_object_path = "/accessible/7" },
+    });
     try protocol.gtk_surface1.encodeRequest(
         &actor.transmit,
         handler.gtk_surface.?.id,
@@ -434,6 +437,24 @@ test "shell-input: core compatibility extensions cross generated runtime" {
         } },
     );
     try protocol.gtk_surface1.encodeRequest(&actor.transmit, handler.gtk_surface.?.id, .{ .set_modal = .{} });
+    try submitClient(&reactor, &driver, &handler);
+    for (0..64) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        _ = linux.sched_yield();
+    }
+    const server_objects = try root.runtime.clients.get(coordinator.peer.?);
+    const sid = try coordinator.adapter.surfaceIdOn(server_objects, handler.surface.?.id);
+    const metadata = coordinator.gtk_shell_adapter.metadata(sid).?;
+    try std.testing.expectEqualStrings("org.ouro.Test", metadata.dbus[0].?);
+    try std.testing.expectEqualStrings(":1.42", metadata.a11y_dbus_name.?);
+    try std.testing.expectEqualStrings("/accessible/7", metadata.toplevel_object_path.?);
+    try std.testing.expect(metadata.modal);
+    try wayring.client.sendRequest(protocol.wl_surface, &client.objects, &actor.transmit, handler.surface.?, .{ .destroy = .{} });
+    // GTK resources outlive wl_surface, but subsequent metadata requests are inert.
+    try protocol.gtk_surface1.encodeRequest(&actor.transmit, handler.gtk_surface.?.id, .{
+        .set_a11y_properties = .{ .a11y_dbus_name = "ignored", .toplevel_object_path = "/gone" },
+    });
     try wayring.client.sendRequest(
         protocol.gtk_surface1,
         &client.objects,
@@ -470,6 +491,8 @@ test "shell-input: core compatibility extensions cross generated runtime" {
         _ = try loop.turn(coordinator);
         _ = linux.sched_yield();
     }
+    try std.testing.expect(coordinator.gtk_shell_adapter.metadata(sid) == null);
+    try std.testing.expect(client.objects.namespace.resolve(handler.gtk_surface.?) == null);
     try std.testing.expect(client.objects.namespace.resolve(second_registry) == null);
     const replacement_registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
     try std.testing.expectEqual(second_registry.id, replacement_registry.id);
@@ -627,7 +650,7 @@ const WaylandFixesHandler = struct {
                     self.registry,
                     value.name,
                     &protocol.gtk_shell1.info,
-                    @min(value.version, 5),
+                    @min(value.version, 7),
                     null,
                 );
                 try self.maybeCreateGtkSurface();
@@ -2688,6 +2711,34 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 24), &denied_pixels);
     coordinator.session_lock_adapter.fail_closed = false;
 
+    _ = linux.close(handler.image_capture_read_fd);
+    handler.image_capture_read_fd = -1;
+    handler.image_capture_ready = false;
+    handler.image_capture_failed = false;
+    handler.image_capture_cursor = true;
+    handler.image_capture_session = (try protocol.ext_image_copy_capture_cursor_session_v1.construct_get_capture_session(
+        &client.objects,
+        &actor.transmit,
+        handler.image_cursor_session.?,
+        .{},
+    )).session;
+    try submitClient(&client_reactor, &driver, &handler);
+    for (0..128) |_| {
+        client_progress = try drainClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.image_capture_ready or handler.image_capture_failed) break;
+        try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(handler.image_capture_ready);
+    try std.testing.expect(!handler.image_capture_failed);
+    try std.testing.expectEqual(@as(u32, 1), handler.image_capture_width);
+    try std.testing.expectEqual(@as(u32, 1), handler.image_capture_height);
+    var cursor_pixels: [24]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 24), linux.pread(handler.image_capture_read_fd, &cursor_pixels, cursor_pixels.len, 0));
+    try std.testing.expectEqualSlices(u8, &.{ 0x23, 0x71, 0xc9, 0xff }, cursor_pixels[0..4]);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 20), cursor_pixels[4..]);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
     const motion_before_warp = handler.pointer_motion;
     const warp_before_request = handler.pointer_warp;
     const frames_before_warp = handler.pointer_frame;
@@ -2768,6 +2819,107 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         capture_objects,
         handler.image_output_source.?.id,
     ).?.target == null);
+
+    // GTK v6 relies on offsets changing the cursor hotspot, not a second
+    // rendering-only origin. Exercise retained, absolute-reset and null-buffer
+    // commits through the generated wire path after output recreation.
+    try input.publish(&.{
+        .{ .device_added = .{ .device = 42, .info = .{ .capabilities = .{ .pointer = true, .keyboard = true } } } },
+        .{ .pointer_motion = .{ .device = 42, .time_usec = 6_000, .dx = @floatFromInt(1 - coordinator.interaction.pointerPosition().x), .dy = @floatFromInt(-coordinator.interaction.pointerPosition().y) } },
+    });
+    for (0..64) |_| {
+        _ = try drainClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        const pause: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = linux.nanosleep(&pause, null);
+    }
+    // Capability removal makes existing pointer objects permanently inert.
+    // Rebind before checking cursor requests after the session restart.
+    try wayring.client.sendRequest(protocol.wl_pointer, &client.objects, &actor.transmit, handler.pointer.?, .{ .release = .{} });
+    handler.pointer = (try protocol.wl_seat.construct_get_pointer(&client.objects, &actor.transmit, handler.seat.?, .{})).id;
+    const enters_before_cursor = handler.pointer_enter;
+    try submitClient(&client_reactor, &driver, &handler);
+    for (0..128) |_| {
+        _ = try drainClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.pointer_enter > enters_before_cursor) break;
+        const pause: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = linux.nanosleep(&pause, null);
+    }
+    try std.testing.expect(handler.pointer_enter > enters_before_cursor);
+    // This 3x2 fixture has no interior outside the compositor's resize grip.
+    // Test the client cursor rather than the resize-policy cursor override.
+    coordinator.interaction.resize_handle = null;
+    const cursor_pool = try protocol.wl_shm.construct_create_pool(&client.objects, &actor.transmit, handler.shm.?, .{
+        .fd = try ordinaryMemfd(4, 0, &.{ 0x23, 0x71, 0xc9, 0xff }),
+        .size = 4,
+    });
+    const cursor_buffer = (try protocol.wl_shm_pool.construct_create_buffer(&client.objects, &actor.transmit, cursor_pool.id, .{
+        .offset = 0,
+        .width = 1,
+        .height = 1,
+        .stride = 4,
+        .format = .argb8888,
+    })).id;
+    const cursor_id = handler.cursor_surface.?.id;
+    const cursor_pointer = try coordinator.seat_adapter.pointerIdOn(capture_objects, handler.pointer.?.id);
+    try protocol.wl_pointer.encodeRequest(&actor.transmit, handler.pointer.?.id, .{ .set_cursor = .{
+        .serial = handler.pointer_enter_serial,
+        .surface = cursor_id,
+        .hotspot_x = 0,
+        .hotspot_y = 0,
+    } });
+    for ([_]ouro.scene_geometry.Point{ .{ .x = 1, .y = -1 }, .{ .x = -1, .y = 0 }, .{ .x = -3, .y = 3 }, .{ .x = -1, .y = 0 } }, 0..) |expected, step| {
+        if (step == 1) {
+            try protocol.wl_pointer.encodeRequest(&actor.transmit, handler.pointer.?.id, .{ .set_cursor = .{
+                .serial = handler.pointer_enter_serial,
+                .surface = cursor_id,
+                .hotspot_x = -1,
+                .hotspot_y = 0,
+            } });
+        } else {
+            const delta: ouro.scene_geometry.Point = switch (step) {
+                0 => .{ .x = -1, .y = 1 },
+                2 => .{ .x = 2, .y = -3 },
+                3 => .{ .x = -2, .y = 3 },
+                else => unreachable,
+            };
+            if (step >= 2) try protocol.wl_surface.encodeRequest(&actor.transmit, cursor_id, .{ .attach = .{
+                .buffer = if (step == 2) null else cursor_buffer.id,
+                .x = 0,
+                .y = 0,
+            } });
+            try protocol.wl_surface.encodeRequest(&actor.transmit, cursor_id, .{ .offset = .{ .x = delta.x, .y = delta.y } });
+            try protocol.wl_surface.encodeRequest(&actor.transmit, cursor_id, .{ .commit = .{} });
+        }
+        try submitClient(&client_reactor, &driver, &handler);
+        for (0..256) |_| {
+            _ = try drainClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (std.meta.eql(expected, coordinator.interaction.cursor.hotspot) and
+                coordinator.cursor_layer.active == (step != 2) and
+                coordinator.pending_surface_len == 0 and
+                (step == 2 or (coordinator.cursor_layer.sample.?.destination.x == coordinator.interaction.pointerPosition().x - expected.x and
+                    coordinator.cursor_layer.sample.?.destination.y == coordinator.interaction.pointerPosition().y - expected.y))) break;
+            const pause: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = linux.nanosleep(&pause, null);
+        }
+        try std.testing.expectEqual(expected, coordinator.interaction.cursor.hotspot);
+        try std.testing.expectEqual(step != 2, coordinator.cursor_layer.active);
+        if (step != 2) {
+            const pointer = coordinator.interaction.pointerPosition();
+            try std.testing.expectEqual(pointer.x - expected.x, coordinator.cursor_layer.sample.?.destination.x);
+            try std.testing.expectEqual(pointer.y - expected.y, coordinator.cursor_layer.sample.?.destination.y);
+            const info = coordinator.cursorCaptureInfo(.{ .cursor = .{
+                .source = .{ .output = coordinator.primaryKmsOutput().?.outputId() },
+                .cursor = cursor_pointer,
+            } }).?;
+            try std.testing.expectEqual(expected.x, info.hotspot.x);
+            try std.testing.expectEqual(expected.y, info.hotspot.y);
+        }
+    }
+    try wayring.client.sendRequest(protocol.wl_buffer, &client.objects, &actor.transmit, cursor_buffer, .{ .destroy = .{} });
+    try wayring.client.sendRequest(protocol.wl_shm_pool, &client.objects, &actor.transmit, cursor_pool.id, .{ .destroy = .{} });
 
     try handler.destroyCursor();
     try submitClient(&client_reactor, &driver, &handler);
@@ -5743,14 +5895,25 @@ fn runScreencopyCapture(
 }
 
 test "shell-input: image copy capture publishes constraints and writes output SHM" {
-    try runImageCopyCapture(false);
+    try runImageCopyCapture(false, .shm);
 }
 
 test "shell-input: session disable fails image copy frame and stops session" {
-    try runImageCopyCapture(true);
+    try runImageCopyCapture(true, .shm);
 }
 
-fn runImageCopyCapture(interrupt: bool) !void {
+test "shell-input: image copy negotiates DMA-BUF success and import rejection" {
+    try runImageCopyCapture(false, .dmabuf);
+    try runImageCopyCapture(false, .reject_dmabuf);
+}
+
+test "shell-input: image copy negotiates high precision SHM without losing low bits" {
+    try runImageCopyCapture(false, .precise);
+}
+
+const ImageCopyKind = enum { shm, precise, dmabuf, reject_dmabuf };
+
+fn runImageCopyCapture(interrupt: bool, kind: ImageCopyKind) !void {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-image-copy-{d}.sock", .{linux.getpid()});
@@ -5759,6 +5922,8 @@ fn runImageCopyCapture(interrupt: bool) !void {
 
     var fixture = try physical_fixture.Fixture.init();
     defer fixture.deinit();
+    fixture.capture_vulkan = kind != .shm;
+    var renderer: physical_fixture.CaptureRenderer = .{ .reject_import = kind == .reject_dmabuf };
     var root_config = physical_fixture.compositorConfig();
     root_config.runtime.object_capacity = 24;
     root_config.runtime.object_quota = 24;
@@ -5769,7 +5934,12 @@ fn runImageCopyCapture(interrupt: bool) !void {
     );
     var config = physical_fixture.coordinatorConfig();
     config.router_capacity = 24;
-    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    var platforms = fixture.platforms();
+    if (kind != .shm) {
+        config.output.renderer = .vulkan;
+        platforms.output.vulkan = renderer.platform();
+    }
+    const coordinator = try Coordinator.create(allocator, root, platforms, config);
     var loop = try Loop.init(
         allocator,
         root,
@@ -5806,6 +5976,7 @@ fn runImageCopyCapture(interrupt: bool) !void {
         .objects = &client.objects,
         .queue = &actor.transmit,
         .registry = registry,
+        .kind = kind,
     };
     defer {
         if (handler.read_fd >= 0) _ = linux.close(handler.read_fd);
@@ -5823,7 +5994,7 @@ fn runImageCopyCapture(interrupt: bool) !void {
             try fixture.signalSession(.disable);
             disable_sent = true;
         }
-        if ((!interrupt and handler.ready) or
+        if ((!interrupt and (handler.ready or handler.failed)) or
             (interrupt and handler.failed and handler.stopped and
                 !coordinator.anyPendingImageCopy() and
                 coordinator.session.state == .disabled)) break;
@@ -5831,27 +6002,57 @@ fn runImageCopyCapture(interrupt: bool) !void {
             try waitForEither(&root.ring, client_reactor.ring);
     }
     try std.testing.expectEqual(interrupt, disable_sent);
-    try std.testing.expectEqual(!interrupt, handler.ready);
-    try std.testing.expectEqual(interrupt, handler.failed);
+    const rejected = kind == .reject_dmabuf;
+    try std.testing.expectEqual(!interrupt and !rejected, handler.ready);
+    try std.testing.expectEqual(interrupt or rejected, handler.failed);
     try std.testing.expectEqual(interrupt, handler.stopped);
     try std.testing.expectEqual(@as(usize, 1), handler.buffer_size_events);
-    try std.testing.expectEqual(@as(usize, 2), handler.shm_format_events);
+    try std.testing.expectEqual(@as(usize, if (kind == .shm) 2 else 3), handler.shm_format_events);
+    try std.testing.expectEqual(@as(usize, if (kind == .shm) 0 else 2), handler.dmabuf_format_events);
+    try std.testing.expectEqual(kind != .shm, handler.dmabuf_device_seen);
     try std.testing.expectEqual(@as(usize, 1), handler.constraints_done_events);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
     if (interrupt) {
         try std.testing.expect(!coordinator.anyPendingImageCopy());
         try std.testing.expectEqual(.disabled, coordinator.session.state);
+    } else if (rejected) {
+        try std.testing.expect(!coordinator.anyPendingImageCopy());
+        try std.testing.expectEqual(@as(usize, 1), renderer.imports);
+        try std.testing.expectEqual(@as(usize, 0), renderer.writes);
+        try std.testing.expectEqual(@as(usize, 0), handler.transform_events);
+        var untouched: [64]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 64), linux.pread(handler.read_fd, &untouched, untouched.len, 0));
+        try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 64), &untouched);
     } else {
         try std.testing.expectEqual(@as(usize, 1), handler.transform_events);
         try std.testing.expectEqual(@as(usize, 1), handler.damage_events);
         try std.testing.expectEqual(@as(usize, 1), handler.presentation_events);
-        var captured: [24]u8 = undefined;
+        var captured: [64]u8 = undefined;
         const read = linux.pread(handler.read_fd, &captured, captured.len, 0);
         try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(read));
         try std.testing.expectEqual(@as(usize, captured.len), read);
-        const black_pixel = [_]u8{ 0, 0, 0, 0xff };
-        for (0..6) |pixel|
-            try std.testing.expectEqualSlices(u8, &black_pixel, captured[pixel * 4 ..][0..4]);
+        if (kind == .precise) {
+            for (0..6) |pixel| {
+                const channels = [_]u16{ @intCast(0x1234 + pixel * 0x1111), @intCast(0x5678 + pixel * 0x1111), @intCast(0x9abc + pixel * 0x1111), 0xffff };
+                for (channels, 0..) |channel, c| try std.testing.expectEqual(channel, std.mem.readInt(u16, captured[pixel * 8 + c * 2 ..][0..2], .little));
+            }
+            try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 16), captured[48..]);
+            try std.testing.expectEqual(@as(usize, 1), renderer.precise_reads);
+        } else if (kind == .dmabuf) {
+            for (0..6) |pixel| {
+                const base: u8 = @intCast(pixel * 16);
+                const offset = 8 + (pixel / 3) * 16 + (pixel % 3) * 4;
+                try std.testing.expectEqualSlices(u8, &.{ base + 4, base + 3, base + 2, 255 }, captured[offset..][0..4]);
+            }
+            try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 8), captured[0..8]);
+            try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 4), captured[20..24]);
+            try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 28), captured[36..]);
+            try std.testing.expectEqual(@as(usize, 1), renderer.imports);
+            try std.testing.expectEqual(@as(usize, 1), renderer.writes);
+        } else {
+            for (0..6) |pixel| try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0xff }, captured[pixel * 4 ..][0..4]);
+            try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 40), captured[24..]);
+        }
     }
 
     coordinator.disconnected(coordinator.peer.?);
@@ -5873,6 +6074,8 @@ fn runImageCopyCapture(interrupt: bool) !void {
     loop.deinit();
     try coordinator.destroy();
     try root.deinit();
+    try std.testing.expectEqual(@as(linux.fd_t, -1), renderer.fd);
+    try std.testing.expectEqual(@as(usize, if (kind == .dmabuf) 1 else 0), renderer.destroys);
 }
 
 test "shell-input: synchronized cursor subsurface batch renders root and child" {
@@ -7432,6 +7635,290 @@ test "shell-input: one client disconnect does not interrupt another client" {
     try root.deinit();
 }
 
+test "shell-input: cross-client DnD transfers an FD and negotiates move before finish" {
+    try runCrossClientDrag(false);
+    try runCrossClientDrag(true);
+}
+
+fn runCrossClientDrag(disconnect_target: bool) !void {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-dnd-transfer-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var input = try FakeInput.init();
+    defer input.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 64;
+    root_config.runtime.object_quota = 64;
+    root_config.runtime.registry_capacity = 2;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 2), root_config);
+    var config = physical_fixture.coordinatorConfig();
+    config.shm.pool_capacity = 2;
+    config.shm.buffer_capacity = 2;
+    config.surface.surface_capacity = 2;
+    config.surface.frame_callback_capacity = 2;
+    config.surface.content_update_capacity = 3;
+    config.surface.dependency_capacity = 2;
+    config.surface.attachment_capacity = 2;
+    config.surface.copy_capacity = 2;
+    config.output.max_samples = 3;
+    config.output.max_source_bytes = pixels.len * 2;
+    var platforms = fixture.platforms();
+    platforms.input = input.platform();
+    const coordinator = try Coordinator.create(allocator, root, platforms, config);
+    coordinator.desktop.policy.inner_gap = 0;
+    coordinator.desktop.policy.outer_gap = 0;
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    var reactors: [2]wayring.io_uring.Reactor = undefined;
+    var clients: [2]ClientConnection = undefined;
+    var drivers: [2]ClientDriver = undefined;
+    var handlers: [2]DragTransferHandler = undefined;
+    for (0..2) |i| {
+        try reactors[i].initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+        clients[i] = try ClientConnection.attach(allocator, &reactors[i], try wayring.unix_socket.connect(path), .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .{ .max_objects = 64, .max_client_ids = 63 });
+        const actor = try clients[i].actor();
+        drivers[i] = ClientDriver.init(&clients[i]);
+        handlers[i] = .{ .queue = &actor.transmit, .shell = .{
+            .objects = &clients[i].objects,
+            .queue = &actor.transmit,
+            .registry = try ClientCore.getRegistry(&clients[i].objects, &actor.transmit, null),
+            .surface_count = 1,
+            .cycle_count = 1,
+            .bind_seat = true,
+        }, .source_client = i == 1 };
+        try submitClient(&reactors[i], &drivers[i], &handlers[i]);
+    }
+    defer for (&handlers) |*handler| {
+        if (handler.read_fd >= 0) _ = linux.close(handler.read_fd);
+        if (handler.write_fd >= 0) _ = linux.close(handler.write_fd);
+    };
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    var stage: u8 = 0;
+    var target_closed = false;
+    for (0..1024) |_| {
+        for (0..2) |i| _ = try drainClient(&reactors[i], &drivers[i], &handlers[i]);
+        _ = try loop.turn(coordinator);
+        if (stage == 0 and handlers[0].shell.shell_created and handlers[1].shell.frame_done == 1 and
+            handlers[1].device != null and coordinator.input != null)
+        {
+            try input.publish(&.{
+                .{ .device_added = .{ .device = 42, .info = .{ .capabilities = .{ .pointer = true } } } },
+                .{ .pointer_motion = .{ .device = 42, .time_usec = 1000, .dx = -100, .dy = -100 } },
+            });
+            stage = 1;
+        }
+        if (stage == 1 and handlers[1].shell.pointer_surface != null and input.cursor == input.event_count) {
+            try input.publish(&.{.{ .pointer_button = .{ .device = 42, .time_usec = 2000, .button = 0x110, .pressed = true } }});
+            stage = 2;
+        }
+        if (stage == 2 and coordinator.data_device_adapter.dragActive()) {
+            // Supply the destination hit independently of desktop placement.
+            // All client requests/events, including the origin grab, use wire IO.
+            // The offer and MIME fit, but source_actions must wait for a send.
+            (try root.reactor.getActor(coordinator.clients.items[0].peer)).transmit.byte_budget = 52;
+            try coordinator.data_device_adapter.updateDragTarget(.{
+                .peer = coordinator.clients.items[0].peer,
+                .surface_object = handlers[0].shell.surfaces[0].?.id,
+                .x = 257,
+                .y = 129,
+            }, 73, 3, true);
+            stage = 3;
+        }
+        if (stage == 3 and handlers[1].write_fd >= 0 and handlers[0].action == 2) {
+            // The receive pipe is deliberately full. A blocked producer must
+            // not prevent Wayland from completing action negotiation.
+            const result = linux.write(handlers[1].write_fd, DragTransferHandler.payload.ptr, DragTransferHandler.payload.len);
+            try std.testing.expectEqual(linux.E.AGAIN, linux.errno(result));
+            var scratch: [4096]u8 = undefined;
+            while (true) {
+                const count = linux.read(handlers[0].read_fd, &scratch, scratch.len);
+                if (linux.errno(count) == .AGAIN) break;
+                try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(count));
+                try std.testing.expect(count != 0);
+                for (scratch[0..count]) |byte| try std.testing.expectEqual(@as(u8, 0xa7), byte);
+            }
+            try std.testing.expectEqual(DragTransferHandler.payload.len, linux.write(handlers[1].write_fd, DragTransferHandler.payload.ptr, DragTransferHandler.payload.len));
+            _ = linux.close(handlers[1].write_fd);
+            handlers[1].write_fd = -1;
+            var received: [DragTransferHandler.payload.len + 1]u8 = undefined;
+            const count = linux.read(handlers[0].read_fd, &received, received.len);
+            try std.testing.expectEqual(DragTransferHandler.payload.len, count);
+            try std.testing.expectEqualSlices(u8, DragTransferHandler.payload, received[0..count]);
+            try std.testing.expectEqual(@as(usize, 0), linux.read(handlers[0].read_fd, &received, received.len));
+            if (disconnect_target) {
+                _ = try clients[0].prepareClose();
+                try submitClient(&reactors[0], &drivers[0], &handlers[0]);
+                target_closed = true;
+            } else {
+                try coordinator.data_device_adapter.dropDrag();
+            }
+            stage = 4;
+        }
+        if (stage == 4 and (if (disconnect_target) coordinator.client_count == 1 else handlers[1].finished == 1)) break;
+        try waitForAny(&root.ring, reactors[0].ring, reactors[1].ring);
+    }
+    try std.testing.expectEqual(@as(u8, 4), stage);
+    try std.testing.expectEqual(@as(usize, 1), handlers[1].sent);
+    try std.testing.expectEqual(@as(usize, 1), handlers[1].accepted);
+    try std.testing.expectEqual(@as(u32, 2), handlers[1].action);
+    if (!disconnect_target) {
+        try std.testing.expectEqual(@as(usize, 1), handlers[0].drops);
+        try std.testing.expectEqual(@as(usize, 1), handlers[1].drop_performed);
+        try std.testing.expectEqual(@as(usize, 1), handlers[1].finished);
+        try std.testing.expectEqual(@as(usize, 0), handlers[1].cancelled);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), handlers[1].finished);
+        try std.testing.expectEqual(@as(usize, 0), handlers[0].drops);
+        try std.testing.expect(!coordinator.stopping);
+    }
+    for (0..2) |i| {
+        try std.testing.expectEqual(@as(usize, 0), handlers[i].shell.event_failures);
+        if (i != 0 or !target_closed) _ = try clients[i].prepareClose();
+        try submitClient(&reactors[i], &drivers[i], &handlers[i]);
+    }
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..512) |_| {
+        const first = try drainClient(&reactors[0], &drivers[0], &handlers[0]);
+        const second = try drainClient(&reactors[1], &drivers[1], &handlers[1]);
+        const progress = try loop.turn(coordinator);
+        drained = first.quiescent and second.quiescent and progress.wayring.shutdown_complete and coordinator.backendDrainComplete();
+        if (drained) break;
+        try waitForAny(&root.ring, reactors[0].ring, reactors[1].ring);
+    }
+    try std.testing.expect(drained);
+    for (0..2) |i| {
+        try clients[i].deinit(allocator);
+        reactors[i].deinit(allocator);
+    }
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
+const DragTransferHandler = struct {
+    const payload = "ouro DnD\x00\xff: move, not copy\n";
+    queue: *wayring.tx.Queue,
+    shell: MultiHandler,
+    source_client: bool,
+    manager: ?wayring.objects.Handle = null,
+    device: ?wayring.objects.Handle = null,
+    source: ?wayring.objects.Handle = null,
+    offer: ?wayring.objects.Handle = null,
+    read_fd: linux.fd_t = -1,
+    write_fd: linux.fd_t = -1,
+    action: u32 = 0,
+    source_actions_events: usize = 0,
+    sent: usize = 0,
+    accepted: usize = 0,
+    drops: usize = 0,
+    drop_performed: usize = 0,
+    finished: usize = 0,
+    cancelled: usize = 0,
+
+    pub fn eventError(self: *@This(), peer: wayring.io_uring.Peer, failure: ClientCore.EventFailure) void {
+        self.shell.eventError(peer, failure);
+    }
+
+    pub fn event(self: *@This(), target: wayring.objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
+        const objects = self.shell.objects;
+        if (target.object.interface == &ClientCore.Registry.info) {
+            const value = try ClientCore.decodeRegistryEvent(objects, self.shell.registry, message, fds);
+            if (value == .global and std.mem.eql(u8, value.global.interface, protocol.wl_data_device_manager.info.name))
+                self.manager = try ClientCore.bind(objects, self.queue, self.shell.registry, value.global.name, &protocol.wl_data_device_manager.info, 3, null);
+            if (value == .global) try self.shell.bindGlobal(value.global);
+            if (self.source_client) {
+                try self.shell.maybeCreateShells();
+            } else if (!self.shell.shell_created and self.shell.compositor != null) {
+                self.shell.surfaces[0] = (try protocol.wl_compositor.construct_create_surface(objects, self.queue, self.shell.compositor.?, .{})).id;
+                self.shell.shell_created = true;
+            }
+            if (self.device == null and self.manager != null and self.shell.seat != null) {
+                self.device = (try protocol.wl_data_device_manager.construct_get_data_device(objects, self.queue, self.manager.?, .{ .seat = self.shell.seat.?.id })).id;
+                if (self.source_client) {
+                    self.source = (try protocol.wl_data_device_manager.construct_create_data_source(objects, self.queue, self.manager.?, .{})).id;
+                    try protocol.wl_data_source.encodeRequest(self.queue, self.source.?.id, .{ .offer = .{ .mime_type = "application/x-ouro-test" } });
+                    try protocol.wl_data_source.encodeRequest(self.queue, self.source.?.id, .{ .set_actions = .{ .dnd_actions = .fromWire(3) } });
+                }
+            }
+        } else if (target.object.interface == &protocol.wl_pointer.info) {
+            const value = try protocol.wl_pointer.decodeEvent(message, fds);
+            if (value == .button and self.source_client and value.button.state.value == protocol.wl_pointer.button_state.pressed.value)
+                try protocol.wl_data_device.encodeRequest(self.queue, self.device.?.id, .{ .start_drag = .{
+                    .source = self.source.?.id,
+                    .origin = self.shell.surfaces[0].?.id,
+                    .icon = null,
+                    .serial = value.button.serial,
+                } });
+            _ = try self.shell.event(target, message, fds);
+        } else if (target.object.interface == &protocol.wl_data_device.info) {
+            switch (try protocol.wl_data_device.decodeEvent(message, fds)) {
+                .data_offer => |value| self.offer = (try protocol.wl_data_device.admit_event_data_offer(objects, self.device.?, value, .{})).id,
+                .enter => |value| if (!self.source_client) {
+                    try std.testing.expectEqual(@as(usize, 1), self.source_actions_events);
+                    try std.testing.expectEqual(self.shell.surfaces[0].?.id, value.surface);
+                    try std.testing.expectEqual(@as(i32, 257), value.x);
+                    try std.testing.expectEqual(@as(i32, 129), value.y);
+                    try protocol.wl_data_offer.encodeRequest(self.queue, value.id.?, .{ .set_actions = .{ .dnd_actions = .fromWire(3), .preferred_action = .move } });
+                    try protocol.wl_data_offer.encodeRequest(self.queue, value.id.?, .{ .accept = .{ .serial = value.serial, .mime_type = "application/x-ouro-test" } });
+                    var pipe: [2]linux.fd_t = undefined;
+                    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true, .NONBLOCK = true })));
+                    self.read_fd = pipe[0];
+                    const filler = [_]u8{0xa7} ** 4096;
+                    while (true) {
+                        const result = linux.write(pipe[1], &filler, filler.len);
+                        if (linux.errno(result) == .SUCCESS) continue;
+                        try std.testing.expectEqual(linux.E.AGAIN, linux.errno(result));
+                        break;
+                    }
+                    try protocol.wl_data_offer.encodeRequest(self.queue, value.id.?, .{ .receive = .{ .mime_type = "application/x-ouro-test", .fd = pipe[1] } });
+                },
+                .drop => {
+                    self.drops += 1;
+                    try std.testing.expectEqual(@as(u32, 2), self.action);
+                    try protocol.wl_data_offer.encodeRequest(self.queue, self.offer.?.id, .{ .finish = .{} });
+                    try wayring.client.sendRequest(protocol.wl_data_offer, objects, self.queue, self.offer.?, .{ .destroy = .{} });
+                },
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.wl_data_offer.info) {
+            switch (try protocol.wl_data_offer.decodeEvent(message, fds)) {
+                .offer => |value| try std.testing.expectEqualStrings("application/x-ouro-test", value.mime_type),
+                .source_actions => |value| {
+                    try std.testing.expectEqual(@as(u32, 3), value.source_actions.value);
+                    self.source_actions_events += 1;
+                },
+                .action => |value| self.action = value.dnd_action.value,
+            }
+        } else if (target.object.interface == &protocol.wl_data_source.info) {
+            switch (try protocol.wl_data_source.decodeEvent(message, fds)) {
+                .target => |value| if (value.mime_type) |mime| {
+                    try std.testing.expectEqualStrings("application/x-ouro-test", mime);
+                    self.accepted += 1;
+                },
+                .send => |value| {
+                    try std.testing.expectEqualStrings("application/x-ouro-test", value.mime_type);
+                    self.write_fd = value.fd;
+                    self.sent += 1;
+                },
+                .action => |value| self.action = value.dnd_action.value,
+                .dnd_drop_performed => self.drop_performed += 1,
+                .dnd_finished => {
+                    try std.testing.expectEqual(@as(usize, 1), self.drop_performed);
+                    self.finished += 1;
+                },
+                .cancelled => self.cancelled += 1,
+            }
+        } else return self.shell.event(target, message, fds);
+        return .continue_dispatch;
+    }
+};
+
 const FakeInput = struct {
     fd: linux.fd_t,
     events: [8]ouro.input_platform.RawEvent = undefined,
@@ -8773,6 +9260,10 @@ const ImageCopyHandler = struct {
     objects: *wayring.objects.ClientObjects,
     queue: *wayring.tx.Queue,
     registry: wayring.objects.Handle,
+    kind: ImageCopyKind = .shm,
+    dmabuf: ?wayring.objects.Handle = null,
+    dmabuf_device_seen: bool = false,
+    dmabuf_format_events: usize = 0,
     shm: ?wayring.objects.Handle = null,
     output: ?wayring.objects.Handle = null,
     source_manager: ?wayring.objects.Handle = null,
@@ -8820,6 +9311,8 @@ const ImageCopyHandler = struct {
             try self.maybeCreateSession();
         } else if (target.object.interface == &protocol.wl_shm.info) {
             _ = try protocol.wl_shm.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.zwp_linux_dmabuf_v1.info) {
+            _ = try protocol.zwp_linux_dmabuf_v1.decodeEvent(message, fds);
         } else if (target.object.interface == &protocol.wl_output.info) {
             switch (try protocol.wl_output.decodeEvent(message, fds)) {
                 .done => {
@@ -8840,7 +9333,8 @@ const ImageCopyHandler = struct {
                 .shm_format => |value| {
                     try std.testing.expect(
                         value.format.value == protocol.wl_shm.format.argb8888.value or
-                            value.format.value == protocol.wl_shm.format.xrgb8888.value,
+                            value.format.value == protocol.wl_shm.format.xrgb8888.value or
+                            (self.kind != .shm and value.format.value == protocol.wl_shm.format.abgr16161616.value),
                     );
                     self.shm_format_events += 1;
                 },
@@ -8849,7 +9343,17 @@ const ImageCopyHandler = struct {
                     try self.requestFrame();
                 },
                 .stopped => self.stopped = true,
-                .dmabuf_device, .dmabuf_format => return error.UnexpectedDmabufCapture,
+                .dmabuf_device => |value| {
+                    try std.testing.expect(self.kind != .shm);
+                    try std.testing.expectEqual(@as(usize, 8), value.device.len);
+                    self.dmabuf_device_seen = true;
+                },
+                .dmabuf_format => |value| {
+                    try std.testing.expect(self.dmabuf_device_seen);
+                    try std.testing.expect(value.format == ouro.gbm.format_argb8888 or value.format == ouro.gbm.format_xrgb8888);
+                    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 8), value.modifiers);
+                    self.dmabuf_format_events += 1;
+                },
             }
         } else if (target.object.interface == &protocol.ext_image_copy_capture_frame_v1.info) {
             switch (try protocol.ext_image_copy_capture_frame_v1.decodeEvent(message, fds)) {
@@ -8881,6 +9385,8 @@ const ImageCopyHandler = struct {
     }
 
     fn bindGlobal(self: *ImageCopyHandler, value: anytype) !void {
+        if (self.kind != .shm and std.mem.eql(u8, value.interface, protocol.zwp_linux_dmabuf_v1.info.name))
+            self.dmabuf = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwp_linux_dmabuf_v1.info, 3, null);
         if (std.mem.eql(u8, value.interface, protocol.wl_shm.info.name))
             self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_shm.info, @min(value.version, 2), null);
         if (std.mem.eql(u8, value.interface, protocol.wl_output.info.name))
@@ -8917,7 +9423,7 @@ const ImageCopyHandler = struct {
         if (self.frame_requested) return;
         try std.testing.expectEqual(@as(u32, 3), self.width);
         try std.testing.expectEqual(@as(u32, 2), self.height);
-        const descriptor = try ordinaryMemfd(24, 0, &([_]u8{0x55} ** 24));
+        const descriptor = try ordinaryMemfd(64, 0, &([_]u8{0x55} ** 64));
         const retained = linux.fcntl(descriptor, linux.F.DUPFD_CLOEXEC, 0);
         if (linux.errno(retained) != .SUCCESS) return error.DuplicateFailed;
         self.read_fd = @intCast(retained);
@@ -8925,31 +9431,35 @@ const ImageCopyHandler = struct {
             _ = linux.close(self.read_fd);
             self.read_fd = -1;
         }
-        const pool = try protocol.wl_shm.construct_create_pool(
-            self.objects,
-            self.queue,
-            self.shm.?,
-            .{ .fd = descriptor, .size = 24 },
-        );
-        self.buffer = (try protocol.wl_shm_pool.construct_create_buffer(
-            self.objects,
-            self.queue,
-            pool.id,
-            .{
+        if (self.kind == .dmabuf or self.kind == .reject_dmabuf) {
+            try std.testing.expectEqual(@as(usize, 2), self.dmabuf_format_events);
+            const params = (try protocol.zwp_linux_dmabuf_v1.construct_create_params(self.objects, self.queue, self.dmabuf.?, .{})).params_id;
+            try protocol.zwp_linux_buffer_params_v1.encodeRequest(self.queue, params.id, .{ .add = .{
+                .fd = descriptor,
+                .plane_idx = 0,
+                .offset = 8,
+                .stride = 16,
+                .modifier_hi = 0,
+                .modifier_lo = 0,
+            } });
+            self.buffer = (try protocol.zwp_linux_buffer_params_v1.construct_create_immed(self.objects, self.queue, params, .{
+                .width = 3,
+                .height = 2,
+                .format = ouro.gbm.format_xrgb8888,
+                .flags = .fromInt(0),
+            })).buffer_id;
+            try wayring.client.sendRequest(protocol.zwp_linux_buffer_params_v1, self.objects, self.queue, params, .{ .destroy = .{} });
+        } else {
+            const pool = try protocol.wl_shm.construct_create_pool(self.objects, self.queue, self.shm.?, .{ .fd = descriptor, .size = 64 });
+            self.buffer = (try protocol.wl_shm_pool.construct_create_buffer(self.objects, self.queue, pool.id, .{
                 .offset = 0,
                 .width = 3,
                 .height = 2,
-                .stride = 12,
-                .format = .xrgb8888,
-            },
-        )).id;
-        try wayring.client.sendRequest(
-            protocol.wl_shm_pool,
-            self.objects,
-            self.queue,
-            pool.id,
-            .{ .destroy = .{} },
-        );
+                .stride = if (self.kind == .precise) 24 else 12,
+                .format = if (self.kind == .precise) .abgr16161616 else .xrgb8888,
+            })).id;
+            try wayring.client.sendRequest(protocol.wl_shm_pool, self.objects, self.queue, pool.id, .{ .destroy = .{} });
+        }
         self.frame = (try protocol.ext_image_copy_capture_session_v1.construct_create_frame(
             self.objects,
             self.queue,
@@ -9790,6 +10300,7 @@ const Handler = struct {
     image_capture_height: u32 = 0,
     image_capture_ready: bool = false,
     image_capture_failed: bool = false,
+    image_capture_cursor: bool = false,
     test_image_capture_sources: bool = false,
     image_output_global_seen: bool = false,
     image_toplevel_global_seen: bool = false,
@@ -10064,8 +10575,8 @@ const Handler = struct {
                 .damage => |value| {
                     try std.testing.expectEqual(@as(i32, 0), value.x);
                     try std.testing.expectEqual(@as(i32, 0), value.y);
-                    try std.testing.expectEqual(@as(i32, 3), value.width);
-                    try std.testing.expectEqual(@as(i32, 2), value.height);
+                    try std.testing.expectEqual(@as(i32, if (self.image_capture_cursor) 1 else 3), value.width);
+                    try std.testing.expectEqual(@as(i32, if (self.image_capture_cursor) 1 else 2), value.height);
                 },
                 .presentation_time => {},
                 .ready => {
@@ -10606,8 +11117,10 @@ const Handler = struct {
 
     fn queueToplevelCaptureFrame(self: *Handler) !void {
         if (self.image_capture_frame != null) return;
-        try std.testing.expectEqual(@as(u32, 3), self.image_capture_width);
-        try std.testing.expectEqual(@as(u32, 2), self.image_capture_height);
+        const width: i32 = if (self.image_capture_cursor) 1 else 3;
+        const height: i32 = if (self.image_capture_cursor) 1 else 2;
+        try std.testing.expectEqual(@as(u32, @intCast(width)), self.image_capture_width);
+        try std.testing.expectEqual(@as(u32, @intCast(height)), self.image_capture_height);
         const descriptor = try ordinaryMemfd(24, 0, &([_]u8{0x55} ** 24));
         const retained = linux.fcntl(descriptor, linux.F.DUPFD_CLOEXEC, 0);
         if (linux.errno(retained) != .SUCCESS) return error.DuplicateFailed;
@@ -10624,9 +11137,9 @@ const Handler = struct {
             pool.id,
             .{
                 .offset = 0,
-                .width = 3,
-                .height = 2,
-                .stride = 12,
+                .width = width,
+                .height = height,
+                .stride = width * 4,
                 .format = .argb8888,
             },
         )).id;
@@ -10822,7 +11335,7 @@ const Handler = struct {
     }
 
     fn queueCursor(self: *Handler, serial: u32) !void {
-        const descriptor = try ordinaryMemfd(4096, 0, &.{ 0xff, 0xff, 0xff, 0xff });
+        const descriptor = try ordinaryMemfd(4096, 0, &.{ 0x23, 0x71, 0xc9, 0xff });
         const pool = try protocol.wl_shm.construct_create_pool(
             self.objects,
             self.queue,

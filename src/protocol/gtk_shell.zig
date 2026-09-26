@@ -1,4 +1,7 @@
-//! Bounded gtk-shell v5 compatibility metadata and configure adapter.
+//! Bounded gtk-shell v7 compatibility metadata and configure adapter.
+//! Legacy timestamps/startup IDs cannot authorize focus; use xdg-activation.
+//! Modal is a hint, as with xdg-dialog, not permission to trap another window's
+//! input. Ouro has no window menu or middle-click lower policy.
 
 const std = @import("std");
 const wayring = @import("wayring");
@@ -23,6 +26,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         const Core = wayring.server.Core(protocol);
         const Shell = protocol.gtk_shell1;
         const Surface = protocol.gtk_surface1;
+        pub const Metadata = struct {
+            dbus: [6]?[]const u8,
+            a11y_dbus_name: ?[]const u8,
+            toplevel_object_path: ?[]const u8,
+            modal: bool,
+        };
+        pub const TitlebarPolicy = struct {
+            context: *anyopaque,
+            toggleMaximizedFn: *const fn (*anyopaque, CoreSurface.SurfaceId) anyerror!void,
+        };
         pub const GestureValidator = struct {
             context: *anyopaque,
             validateFn: *const fn (*anyopaque, wayring.io_uring.Peer, u32, u32, CoreSurface.SurfaceId) bool,
@@ -31,7 +44,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             }
         };
         const Kind = enum { shell, surface };
-        const Text = struct { offset: usize = 0, len: usize = 0 };
+        const Text = struct { offset: usize = 0, len: usize = 0, present: bool = false };
         const Slot = struct {
             header: slot_pool.Header = .{},
             kind: Kind = .shell,
@@ -39,7 +52,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             peer: wayring.io_uring.Peer = undefined,
             version: u32 = 1,
             surface: ?CoreSurface.SurfaceId = null,
-            strings: [7]Text = .{Text{}} ** 7,
+            strings: [8]Text = .{Text{}} ** 8,
             used: usize = 0,
             modal: bool = false,
             capabilities_pending: bool = false,
@@ -55,6 +68,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         slots: slot_pool.Pool(Slot),
         string_bytes: usize,
         validator: ?GestureValidator = null,
+        titlebar_policy: ?TitlebarPolicy = null,
 
         pub fn init(allocator: std.mem.Allocator, core: *CoreSurface, config: Config) !Self {
             try config.validate();
@@ -73,7 +87,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (self.runtime != null) return error.AlreadyInstalled;
             self.runtime = runtime;
             errdefer self.runtime = null;
-            return runtime.addGlobalWithBinder(&Shell.info, 5, self, bind);
+            return runtime.addGlobalWithBinder(&Shell.info, 7, self, bind);
         }
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
@@ -102,7 +116,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         };
                         child.handle = admitted.gtk_surface;
                     },
-                    .set_startup_id => |v| self.replaceAll(slot, &.{v.startup_id}) catch |e| return try self.failure(actor, d.handle.id, e),
+                    .set_startup_id => |v| self.replace(slot, 0, &.{v.startup_id}) catch |e| return try self.failure(actor, d.handle.id, e),
                     .system_bell => |v| if (v.surface) |id| if (!self.validSurfaceObject(server_objects, peer, id)) return try self.failure(actor, d.handle.id, error.InvalidGtkSurface),
                     .notify_launch => |v| if (v.startup_id.len > self.string_bytes) return try self.failure(actor, d.handle.id, error.StringTooLong),
                 }
@@ -113,19 +127,23 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 const d = try wayring.server.decodeRequest(Surface, server_objects, message, fds);
                 switch (d.value) {
                     .release => {}, // Destructor remains valid after wl_surface destruction.
-                    .set_dbus_properties => |v| if (slot.surface != null) self.replaceAll(slot, &.{ v.application_id, v.app_menu_path, v.menubar_path, v.window_object_path, v.application_object_path, v.unique_bus_name }) catch |e| return try self.failure(actor, d.handle.id, e),
+                    .set_dbus_properties => |v| if (slot.surface != null) self.replace(slot, 0, &.{ v.application_id, v.app_menu_path, v.menubar_path, v.window_object_path, v.application_object_path, v.unique_bus_name }) catch |e| return try self.failure(actor, d.handle.id, e),
+                    .set_a11y_properties => |v| if (slot.surface != null) self.replace(slot, 6, &.{ v.a11y_dbus_name, v.toplevel_object_path }) catch |e| return try self.failure(actor, d.handle.id, e),
                     .set_modal => if (slot.surface != null) {
                         slot.modal = true;
                     },
                     .unset_modal => if (slot.surface != null) {
                         slot.modal = false;
                     },
-                    .present => {},
+                    .present => {}, // A client timestamp is not an activation token.
                     .request_focus => |v| if (slot.surface != null) if (v.startup_id) |id| if (id.len > self.string_bytes) return try self.failure(actor, d.handle.id, error.StringTooLong),
                     .titlebar_gesture => |v| {
                         if (v.gesture.value < 1 or v.gesture.value > 3) return try self.protocolError(actor, d.handle.id, Surface.@"error".invalid_gesture.value, "invalid titlebar gesture");
                         if (slot.surface) |sid| {
-                            if (self.validator) |validator| _ = validator.validate(peer, v.seat, v.serial, sid);
+                            if (self.validator) |validator| if (validator.validate(peer, v.seat, v.serial, sid)) {
+                                if (v.gesture.value == Surface.gesture.double_click.value) if (self.titlebar_policy) |policy|
+                                    try policy.toggleMaximizedFn(policy.context, sid);
+                            };
                         }
                     },
                 }
@@ -153,7 +171,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 if (slot.configure_pending) {
                     var sb: [20]u8 = undefined;
                     var eb: [16]u8 = undefined;
-                    try Surface.encodeEvent(queue, slot.handle.id, .{ .configure = .{ .states = encodeSet(slot.states[0..], &sb) } });
+                    try Surface.encodeEvent(queue, slot.handle.id, .{ .configure = .{ .states = encodeSet(slot.states[0..if (slot.version >= 2) 5 else 1], &sb) } });
                     if (slot.version >= 2) {
                         const edges = [_]bool{slot.floating} ** 4;
                         try Surface.encodeEvent(queue, slot.handle.id, .{ .configure_edges = .{ .constraints = encodeSet(&edges, &eb) } });
@@ -172,7 +190,19 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (self.findSurface(id)) |s| {
                 s.surface = null;
                 s.configure_pending = false;
+                if (s.text) |text| self.allocator.free(text);
+                s.text = null;
+                s.strings = .{Text{}} ** 8;
+                s.used = 0;
+                s.modal = false;
             }
+        }
+        /// Borrowed strings remain valid until metadata replacement or removal.
+        pub fn metadata(self: *Self, id: CoreSurface.SurfaceId) ?Metadata {
+            const s = self.findSurface(id) orelse return null;
+            var dbus: [6]?[]const u8 = undefined;
+            for (&dbus, 0..) |*value, i| value.* = textAt(s, i);
+            return .{ .dbus = dbus, .a11y_dbus_name = textAt(s, 6), .toplevel_object_path = textAt(s, 7), .modal = s.modal };
         }
         pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {
             const s = self.fromObject(&object) orelse return false;
@@ -195,22 +225,31 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             s.text = null;
             self.slots.release(s);
         }
-        fn replaceAll(self: *Self, s: *Slot, values: []const ?[]const u8) !void {
+        fn textAt(s: *Slot, i: usize) ?[]const u8 {
+            const t = s.strings[i];
+            return if (t.present) s.text.?[t.offset..][0..t.len] else null;
+        }
+        fn replace(self: *Self, s: *Slot, start: usize, replacements: []const ?[]const u8) !void {
+            var values: [8]?[]const u8 = undefined;
+            for (&values, 0..) |*value, i| value.* = textAt(s, i);
+            @memcpy(values[start..][0..replacements.len], replacements);
             var needed: usize = 0;
             for (values) |v| if (v) |text| {
                 needed = std.math.add(usize, needed, text.len) catch return error.StringTooLong;
             };
             if (needed > self.string_bytes) return error.StringTooLong;
-            if (s.text == null) s.text = try self.allocator.alloc(u8, self.string_bytes);
-            const storage = s.text.?;
+            // Stage the whole snapshot so a failed update preserves both groups.
+            const storage = try self.allocator.alloc(u8, needed);
             var at: usize = 0;
             for (values, 0..) |v, i| {
-                s.strings[i] = .{ .offset = at, .len = if (v) |text| text.len else 0 };
+                s.strings[i] = .{ .offset = at, .len = if (v) |text| text.len else 0, .present = v != null };
                 if (v) |text| {
                     @memcpy(storage[at..][0..text.len], text);
                     at += text.len;
                 }
             }
+            if (s.text) |text| self.allocator.free(text);
+            s.text = storage;
             s.used = needed;
         }
         fn findSurface(self: *Self, id: CoreSurface.SurfaceId) ?*Slot {
@@ -261,9 +300,9 @@ test "gtk slots recycle generation-safely and metadata replacement is atomic" {
     defer a.deinit();
     const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 2 };
     const s = try a.acquire(.surface, .{ .id = 3, .generation = 4 }, peer, 5, .{ .index = 1, .generation = 1 });
-    try a.replaceAll(s, &.{"abc"});
+    try a.replace(s, 0, &.{"abc"});
     const old = s.text.?[0..3].*;
-    try std.testing.expectError(error.StringTooLong, a.replaceAll(s, &.{ "abc", "def" }));
+    try std.testing.expectError(error.StringTooLong, a.replace(s, 0, &.{ "abc", "def" }));
     try std.testing.expectEqualSlices(u8, &old, s.text.?[0..3]);
     const generation = s.header.generation;
     const grown = try a.acquire(.shell, .{ .id = 8, .generation = 1 }, peer, 5, null);
@@ -281,4 +320,123 @@ test "gtk configure arrays match v5 wire values" {
     const bytes = encodeSet(&values, &b);
     try std.testing.expectEqual(@as(usize, 12), bytes.len);
     try std.testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, bytes[8..12], .little));
+}
+
+test "gtk metadata groups replace atomically and die with the surface" {
+    const Fake = struct {
+        pub const SurfaceId = packed struct { index: u32, generation: u32 };
+    };
+    const A = Adapter(@import("core_protocol"), Fake);
+    var core: Fake = .{};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var a = try A.init(failing.allocator(), &core, .{ .string_bytes = 12 });
+    defer a.deinit();
+    const sid: Fake.SurfaceId = .{ .index = 1, .generation = 2 };
+    const s = try a.acquire(.surface, .{ .id = 3, .generation = 4 }, .{ .slot = 1, .generation = 2 }, 7, sid);
+    try a.replace(s, 6, &.{ ":1.2", "/win" });
+    try a.replace(s, 0, &.{ "app", null, "", null, null, null });
+    try std.testing.expectEqualStrings(":1.2", a.metadata(sid).?.a11y_dbus_name.?);
+    try a.replace(s, 6, &.{ ":2.34", "/new" }); // Exactly the shared 12-byte budget.
+    try std.testing.expectEqualStrings("app", a.metadata(sid).?.dbus[0].?);
+    try std.testing.expect(a.metadata(sid).?.dbus[1] == null);
+    try std.testing.expectEqualStrings("", a.metadata(sid).?.dbus[2].?);
+    try std.testing.expectError(error.StringTooLong, a.replace(s, 6, &.{ ":2.345", "/new" }));
+    try std.testing.expectEqualStrings(":2.34", a.metadata(sid).?.a11y_dbus_name.?);
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, a.replace(s, 0, &.{"x"}));
+    try std.testing.expectEqualStrings("app", a.metadata(sid).?.dbus[0].?);
+    try std.testing.expectEqualStrings("/new", a.metadata(sid).?.toplevel_object_path.?);
+    a.surfaceRemoved(.{ .index = 1, .generation = 1 });
+    try std.testing.expect(a.metadata(sid) != null);
+    a.surfaceRemoved(sid);
+    try std.testing.expect(a.metadata(sid) == null);
+    try std.testing.expect(s.text == null and s.used == 0 and !s.modal);
+    try std.testing.expect(a.resourceRemoved(s.handle, .{ .interface = &@import("core_protocol").gtk_surface1.info, .version = 7, .context = s }));
+}
+
+test "gtk generated version gates configure states and authenticated titlebar actions" {
+    const protocol = @import("core_protocol");
+    const Surface = protocol.gtk_surface1;
+    const CoreSurface = @import("core_surface.zig").Adapter(protocol);
+    const A = Adapter(protocol, CoreSurface);
+    const peer: wayring.io_uring.Peer = .{ .slot = 0, .generation = 1 };
+    const sid: CoreSurface.SurfaceId = .{ .index = 2, .generation = 3 };
+    const Policy = struct {
+        calls: usize = 0,
+        fn validate(_: *anyopaque, p: wayring.io_uring.Peer, seat: u32, serial: u32, surface: CoreSurface.SurfaceId) bool {
+            return samePeer(p, peer) and seat == 3 and serial == 42 and std.meta.eql(surface, sid);
+        }
+        fn toggle(context: *anyopaque, surface: CoreSurface.SurfaceId) !void {
+            try std.testing.expectEqual(sid, surface);
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+        }
+    };
+    for (1..8) |version| {
+        var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 4096, 8);
+        defer blocks.deinit(std.testing.allocator);
+        var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+        defer descriptors.deinit(std.testing.allocator);
+        var requests = wayring.tx.Queue.init(&blocks, 4096, &descriptors, 0);
+        defer requests.deinit();
+        var fragment: [128]u8 = undefined;
+        var actor = wayring.connection.Actor.init(0, 1, &fragment, &descriptors, 0, &blocks, 4096, 0);
+        defer actor.deinit();
+        var fds = wayring.ancillary.FdQueue.init(&descriptors, 0);
+        defer fds.deinit();
+        var server = try objects.ServerObjects.init(std.testing.allocator, 8, 2, &protocol.wl_display.info, null);
+        defer server.deinit(std.testing.allocator);
+        var core: CoreSurface = undefined;
+        var a = try A.init(std.testing.allocator, &core, .{});
+        defer a.deinit();
+        var policy: Policy = .{};
+        a.setGestureValidator(.{ .context = &policy, .validateFn = Policy.validate });
+        a.titlebar_policy = .{ .context = &policy, .toggleMaximizedFn = Policy.toggle };
+        const s = try a.acquire(.surface, undefined, peer, @intCast(version), sid);
+        s.handle = try server.insertClient(2, &Surface.info, @intCast(version), s);
+        _ = try server.insertClient(3, &protocol.wl_seat.info, 1, null);
+        // Exact GTK wire opcodes, including additions at v3/v4/v5/v7.
+        for ([_]struct { opcode: u16, since: u32 }{
+            .{ .opcode = 4, .since = 3 }, .{ .opcode = 5, .since = 4 },
+            .{ .opcode = 6, .since = 5 }, .{ .opcode = 7, .since = 7 },
+        }) |gate| {
+            const accepted = if (server.namespace.request(2, gate.opcode)) |_| true else |_| false;
+            try std.testing.expectEqual(version >= gate.since, accepted);
+        }
+        a.queueConfigure(sid, .{ .tiled_left = true, .tiled_right = false, .tiled_top = true, .tiled_bottom = false });
+        try std.testing.expectEqual(@as(usize, 1), try a.flushOn(peer, &server, &actor.transmit));
+        var fd_scratch: [1]std.os.linux.fd_t = undefined;
+        var control: [64]u8 align(@alignOf(std.os.linux.cmsghdr)) = undefined;
+        const snapshot = try actor.transmit.snapshot(&fd_scratch, &control);
+        const configure = (try wayring.wire.Message.decode(snapshot.first)).?;
+        const states = (try Surface.decodeEvent(configure, &fds)).configure.states;
+        try std.testing.expectEqual(@as(usize, if (version == 1) 4 else 12), states.len);
+        try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, states[0..4], .little));
+        if (version >= 2) {
+            try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, states[4..8], .little));
+            try std.testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, states[8..12], .little));
+            const edges = (try wayring.wire.Message.decode(snapshot.first[configure.header.size..])).?;
+            try std.testing.expectEqual(@as(usize, 0), (try Surface.decodeEvent(edges, &fds)).configure_edges.constraints.len);
+        } else try std.testing.expectEqual(configure.header.size, snapshot.byteCount());
+        try actor.transmit.begin(snapshot);
+        try actor.transmit.complete(snapshot.byteCount());
+        if (version < 5) continue;
+        for ([_]Surface.Request{
+            .{ .present = .{ .time = 42 } },
+            .{ .request_focus = .{ .startup_id = "untrusted_TIME42" } },
+            .{ .titlebar_gesture = .{ .seat = 3, .serial = 41, .gesture = .double_click } },
+            .{ .titlebar_gesture = .{ .seat = 3, .serial = 42, .gesture = .right_click } },
+            .{ .titlebar_gesture = .{ .seat = 3, .serial = 42, .gesture = .middle_click } },
+            .{ .titlebar_gesture = .{ .seat = 3, .serial = 42, .gesture = .double_click } },
+        }, 0..) |request_value, i| {
+            try Surface.encodeRequest(&requests, 2, request_value);
+            const wire = try requests.snapshot(&fd_scratch, &control);
+            const message = (try wayring.wire.Message.decode(wire.first)).?;
+            const target = try server.namespace.request(2, message.header.opcode);
+            try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, (try a.requestOn(&actor, &server, peer, target, message, &fds)).?);
+            try std.testing.expectEqual(@as(usize, if (i == 5) 1 else 0), policy.calls);
+            try requests.begin(wire);
+            try requests.complete(wire.byteCount());
+        }
+    }
 }

@@ -4829,6 +4829,124 @@ const LeaseClientHandler = struct {
 
 pub const SessionCommand = enum { enable, disable };
 
+/// A deterministic renderer boundary, not a Vulkan driver or shader test.
+/// The coordinator must negotiate, import, schedule and release real client
+/// FDs; only GPU execution/readback is substituted with asymmetric pixels.
+pub const CaptureRenderer = struct {
+    const vk = ouro.vulkan_platform;
+    fd: linux.fd_t = -1,
+    metadata: ouro.gbm.Metadata = undefined,
+    imports: usize = 0,
+    destroys: usize = 0,
+    writes: usize = 0,
+    precise_reads: usize = 0,
+    reject_import: bool = false,
+    captures: vk.Captures = .{},
+    pub const rgba16 = [_]u16{
+        0x1234, 0x5678, 0x9abc, 0xffff, 0x2345, 0x6789, 0xabcd, 0xffff,
+        0x3456, 0x789a, 0xbcde, 0xffff, 0x4567, 0x89ab, 0xcdef, 0xffff,
+        0x5678, 0x9abc, 0xdf00, 0xffff, 0x6789, 0xabcd, 0xf011, 0xffff,
+    };
+
+    pub fn platform(self: *@This()) vk.Platform {
+        return .{ .context = self, .vtable = &.{
+            .create = create,
+            .destroy = destroy,
+            .supports_target = supportsTarget,
+            .import_target = importTarget,
+            .destroy_target = destroyTarget,
+            .supports_capture_target = supportsCapture,
+            .import_capture_target = importCapture,
+            .prepare_capture_target = prepareCapture,
+            .destroy_capture_target = destroyCapture,
+            .draw = draw,
+            .readback = readback,
+            .content_provider = contentProvider,
+            .validate_external = validateExternal,
+            .sampled_dmabuf_formats = formats,
+            .packs_sources = packsSources,
+            .cache_lut = cacheLut,
+            .supports_precise_capture = precise,
+        } };
+    }
+    fn create(context: *anyopaque, _: linux.fd_t, _: vk.Config) !vk.Renderer {
+        return context;
+    }
+    fn destroy(_: *anyopaque, _: vk.Renderer) void {}
+    fn supportsTarget(_: *anyopaque, _: vk.Renderer, _: ouro.gbm.Allocation) bool {
+        return true;
+    }
+    fn importTarget(context: *anyopaque, _: vk.Renderer, _: ouro.gbm.Metadata, fd: linux.fd_t) !vk.Target {
+        _ = linux.close(fd);
+        return context;
+    }
+    fn destroyTarget(_: *anyopaque, _: vk.Renderer, _: vk.Target) void {}
+    fn supportsCapture(_: *anyopaque, _: vk.Renderer, metadata: ouro.gbm.Metadata) bool {
+        return metadata.modifier == ouro.gbm.modifier_linear and metadata.width == 3 and metadata.height == 2;
+    }
+    fn importCapture(context: *anyopaque, _: vk.Renderer, metadata: ouro.gbm.Metadata, fd: linux.fd_t) !vk.CaptureTarget {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.imports += 1;
+        if (self.reject_import) {
+            _ = linux.close(fd);
+            return error.CaptureImportRejected;
+        }
+        try std.testing.expectEqual(@as(linux.fd_t, -1), self.fd);
+        self.fd = fd;
+        self.metadata = metadata;
+        return context;
+    }
+    fn prepareCapture(_: *anyopaque, _: vk.Renderer, _: vk.CaptureTarget, _: linux.fd_t) !void {}
+    fn destroyCapture(context: *anyopaque, _: vk.Renderer, _: vk.CaptureTarget) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        _ = linux.close(self.fd);
+        self.fd = -1;
+        self.destroys += 1;
+    }
+    fn draw(context: *anyopaque, _: vk.Renderer, _: vk.Target, frame: vk.Frame) !linux.fd_t {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.captures = frame.captures;
+        if (frame.capture_destination) |destination| {
+            try std.testing.expectEqual(ouro.render.Rect{ .x = 0, .y = 0, .width = 3, .height = 2 }, destination.source);
+            for (0..2) |y| {
+                const offset = self.metadata.offsets[0] + y * self.metadata.strides[0];
+                try std.testing.expectEqual(@as(usize, 12), linux.pwrite(self.fd, pixels[y * 16 ..].ptr, 12, @intCast(offset)));
+            }
+            self.writes += 1;
+        }
+        const fence = try eventFd();
+        try signalFd(fence);
+        return fence;
+    }
+    fn readback(context: *anyopaque, _: vk.Renderer, _: vk.Target, phase: vk.CapturePhase) !vk.Readback {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        try std.testing.expect(switch (phase) {
+            .before_cursor => self.captures.before_cursor,
+            .after_cursor => self.captures.after_cursor,
+        });
+        if (self.captures.high_precision) self.precise_reads += 1;
+        // Tight 8-bit stride also defines the tight 16-bit row pitch.
+        return .{ .bytes = &.{ 4, 3, 2, 255, 20, 19, 18, 255, 36, 35, 34, 255, 52, 51, 50, 255, 68, 67, 66, 255, 84, 83, 82, 255 }, .stride = 12, .rgba16 = std.mem.sliceAsBytes(&rgba16) };
+    }
+    fn contentProvider(_: *anyopaque, _: vk.Renderer) ?ouro.render_content.Provider {
+        return null;
+    }
+    fn validateExternal(_: *anyopaque, _: vk.Renderer, _: ouro.render.ExternalSource, _: ouro.render.Size, _: ouro.render.PixelFormat) !void {}
+    fn formats(_: *anyopaque, _: vk.Renderer, output: []ouro.gbm.FormatModifier) !usize {
+        output[0] = .{ .fourcc = ouro.gbm.format_xrgb8888, .modifier = ouro.gbm.modifier_linear };
+        return 1;
+    }
+    fn packsSources(_: *anyopaque, _: vk.Renderer) bool {
+        return true;
+    }
+    fn cacheLut(_: *anyopaque, _: vk.Renderer, _: *const ouro.icc.Lut) !u32 {
+        return 0;
+    }
+    fn precise(_: *anyopaque, _: vk.Renderer, _: ouro.render.Size) bool {
+        return true;
+    }
+};
+
 pub const Fixture = struct {
     const AtomicRequest = struct { crtc: u32 = 0 };
     const PendingFlip = struct { userdata: ?*anyopaque = null, crtc: u32 = 0 };
@@ -4870,6 +4988,7 @@ pub const Fixture = struct {
     vrr_supported: bool = false,
     read_maps: usize = 0,
     unmaps: usize = 0,
+    capture_vulkan: bool = false,
     discover_cards: bool = true,
     first_desktop: bool = true,
     first_mode_width: u16 = 3,
@@ -5089,10 +5208,12 @@ pub const Fixture = struct {
         const self: *Fixture = @ptrCast(@alignCast(context));
         if (!self.discover_cards) return 0;
         var card: ouro.drm_platform.Card = .{};
-        const path = "/dev/dri/card-test";
+        // Capture negotiation stats the device path; /dev/null supplies a
+        // deterministic device number without pretending there is a DRM GPU.
+        const path = if (self.capture_vulkan) "/dev/null" else "/dev/dri/card-test";
         const stable = "/devices/test";
         @memcpy(card.path[0..path.len], path);
-        card.path_len = path.len;
+        card.path_len = @intCast(path.len);
         @memcpy(card.syspath[0..stable.len], stable);
         card.syspath_len = stable.len;
         card.boot_vga = true;
@@ -5109,6 +5230,7 @@ pub const Fixture = struct {
         out.encoders[0] = .{ .id = 20, .crtc_id = 30, .possible_crtcs = 1 };
         out.crtcs[0] = .{ .id = 30, .index = 0, .properties = .{ .active = 2, .mode_id = 3, .vrr_enabled = if (self.vrr_supported) 15 else 0 } };
         out.planes[0] = .{ .id = 40, .possible_crtcs = 1, .plane_type_value = 1, .format_start = 0, .format_count = 1, .properties = .{ .plane_type = 4, .fb_id = 5, .crtc_id = 6, .src_x = 7, .src_y = 8, .src_w = 9, .src_h = 10, .crtc_x = 11, .crtc_y = 12, .crtc_w = 13, .crtc_h = 14 } };
+        if (self.capture_vulkan) out.planes[0].properties.in_fence_fd = 17;
         out.formats[0] = .{ .fourcc = ouro.gbm.format_xrgb8888, .modifier = ouro.gbm.modifier_linear };
         out.connectors[1] = .{ .id = 11, .connector_type = 1, .connector_type_id = 2, .connected = true, .desktop = self.second_desktop, .width_mm = 2, .height_mm = 2, .encoder_id = 21, .mode_start = 1, .mode_count = 1, .encoder_start = 1, .encoder_count = 1, .properties = .{ .crtc_id = 1, .vrr_capable = self.vrr_supported } };
         out.modes[1] = out.modes[0];
@@ -5208,8 +5330,10 @@ pub const Fixture = struct {
     fn metadata(_: *anyopaque, bo: ouro.gbm.Bo) !ouro.gbm.Metadata {
         return .{ .width = 3, .height = 2, .format = ouro.gbm.format_xrgb8888, .modifier = ouro.gbm.modifier_linear, .plane_count = 1, .handles = .{ @truncate(@intFromPtr(bo)), 0, 0, 0 }, .strides = .{ 16, 0, 0, 0 } };
     }
-    fn exportPlane(_: *anyopaque, _: ouro.gbm.Bo, _: u8) !linux.fd_t {
-        return error.UnexpectedExport;
+    fn exportPlane(context: *anyopaque, _: ouro.gbm.Bo, _: u8) !linux.fd_t {
+        const self: *Fixture = @ptrCast(@alignCast(context));
+        if (!self.capture_vulkan) return error.UnexpectedExport;
+        return ordinaryMemfd(32, 0, &pixels);
     }
     fn mapBo(context: *anyopaque, bo: ouro.gbm.Bo, access: ouro.gbm.MapAccess) !ouro.gbm.Mapping {
         const self: *Fixture = @ptrCast(@alignCast(context));
