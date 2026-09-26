@@ -360,10 +360,19 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
         /// Publishes only the relationship state double-buffered on this
         /// surface. Content payload ordering is owned by content_update.zig;
         /// protocol integrations using that scheduler must not cache a second
-        /// copy of each surface commit in this graph.
-        pub fn commitStructure(graph: *Self, surface: Key) void {
-            const index = graph.find(surface) orelse return;
+        /// copy of each surface commit in this graph. Reports scene changes
+        /// independently of whether the parent commits any new pixels.
+        pub fn commitStructure(graph: *Self, surface: Key) bool {
+            const index = graph.find(surface) orelse return false;
+            var changed = graph.surfaces[index].stack_changed;
+            var child = graph.surfaces[index].first_child;
+            while (child != none) : (child = graph.surfaces[child].next_sibling) {
+                const node = graph.surfaces[child];
+                changed = changed or !node.visible or (node.position_changed and
+                    !std.meta.eql(node.current_position, node.pending_position));
+            }
             graph.latchParentState(index);
+            return changed;
         }
 
         /// Commits one content update. Effectively synchronized updates are
@@ -1056,7 +1065,7 @@ test "relationship storage grows while preserving live tokens and scene order" {
     try std.testing.expectEqual(@as(usize, 34), graph.activeSurfaceCount());
     try std.testing.expectEqual(first_token, graph.token(first).?);
     try graph.setPosition(first, 7, -9);
-    graph.commitStructure(root);
+    try std.testing.expect(graph.commitStructure(root));
     try std.testing.expectEqual(TestGraph.Position{ .x = 7, .y = -9 }, try graph.position(first));
 
     var scene: [34]objects.Handle = undefined;
@@ -1065,6 +1074,27 @@ test "relationship storage grows while preserving live tokens and scene order" {
     try std.testing.expectEqual(root, order[0]);
     try std.testing.expectEqual(first, order[1]);
     try std.testing.expectEqual(handle(34), order[33]);
+}
+
+test "structure-only commits report visibility motion and stacking but not unchanged positions" {
+    var graph = try TestGraph.init(std.testing.allocator, 3, 1);
+    defer graph.deinit(std.testing.allocator);
+    const root = handle(1);
+    const child = handle(2);
+    try graph.add(child, root);
+    try std.testing.expect(graph.commitStructure(root));
+    try std.testing.expect(!graph.commitStructure(root));
+    try graph.setPosition(child, -7, 13);
+    // A child's commit cannot publish its parent-owned position.
+    try std.testing.expect(!graph.commitStructure(child));
+    try std.testing.expectEqual(TestGraph.Position{}, try graph.position(child));
+    try std.testing.expect(graph.commitStructure(root));
+    try std.testing.expectEqual(TestGraph.Position{ .x = -7, .y = 13 }, try graph.position(child));
+    try graph.setPosition(child, -7, 13);
+    try std.testing.expect(!graph.commitStructure(root));
+    try graph.placeBelow(child, root);
+    try std.testing.expect(graph.commitStructure(root));
+    try std.testing.expect(!graph.commitStructure(root));
 }
 
 test "destroying a role preserves children and releases cached state" {

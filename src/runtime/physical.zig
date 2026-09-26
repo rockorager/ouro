@@ -3406,6 +3406,11 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.shellMaintenancePending()) try self.advanceShell();
             _ = try self.retryRetainedOutcomes();
             if (self.pending_surface_len != 0) try self.applyReady();
+            // Child placement/stacking is parent-committed state, even when
+            // the parent's retained-buffer commit needs no repaint itself.
+            // Refresh and track damage before rendering, not only when a
+            // later unrelated frame happens to sample the subsurface tree.
+            if (self.subcompositor_adapter.takeSceneChanged()) try self.desktopSceneChanged();
             self.applyInteractionCommands() catch |err| switch (err) {
                 error.Exhausted => {},
                 else => return err,
@@ -9135,6 +9140,8 @@ pub fn Coordinator(comptime protocol: type) type {
             const output_bounds = self.globalOutputBounds() catch return false;
             var visibility_changed = false;
             for (self.app_layers[0..self.app_layer_count]) |*layer| if (layer.active) {
+                // Cursor and drag-icon trees have their own placement path.
+                if (layer.floating) continue;
                 const id = layer.id orelse unreachable;
                 if (self.layer_shell_adapter.stateForSurface(id)) |state| {
                     if (self.physicalOutputForProtocolId(state.output)) |physical|

@@ -48,6 +48,7 @@ pub fn Adapter(comptime protocol: type, comptime Core: type) type {
         free_head: u32 = 0,
         graph: Graph,
         surface_scratch: []Core.SurfaceId,
+        scene_changed: bool = false,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -253,7 +254,13 @@ pub fn Adapter(comptime protocol: type, comptime Core: type) type {
 
         fn contentCommitted(context: *anyopaque, surface: Core.SurfaceId) void {
             const self: *Self = @ptrCast(@alignCast(context));
-            self.graph.commitStructure(surface);
+            self.scene_changed = self.graph.commitStructure(surface) or self.scene_changed;
+        }
+
+        pub fn takeSceneChanged(self: *Self) bool {
+            const changed = self.scene_changed;
+            self.scene_changed = false;
+            return changed;
         }
 
         pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {

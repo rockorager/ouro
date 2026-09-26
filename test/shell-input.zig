@@ -7038,6 +7038,78 @@ test "shell-input: synchronized subsurface publishes with parent and receives po
     try std.testing.expectEqual(handler.surfaces[0].?.id, handler.key_surface.?);
     try std.testing.expectEqual(keyboard_leaves, handler.keyboard_leaves);
 
+    // Chromium's toast/status bubble is desynchronized. Moving it commits
+    // only the parent, without attaching a buffer or damaging either surface.
+    // Fix the parent's window geometry so child movement cannot resize it.
+    try protocol.wl_subsurface.encodeRequest(&actor.transmit, handler.subsurfaces[1].?.id, .{ .set_desync = .{} });
+    try protocol.xdg_surface.encodeRequest(&actor.transmit, handler.xdg_surfaces[0].?.id, .{
+        .set_window_geometry = .{ .x = 0, .y = 0, .width = 3, .height = 2 },
+    });
+    try protocol.wl_surface.encodeRequest(&actor.transmit, handler.surfaces[0].?.id, .{ .commit = .{} });
+    var applied_before = coordinator.stats.applied;
+    try submitMultiClient(&client_reactor, &driver, &handler);
+    for (0..256) |_| {
+        _ = try drainMultiClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.stats.applied > applied_before and coordinator.pending_surface_len == 0 and
+            fixture.flip_len == 0 and coordinator.primaryKmsOutput().?.in_flight_frame == null and
+            !coordinator.desktop.transactionPending()) break;
+        const delay: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = linux.nanosleep(&delay, null);
+    }
+    const positions = [_]ouro.scene_geometry.Point{
+        .{ .x = 0, .y = 1 },
+        .{ .x = 2, .y = 0 },
+        .{ .x = 6, .y = 1 },
+        .{ .x = 1, .y = 0 },
+    };
+    for (positions, 0..) |position, step| {
+        const presented_before = coordinator.stats.presented;
+        applied_before = coordinator.stats.applied;
+        try protocol.wl_subsurface.encodeRequest(&actor.transmit, handler.subsurfaces[1].?.id, .{
+            .set_position = .{ .x = position.x, .y = position.y },
+        });
+        try protocol.wl_surface.encodeRequest(&actor.transmit, handler.surfaces[0].?.id, .{ .commit = .{} });
+        try submitMultiClient(&client_reactor, &driver, &handler);
+        for (0..256) |_| {
+            _ = try drainMultiClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (coordinator.stats.presented > presented_before) break;
+            const delay: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = linux.nanosleep(&delay, null);
+        }
+        const output = coordinator.primaryKmsOutput().?;
+        const image = output.pool.slots[output.kms_output.current.?.slot].dumb.?.bytes;
+        if (std.c.getenv("OURO_SUBSURFACE_CAPTURE")) |prefix| {
+            var filename: [512]u8 = undefined;
+            const capture = try std.fmt.bufPrint(&filename, "{s}-{d}.ppm", .{ std.mem.span(prefix), step });
+            const header = "P6\n3 2\n255\n";
+            var ppm: [header.len + 3 * 2 * 3]u8 = undefined;
+            @memcpy(ppm[0..header.len], header);
+            for (0..2) |y| for (0..3) |x| {
+                const pixel = y * 3 + x;
+                ppm[header.len + pixel * 3] = image[y * 16 + x * 4 + 2];
+                ppm[header.len + pixel * 3 + 1] = image[y * 16 + x * 4 + 1];
+                ppm[header.len + pixel * 3 + 2] = image[y * 16 + x * 4];
+            };
+            try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = capture, .data = &ppm });
+        }
+        try std.testing.expectEqual(applied_before + 1, coordinator.stats.applied);
+        try std.testing.expectEqual(presented_before + 1, coordinator.stats.presented);
+        // Check both the new content and the erased old location, including
+        // a completely offscreen move and scanout-image reuse on return.
+        for (0..2) |y| for (0..3) |x| {
+            const child_x = @as(i32, @intCast(x)) - position.x;
+            const child_y = @as(i32, @intCast(y)) - position.y;
+            const source_offset = if (child_x >= 0 and child_x < 3 and child_y >= 0 and child_y < 2)
+                @as(usize, @intCast(child_y)) * 16 + @as(usize, @intCast(child_x)) * 4
+            else
+                y * 16 + x * 4;
+            try std.testing.expectEqualSlices(u8, pixels[source_offset..][0..4], image[y * 16 + x * 4 ..][0..4]);
+        };
+    }
+    const presented_before_destroy = coordinator.stats.presented;
+
     try wayring.client.sendRequest(
         protocol.wl_subsurface,
         &client.objects,
@@ -7050,12 +7122,12 @@ test "shell-input: synchronized subsurface publishes with parent and receives po
     for (0..256) |_| {
         client_progress = try drainMultiClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (coordinator.stats.presented == 2) break;
+        if (coordinator.stats.presented == presented_before_destroy + 1) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
-    try std.testing.expectEqual(@as(usize, 2), coordinator.stats.submitted);
-    try std.testing.expectEqual(@as(usize, 2), coordinator.stats.presented);
+    try std.testing.expectEqual(presented_before_destroy + 1, coordinator.stats.submitted);
+    try std.testing.expectEqual(presented_before_destroy + 1, coordinator.stats.presented);
     try std.testing.expectEqual(@as(usize, 0), coordinator.removed_layer_len);
     try std.testing.expect(coordinator.seat_adapter.pointerState().focus == null);
     const root_id = try coordinator.adapter.surfaceId(handler.surfaces[0].?);
