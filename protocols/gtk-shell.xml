@@ -22,7 +22,7 @@
     DEALINGS IN THE SOFTWARE.
   </copyright>
 
-  <interface name="gtk_shell1" version="5">
+  <interface name="gtk_shell1" version="7">
     <enum name="capability">
       <entry name="global_app_menu" value="1"/>
       <entry name="global_menu_bar" value="2"/>
@@ -49,9 +49,11 @@
     <request name="notify_launch" since="3">
       <arg name="startup_id" type="string"/>
     </request>
+
+    <!-- Version 6 adds no API, but asserts that surface offsets are implemented. -->
   </interface>
 
-  <interface name="gtk_surface1" version="5">
+  <interface name="gtk_surface1" version="7">
     <request name="set_dbus_properties">
       <arg name="application_id" type="string" allow-null="true"/>
       <arg name="app_menu_path" type="string" allow-null="true"/>
@@ -111,6 +113,13 @@
       <arg name="serial" type="uint"/>
       <arg name="seat" type="object" interface="wl_seat"/>
       <arg name="gesture" type="uint" enum="gesture"/>
+    </request>
+
+    <!-- Wire API matches GNOME/gtk gdk/wayland/protocol/gtk-shell.xml
+         at 91ecb49fb9bffb46e13125b15293c3bd2cd747bd. -->
+    <request name="set_a11y_properties" since="7">
+      <arg name="a11y_dbus_name" type="string"/>
+      <arg name="toplevel_object_path" type="string"/>
     </request>
   </interface>
 </protocol>

@@ -239,7 +239,6 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             const output: *OutputState = @ptrCast(@alignCast(context orelse return error.InvalidContext));
-            if (output.retired) return error.InvalidOutput;
             const adapter = output.adapter orelse return error.InvalidContext;
             const output_id = adapter.outputIdFor(adapter.outputIndexFor(output));
             const index = adapter.acquireResource() catch return error.OutOfMemory;
@@ -248,6 +247,9 @@ pub fn Adapter(comptime protocol: type) type {
             resource.peer = binding.peer;
             resource.handle = binding.resource;
             resource.version = binding.version;
+            // The registry removal can cross a bind in flight. Retired states
+            // stay allocated; admit an inert resource with a normal release.
+            if (output.retired) return resource;
             adapter.queueSnapshot(adapter.idFor(index)) catch {
                 adapter.releaseResource(index);
                 return error.OutOfMemory;
@@ -315,6 +317,7 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn publishOutput(adapter: *Self, id: OutputId) !void {
             const output = try adapter.resolveOutput(id);
+            if (output.retired) return error.OutputRetired;
             if (output.global != null) return error.OutputPublished;
             const runtime = adapter.runtime orelse return error.NotInstalled;
             output.adapter = adapter;

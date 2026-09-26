@@ -6,6 +6,7 @@ const std = @import("std");
 const api = @import("platform.zig");
 const seat_platform = @import("../platform.zig");
 const session_api = @import("../session.zig");
+const diagnostics = @import("../../diagnostics.zig");
 
 pub const Card = api.Card;
 pub const Connector = api.Connector;
@@ -656,6 +657,7 @@ pub const Manager = struct {
                     probe,
                     probed,
                 )) {
+                    logCandidateChanges(current, candidate, probe, probed);
                     if (desktop_updated_count == updated_output.len)
                         return error.OutputTooSmall;
                     updated_output[desktop_updated_count] = connector_id;
@@ -1119,8 +1121,8 @@ fn candidateConfigurationEqual(
     right: *const Storage,
     right_candidate: ScanoutCandidate,
 ) bool {
-    const left_connector = left.buffer.connectors[left_candidate.connector_index];
-    const right_connector = right.buffer.connectors[right_candidate.connector_index];
+    const left_connector = connectorCapabilities(left.buffer.connectors[left_candidate.connector_index]);
+    const right_connector = connectorCapabilities(right.buffer.connectors[right_candidate.connector_index]);
     if (left_connector.id != right_connector.id or
         left_connector.connector_type != right_connector.connector_type or
         left_connector.connector_type_id != right_connector.connector_type_id or
@@ -1148,8 +1150,8 @@ fn candidateConfigurationEqual(
         right.buffer.connector_encoders[right_connector.encoder_start..right_encoder_end],
     )) return false;
 
-    const left_crtc = left.buffer.crtcs[left_candidate.crtc_index];
-    const right_crtc = right.buffer.crtcs[right_candidate.crtc_index];
+    const left_crtc = crtcCapabilities(left.buffer.crtcs[left_candidate.crtc_index]);
+    const right_crtc = crtcCapabilities(right.buffer.crtcs[right_candidate.crtc_index]);
     if (!std.meta.eql(left_crtc, right_crtc)) return false;
     const left_plane = left.buffer.planes[left_candidate.plane_index];
     const right_plane = right.buffer.planes[right_candidate.plane_index];
@@ -1168,10 +1170,76 @@ fn candidateConfigurationEqual(
     );
 }
 
+// Hotplug compares capabilities, not color state programmed since discovery.
+// Normalize copies only: snapshots retain inherited values for restoration.
+fn connectorCapabilities(connector: Connector) Connector {
+    var result = connector;
+    result.properties.colorspace.inherited = 0;
+    result.properties.hdr_output_metadata.inherited = 0;
+    result.properties.max_bpc.inherited = 0;
+    return result;
+}
+
+fn crtcCapabilities(crtc: Crtc) Crtc {
+    var result = crtc;
+    result.properties.degamma_lut.inherited = 0;
+    result.properties.ctm.inherited = 0;
+    result.properties.gamma_lut.inherited = 0;
+    return result;
+}
+
 fn recordsEqual(comptime T: type, left: []const T, right: []const T) bool {
     if (left.len != right.len) return false;
     for (left, right) |a, b| if (!std.meta.eql(a, b)) return false;
     return true;
+}
+
+fn logCandidateChanges(
+    left: *const Storage,
+    old: ScanoutCandidate,
+    right: *const Storage,
+    new: ScanoutCandidate,
+) void {
+    const a = connectorCapabilities(left.buffer.connectors[old.connector_index]);
+    const b = connectorCapabilities(right.buffer.connectors[new.connector_index]);
+    diagnostics.logDisplay("candidate-changed connector={d} crtc={d}->{d} plane={d}->{d}", .{
+        a.id,
+        left.buffer.crtcs[old.crtc_index].id,
+        right.buffer.crtcs[new.crtc_index].id,
+        left.buffer.planes[old.plane_index].id,
+        right.buffer.planes[new.plane_index].id,
+    });
+    // Match the fields compared above, excluding inventory offsets and mutable
+    // plane attachment state that do not participate in classification.
+    inline for (.{ "id", "connector_type", "connector_type_id", "width_mm", "height_mm", "encoder_id", "mode_count", "encoder_count", "properties" }) |field|
+        logConfigurationDifference(a.id, "connector." ++ field, @field(a, field), @field(b, field));
+    logConfigurationDifference(a.id, "crtc", crtcCapabilities(left.buffer.crtcs[old.crtc_index]), crtcCapabilities(right.buffer.crtcs[new.crtc_index]));
+    const old_plane = left.buffer.planes[old.plane_index];
+    const new_plane = right.buffer.planes[new.plane_index];
+    inline for (.{ "id", "possible_crtcs", "plane_type_value", "has_in_formats", "format_count", "properties" }) |field|
+        logConfigurationDifference(a.id, "plane." ++ field, @field(old_plane, field), @field(new_plane, field));
+    const old_modes = left.buffer.modes[a.mode_start..][0..a.mode_count];
+    const new_modes = right.buffer.modes[b.mode_start..][0..b.mode_count];
+    if (!recordsEqual(Mode, old_modes, new_modes))
+        diagnostics.logDisplay("candidate-diff connector={d} field=modes old={any} new={any}", .{ a.id, old_modes, new_modes });
+    const old_encoders = left.buffer.connector_encoders[a.encoder_start..][0..a.encoder_count];
+    const new_encoders = right.buffer.connector_encoders[b.encoder_start..][0..b.encoder_count];
+    if (!std.mem.eql(u32, old_encoders, new_encoders))
+        diagnostics.logDisplay("candidate-diff connector={d} field=encoders old={any} new={any}", .{ a.id, old_encoders, new_encoders });
+    const old_formats = left.buffer.formats[old_plane.format_start..][0..old_plane.format_count];
+    const new_formats = right.buffer.formats[new_plane.format_start..][0..new_plane.format_count];
+    if (!recordsEqual(api.Format, old_formats, new_formats))
+        diagnostics.logDisplay("candidate-diff connector={d} field=formats old={any} new={any}", .{ a.id, old_formats, new_formats });
+}
+
+fn logConfigurationDifference(connector: u32, comptime field: []const u8, old: anytype, new: @TypeOf(old)) void {
+    if (std.meta.eql(old, new)) return;
+    if (@typeInfo(@TypeOf(old)) == .@"struct") {
+        inline for (std.meta.fields(@TypeOf(old))) |member|
+            logConfigurationDifference(connector, field ++ "." ++ member.name, @field(old, member.name), @field(new, member.name));
+    } else {
+        diagnostics.logDisplay("candidate-diff connector={d} field={s} old={any} new={any}", .{ connector, field, old, new });
+    }
 }
 
 fn candidateTuplePresent(
@@ -2084,6 +2152,68 @@ test "drm: plane capability changes invalidate candidate configuration" {
         &right_storage,
         candidate,
     ));
+}
+
+test "drm: color programming preserves candidate capabilities without hiding capability changes" {
+    var left: TestTopology = undefined;
+    left.init();
+    var right: TestTopology = undefined;
+    right.init();
+    left.connectors[0].properties.colorspace = .{ .id = 21, .inherited = 3, .default = 3, .bt2020_rgb = 9 };
+    left.connectors[0].properties.hdr_output_metadata = .{ .id = 22, .inherited = 88 };
+    left.connectors[0].properties.max_bpc = .{ .id = 23, .inherited = 12, .minimum = 8, .maximum = 12 };
+    left.crtcs[0].properties.degamma_lut = .{ .id = 24, .inherited = 431 };
+    left.crtcs[0].properties.ctm = .{ .id = 25, .inherited = 432 };
+    left.crtcs[0].properties.gamma_lut = .{ .id = 26, .inherited = 436 };
+    left.crtcs[0].properties.degamma_lut_size = 256;
+    left.crtcs[0].properties.gamma_lut_size = 1024;
+    right.connectors[0] = left.connectors[0];
+    right.crtcs[0] = left.crtcs[0];
+    const candidate = ScanoutCandidate{ .connector_index = 0, .mode_index = 0, .crtc_index = 0, .plane_index = 0 };
+    const a = Storage{ .buffer = left.buffer, .candidates = &.{}, .lease_candidates = &.{} };
+    const b = Storage{ .buffer = right.buffer, .candidates = &.{}, .lease_candidates = &.{} };
+
+    // Every programmable color value is ignored independently, but its
+    // property identity must still trigger a rebuild if it changes.
+    inline for (.{ "colorspace", "hdr_output_metadata", "max_bpc" }) |field| {
+        right.connectors[0] = left.connectors[0];
+        @field(right.connectors[0].properties, field).inherited += 1;
+        try std.testing.expect(candidateConfigurationEqual(&a, candidate, &b, candidate));
+        @field(right.connectors[0].properties, field).id += 1;
+        try std.testing.expect(!candidateConfigurationEqual(&a, candidate, &b, candidate));
+    }
+    right.connectors[0] = left.connectors[0];
+    inline for (.{ "degamma_lut", "ctm", "gamma_lut" }) |field| {
+        right.crtcs[0] = left.crtcs[0];
+        @field(right.crtcs[0].properties, field).inherited += 1;
+        try std.testing.expect(candidateConfigurationEqual(&a, candidate, &b, candidate));
+        @field(right.crtcs[0].properties, field).id += 1;
+        try std.testing.expect(!candidateConfigurationEqual(&a, candidate, &b, candidate));
+    }
+    right.crtcs[0] = left.crtcs[0];
+
+    inline for (.{ "minimum", "maximum" }) |field| {
+        right.connectors[0] = left.connectors[0];
+        @field(right.connectors[0].properties.max_bpc, field) += 1;
+        try std.testing.expect(!candidateConfigurationEqual(&a, candidate, &b, candidate));
+    }
+    inline for (.{ "default", "bt2020_rgb" }) |field| {
+        right.connectors[0] = left.connectors[0];
+        @field(right.connectors[0].properties.colorspace, field) = null;
+        try std.testing.expect(!candidateConfigurationEqual(&a, candidate, &b, candidate));
+    }
+    right.connectors[0] = left.connectors[0];
+    right.connectors[0].properties.hdr_capabilities.pq = true;
+    try std.testing.expect(!candidateConfigurationEqual(&a, candidate, &b, candidate));
+    right.connectors[0] = left.connectors[0];
+    inline for (.{ "degamma_lut_size", "gamma_lut_size" }) |field| {
+        right.crtcs[0] = left.crtcs[0];
+        @field(right.crtcs[0].properties, field) += 1;
+        try std.testing.expect(!candidateConfigurationEqual(&a, candidate, &b, candidate));
+    }
+    // Capability views must not erase the snapshot state used for restoration.
+    try std.testing.expectEqual(@as(u64, 12), left.connectors[0].properties.max_bpc.inherited);
+    try std.testing.expectEqual(@as(u64, 436), left.crtcs[0].properties.gamma_lut.inherited);
 }
 
 test "drm: overlay plane ranking preserves attached and scarce resources" {

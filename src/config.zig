@@ -76,6 +76,7 @@ pub const Binding = struct {
 
 pub const General = struct {
     focus_follows_mouse: bool = false,
+    experimental_hotkeys: bool = true,
     inner_gap: u32 = 12,
     outer_gap: u32 = 12,
     /// Reserve center and side tiling bands; shrink side tiles and floating

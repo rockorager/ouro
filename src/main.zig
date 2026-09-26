@@ -254,7 +254,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .linux_dmabuf = .{},
         .virtual_keyboard_reconciles_focus = options.headless,
-        .enable_color_protocols = options.renderer == .vulkan,
+        .enable_color_protocols = options.renderer != .pixman,
         .color_management = .{
             // Compilation remains single-worker and byte-bounded. Up to 32
             // client and 32 output transforms fit the 64-slot renderer cache.
@@ -305,7 +305,6 @@ pub fn main(init: std.process.Init) !void {
             .max_source_height = 8192,
             // Client descriptions and profile changes share a bounded cache.
             .max_color_luts = 64,
-            .enable_color_management = options.renderer == .vulkan,
         },
     }) catch |err| {
         exit_deadline.arm(fatal_shutdown_grace_ns);

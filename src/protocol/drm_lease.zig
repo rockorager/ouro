@@ -49,7 +49,7 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
             name_len: usize = 0,
             description_len: usize = 0,
         };
-        const Dev = struct { h: Header = .{}, peer: Peer = undefined, resource: Handle = undefined, device: DeviceId = undefined, dirty: bool = false, notify: bool = false };
+        const Dev = struct { h: Header = .{}, peer: Peer = undefined, resource: Handle = undefined, device: DeviceId = undefined, inert: bool = false, dirty: bool = false, notify: bool = false };
         const Offer = struct { h: Header = .{}, peer: Peer = undefined, resource: ?Handle = null, device_owner: Id = undefined, inventory: Id = undefined, withdrawn: bool = false };
         const Req = struct { h: Header = .{}, peer: Peer = undefined, resource: Handle = undefined, device_owner: Id = undefined, invalid: bool = false };
         const Ls = struct { h: Header = .{}, peer: Peer = undefined, resource: ?Handle = null, device_owner: Id = undefined, device: DeviceId = undefined, token: ?Token = null, revocation_pending: bool = false, finished: bool = false, finished_queued: bool = false };
@@ -153,11 +153,16 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
 
         fn bind(ctx: ?*anyopaque, b: wayring.server.Binding) !?*anyopaque {
             const self: *Self = @ptrCast(@alignCast(ctx orelse return error.InvalidContext));
-            if (!self.resolver.allowDrmLease(b)) return error.AccessDenied;
+            const inert = self.global == null or !std.meta.eql(self.global.?, b.global);
+            if (!inert and !self.resolver.allowDrmLease(b)) return error.AccessDenied;
             const d = self.acquire(Dev, self.devices) orelse return error.OutOfMemory;
             errdefer self.retire(d);
             d.peer = b.peer;
             d.resource = b.resource;
+            // Do not resolve/open a backend device for an old global name,
+            // including when this adapter has since installed a replacement.
+            d.inert = inert;
+            if (inert) return d;
             d.device = self.resolver.resolveDrmLeaseDevice(b);
             d.dirty = true;
             try self.ensureOut(1);
@@ -226,6 +231,7 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
                         r.peer = peer;
                         r.resource = admitted.id;
                         r.device_owner = self.idOf(Dev, self.devices, d);
+                        r.invalid = d.inert;
                     },
                     .release => {
                         // sendEvent is atomic: retain the resource when transmit is full.
@@ -639,7 +645,7 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
 
         fn reconcilePeer(self: *Self, peer: Peer) void {
             for (self.leases) |*l| if (l.h.active and l.finished and !l.finished_queued and samePeer(l.peer, peer)) self.queueFinished(l);
-            for (self.devices) |*d| if (d.h.active and d.dirty and samePeer(d.peer, peer)) {
+            for (self.devices) |*d| if (d.h.active and !d.inert and d.dirty and samePeer(d.peer, peer)) {
                 if (self.outbound_len == self.outbound.len) continue;
                 var missing: usize = 0;
                 for (self.inventory) |*x| if (x.h.active and x.present and x.available and std.meta.eql(x.device, d.device) and !self.hasCurrentOffer(self.idOf(Dev, self.devices, d), self.idOf(Inventory, self.inventory, x))) {
@@ -687,7 +693,7 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
             return false;
         }
         fn markDirty(self: *Self, device: DeviceId) void {
-            for (self.devices) |*d| if (d.h.active and std.meta.eql(d.device, device)) {
+            for (self.devices) |*d| if (d.h.active and !d.inert and std.meta.eql(d.device, device)) {
                 d.dirty = true;
             };
         }

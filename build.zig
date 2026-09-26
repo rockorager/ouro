@@ -60,6 +60,7 @@ pub fn build(b: *std.Build) void {
     generate_core_protocol.addFileArg(wlr_protocols.path("unstable/wlr-gamma-control-unstable-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("unstable/relative-pointer/relative-pointer-unstable-v1.xml"));
+    generate_core_protocol.addFileArg(wayland_protocols.path("unstable/input-timestamps/input-timestamps-unstable-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("unstable/pointer-gestures/pointer-gestures-unstable-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("stable/tablet/tablet-v2.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("unstable/idle-inhibit/idle-inhibit-unstable-v1.xml"));
@@ -76,6 +77,7 @@ pub fn build(b: *std.Build) void {
     generate_core_protocol.addFileArg(b.path("protocols/input-method-unstable-v2.xml"));
     generate_core_protocol.addFileArg(b.path("protocols/virtual-keyboard-unstable-v1.xml"));
     generate_core_protocol.addFileArg(b.path("protocols/gtk-shell.xml"));
+    generate_core_protocol.addFileArg(b.path("protocols/xx-hotkey-v1.xml"));
     const generated_core_protocol = generate_core_protocol.addOutputFileArg("wayland-core.zig");
     const core_protocol = b.createModule(.{
         .root_source_file = generated_core_protocol,
@@ -125,6 +127,7 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(wlr_protocols.path("unstable/wlr-gamma-control-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("unstable/relative-pointer/relative-pointer-unstable-v1.xml"));
+    generate_xdg_protocol.addFileArg(wayland_protocols.path("unstable/input-timestamps/input-timestamps-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("unstable/pointer-gestures/pointer-gestures-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("stable/tablet/tablet-v2.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("unstable/idle-inhibit/idle-inhibit-unstable-v1.xml"));
@@ -141,6 +144,7 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(b.path("protocols/input-method-unstable-v2.xml"));
     generate_xdg_protocol.addFileArg(b.path("protocols/virtual-keyboard-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(b.path("protocols/gtk-shell.xml"));
+    generate_xdg_protocol.addFileArg(b.path("protocols/xx-hotkey-v1.xml"));
     const generated_xdg_protocol = generate_xdg_protocol.addOutputFileArg("wayland-xdg-shell.zig");
     const xdg_protocol = b.createModule(.{
         .root_source_file = generated_xdg_protocol,
@@ -655,6 +659,24 @@ pub fn build(b: *std.Build) void {
     });
     capture_test_step.dependOn(&b.addRunArtifact(capture_runtime_tests).step);
 
+    const color_startup_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/color-startup.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wayring", .module = wayring },
+                .{ .name = "ouro", .module = ouro },
+                .{ .name = "core_protocol", .module = xdg_protocol },
+            },
+        }),
+        .filters = &.{"color startup:"},
+    });
+    const run_color_startup_tests = b.addRunArtifact(color_startup_tests);
+    const color_startup_step = b.step("test-color-startup", "Run renderer selection and color registry lifecycle tests");
+    color_startup_step.dependOn(&run_color_startup_tests.step);
+    drm_presentation_test_step.dependOn(&run_color_startup_tests.step);
+
     const shm_tests = b.addTest(.{
         .root_module = ouro,
         .filters = &.{ "high precision", "UNORM16", "capture normalizes", "mixed SHM widths", "single pixel buffers", "modern RGB" },
@@ -719,10 +741,48 @@ pub fn build(b: *std.Build) void {
     );
     shell_input_test_step.dependOn(&run_shell_input_tests.step);
 
+    const hotkey_units = b.addTest(.{ .root_module = ouro, .filters = &.{ "hotkey:", "xdg-activation:" } });
+    const hotkey_clients = b.addTest(.{ .root_module = shell_input_tests.root_module, .filters = &.{"hotkey:"} });
+    const hotkey_step = b.step("test-hotkey", "Run experimental hotkey policy and generated-client activation tests");
+    hotkey_step.dependOn(&b.addRunArtifact(hotkey_units).step);
+    hotkey_step.dependOn(&b.addRunArtifact(hotkey_clients).step);
+
+    const gtk_tests = b.addTest(.{ .root_module = ouro, .filters = &.{"gtk "} });
+    const gtk_runtime_tests = b.addTest(.{
+        .root_module = shell_input_tests.root_module,
+        .filters = &.{ "core compatibility extensions", "gtk ", "pollable backend retains" },
+    });
+    const gtk_test_step = b.step("test-gtk", "Run GTK version, metadata, policy and surface-offset tests");
+    gtk_test_step.dependOn(&b.addRunArtifact(gtk_tests).step);
+    gtk_test_step.dependOn(&b.addRunArtifact(gtk_runtime_tests).step);
+
+    const timestamp_tests = b.addTest(.{ .root_module = ouro, .filters = &.{"input timestamps"} });
+    const timestamp_client_tests = b.addTest(.{ .root_module = shell_input_tests.root_module, .filters = &.{"input timestamps"} });
+    const timestamp_test_step = b.step("test-input-timestamps", "Run high-resolution input timestamp and generated-client tests");
+    timestamp_test_step.dependOn(&b.addRunArtifact(timestamp_tests).step);
+    timestamp_test_step.dependOn(&b.addRunArtifact(timestamp_client_tests).step);
+
+    const global_removal_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/global-removal.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wayring", .module = wayring },
+                .{ .name = "ouro", .module = ouro },
+                .{ .name = "core_protocol", .module = core_protocol },
+            },
+        }),
+    });
+    const run_global_removal_tests = b.addRunArtifact(global_removal_tests);
+    b.step("test-global-removal", "Run retained-global adapter lifetime tests").dependOn(&run_global_removal_tests.step);
+
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_headless_presentation_tests.step);
     test_step.dependOn(&run_drm_presentation_tests.step);
+    test_step.dependOn(&run_color_startup_tests.step);
     test_step.dependOn(&run_shell_input_tests.step);
+    test_step.dependOn(&run_global_removal_tests.step);
 }

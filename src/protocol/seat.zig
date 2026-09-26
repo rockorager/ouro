@@ -11,6 +11,7 @@ const input = @import("../backend/input/backend.zig");
 const input_platform = @import("../backend/input/platform.zig");
 const surface_state = @import("../surface.zig");
 const slot_pool = @import("slot_pool.zig");
+const input_timestamps = @import("input_timestamps.zig");
 
 const linux = std.os.linux;
 const objects = wayring.objects;
@@ -59,7 +60,7 @@ pub const Config = struct {
     keymap: []const u8,
     repeat_rate: i32 = 25,
     repeat_delay: i32 = 600,
-    global_version: u32 = 10,
+    global_version: u32 = 11,
     initial_serial: u32 = 1,
 
     fn validate(config: Config) !void {
@@ -131,6 +132,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
+            inert: bool = false,
             last_implicit_grab_serial: u32 = 0,
             last_user_action_serial: u32 = 0,
             last_user_action_target: ?FocusTarget = null,
@@ -183,22 +185,23 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             seat_name: Id,
             pointer_enter: struct { pointer: Id, serial: u32, target: FocusTarget, point: Point },
             pointer_leave: struct { pointer: Id, serial: u32, target: FocusTarget },
-            pointer_motion: struct { pointer: Id, target: FocusTarget, time: u32, point: Point },
-            pointer_button: struct { pointer: Id, target: ?FocusTarget, serial: u32, time: u32, button: u32, pressed: bool },
+            pointer_motion: struct { pointer: Id, target: FocusTarget, time: u32, time_usec: ?u64 = null, point: Point },
+            pointer_warp: struct { pointer: Id, target: FocusTarget, time: u32, point: Point },
+            pointer_button: struct { pointer: Id, target: ?FocusTarget, serial: u32, time: u32, time_usec: ?u64 = null, button: u32, pressed: bool },
             pointer_axis_source: struct { pointer: Id, target: FocusTarget, source: input_platform.AxisSource },
-            pointer_axis: struct { pointer: Id, target: FocusTarget, time: u32, axis: Axis, value: i32 },
-            pointer_axis_stop: struct { pointer: Id, target: FocusTarget, time: u32, axis: Axis },
+            pointer_axis: struct { pointer: Id, target: FocusTarget, time: u32, time_usec: ?u64 = null, axis: Axis, value: i32 },
+            pointer_axis_stop: struct { pointer: Id, target: FocusTarget, time: u32, time_usec: ?u64 = null, axis: Axis },
             pointer_axis_value120: struct { pointer: Id, target: FocusTarget, axis: Axis, value120: i32 },
             pointer_frame: struct { pointer: Id, target: ?FocusTarget },
             keyboard_keymap: Id,
             keyboard_repeat: Id,
             keyboard_enter: struct { keyboard: Id, serial: u32, target: FocusTarget, pressed_keys: [state_words]u64 },
             keyboard_leave: struct { keyboard: Id, serial: u32, target: FocusTarget },
-            keyboard_key: struct { keyboard: Id, serial: u32, target: FocusTarget, time: u32, key: u32, pressed: bool },
+            keyboard_key: struct { keyboard: Id, serial: u32, target: FocusTarget, time: u32, time_usec: ?u64 = null, key: u32, pressed: bool },
             keyboard_modifiers: struct { keyboard: Id, serial: u32, target: FocusTarget, state: ModifierState },
-            touch_down: struct { touch: Id, serial: u32, time: u32, id: i32, target: FocusTarget, point: Point },
-            touch_up: struct { touch: Id, serial: u32, time: u32, id: i32 },
-            touch_motion: struct { touch: Id, time: u32, id: i32, point: Point },
+            touch_down: struct { touch: Id, serial: u32, time: u32, time_usec: ?u64 = null, id: i32, target: FocusTarget, point: Point },
+            touch_up: struct { touch: Id, serial: u32, time: u32, time_usec: ?u64 = null, id: i32 },
+            touch_motion: struct { touch: Id, time: u32, time_usec: ?u64 = null, id: i32, point: Point },
             touch_frame: struct { touch: Id, client: ClientId },
             touch_cancel: struct { touch: Id, client: ClientId },
         };
@@ -228,8 +231,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         allocator: std.mem.Allocator,
         core: *CoreSurface,
+        timestamps: ?*input_timestamps.Adapter(protocol) = null,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
+        pending_global_removals: usize = 0,
         global_version: u32,
         name: []u8,
         keymap_fd: linux.fd_t,
@@ -370,8 +375,23 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         pub fn removeGlobal(adapter: *Self) !void {
             const runtime = adapter.runtime orelse return error.NotInstalled;
             const global = adapter.global orelse return error.NotInstalled;
-            try runtime.removeGlobal(global);
+            // Register ownership before removal: withdrawal may be synchronous.
+            adapter.pending_global_removals += 1;
+            errdefer adapter.pending_global_removals -= 1;
+            try runtime.removeGlobalWithCallback(global, globalWithdrawn);
             adapter.global = null;
+        }
+
+        fn globalWithdrawn(context: ?*anyopaque, _: objects.Handle) void {
+            const adapter: *Self = @ptrCast(@alignCast(context.?));
+            std.debug.assert(adapter.pending_global_removals != 0);
+            adapter.pending_global_removals -= 1;
+        }
+
+        /// The adapter remains a possible bind target until all registry offers
+        /// for every removed installation have been acknowledged or destroyed.
+        pub fn globalBindingsPending(adapter: *const Self) bool {
+            return adapter.global != null or adapter.pending_global_removals != 0;
         }
 
         pub fn globalName(adapter: *const Self) ?u32 {
@@ -399,6 +419,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 return error.OutOfMemory;
             slot.resource = binding.resource;
             slot.peer = binding.peer;
+            slot.inert = adapter.global == null or !std.meta.eql(adapter.global.?, binding.global);
             const id = adapter.seatId(slot);
             const client = clientId(binding.peer);
             adapter.ensureOutbound(2) catch {
@@ -407,7 +428,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             };
             adapter.enqueue(client, .{ .seat_capabilities = .{
                 .seat = id,
-                .value = adapter.capabilityBits(),
+                .value = if (slot.inert) 0 else adapter.capabilityBits(),
             } }) catch unreachable;
             adapter.enqueue(client, .{ .seat_name = id }) catch unreachable;
             return slot;
@@ -463,15 +484,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const decoded = try wayring.server.decodeRequest(Seat, server_objects, message, fds);
             switch (decoded.value) {
                 .get_pointer => |payload| {
-                    if (!adapter.pointer_ever_available)
+                    if (!seat.inert and !adapter.pointer_ever_available)
                         return try adapter.protocolError(actor, decoded.handle.id, Seat.@"error".missing_capability.value, "pointer capability unavailable");
                     const slot = adapter.pointers.acquire() catch
                         return try adapter.noMemory(actor);
                     slot.seat_index = adapter.seatIndex(seat);
                     slot.seat_generation = seat.header.generation;
                     slot.client = clientId(seat.peer);
-                    slot.capability_generation = adapter.pointer_capability_generation;
-                    const focused = adapter.pointer_delivery != null and
+                    slot.capability_generation = if (seat.inert) 0 else adapter.pointer_capability_generation;
+                    const focused = !seat.inert and adapter.pointer_delivery != null and
                         sameClient(clientId(seat.peer), adapter.pointer_delivery.?.client);
                     if (focused) adapter.ensureOutbound(2) catch {
                         adapter.pointers.release(slot);
@@ -499,14 +520,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     };
                 },
                 .get_keyboard => |payload| {
-                    if (!adapter.keyboard_ever_available)
+                    if (!seat.inert and !adapter.keyboard_ever_available)
                         return try adapter.protocolError(actor, decoded.handle.id, Seat.@"error".missing_capability.value, "keyboard capability unavailable");
                     const slot = adapter.keyboards.acquire() catch
                         return try adapter.noMemory(actor);
                     slot.seat_index = adapter.seatIndex(seat);
                     slot.seat_generation = seat.header.generation;
                     slot.client = clientId(seat.peer);
-                    slot.capability_generation = adapter.keyboard_capability_generation;
+                    slot.capability_generation = if (seat.inert) 0 else adapter.keyboard_capability_generation;
                     const extra: usize = if (adapter.keyboard_focus != null) 4 else 2;
                     adapter.ensureOutbound(extra) catch {
                         adapter.keyboards.release(slot);
@@ -520,7 +541,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     const client = clientId(seat.peer);
                     adapter.enqueue(client, .{ .keyboard_keymap = adapter.keyboardId(slot) }) catch unreachable;
                     adapter.enqueue(client, .{ .keyboard_repeat = adapter.keyboardId(slot) }) catch unreachable;
-                    if (adapter.keyboard_focus) |focus| if (sameClient(client, focus.client)) {
+                    if (adapter.keyboard_focus) |focus| if (!seat.inert and sameClient(client, focus.client)) {
                         const serial = adapter.issueSerial();
                         adapter.enqueue(client, .{ .keyboard_enter = .{
                             .keyboard = adapter.keyboardId(slot),
@@ -537,7 +558,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     };
                 },
                 .get_touch => |payload| {
-                    if (!adapter.touch_ever_available)
+                    if (!seat.inert and !adapter.touch_ever_available)
                         return try adapter.protocolError(actor, decoded.handle.id, Seat.@"error".missing_capability.value, "touch capability unavailable");
                     const slot = adapter.touches.acquire() catch return try adapter.noMemory(actor);
                     slot.seat_index = adapter.seatIndex(seat);
@@ -546,7 +567,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     slot.resource_generation = adapter.next_touch_resource_generation;
                     adapter.next_touch_resource_generation +%= 1;
                     if (adapter.next_touch_resource_generation == 0) adapter.next_touch_resource_generation = 1;
-                    slot.capability_generation = adapter.touch_capability_generation;
+                    slot.capability_generation = if (seat.inert) 0 else adapter.touch_capability_generation;
                     slot.pending_frame_events = 0;
                     const admitted = Seat.admit_get_touch(server_objects, decoded.handle, payload, .{ .id = slot }) catch |err| {
                         adapter.touches.release(slot);
@@ -612,6 +633,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (object.interface == &Pointer.info) {
                 const slot = adapter.pointers.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(slot.resource, handle)) return false;
+                adapter.invalidateTimestamps(slot);
                 adapter.dropOutboundResource(.pointer, adapter.pointerIndex(slot), slot.header.generation);
                 adapter.pointers.release(slot);
                 return true;
@@ -619,6 +641,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (object.interface == &Keyboard.info) {
                 const slot = adapter.keyboards.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(slot.resource, handle)) return false;
+                adapter.invalidateTimestamps(slot);
                 adapter.dropOutboundResource(.keyboard, adapter.keyboardIndex(slot), slot.header.generation);
                 adapter.keyboards.release(slot);
                 return true;
@@ -626,6 +649,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (object.interface == &Touch.info) {
                 const slot = adapter.touches.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(slot.resource, handle)) return false;
+                adapter.invalidateTimestamps(slot);
                 adapter.dropOutboundResource(.touch, adapter.touchIndex(slot), slot.header.generation);
                 const owner = slot.client;
                 adapter.touches.release(slot);
@@ -730,11 +754,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 std.meta.eql(delivery.surface, surface);
         }
 
-        pub fn applyPointerWarp(adapter: *Self, surface: SurfaceId, point: Point) bool {
+        pub fn applyPointerWarp(adapter: *Self, surface: SurfaceId, point: Point, time_ms: u32) !bool {
             const delivery = adapter.deliveryTarget() orelse return false;
             if (!std.meta.eql(delivery.surface, surface)) return false;
-            adapter.pointer_point = point;
-            adapter.pointer_focus = delivery;
+            try adapter.relocatePointerFocus(delivery, point, time_ms);
             return true;
         }
 
@@ -1058,6 +1081,30 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             adapter.pointer_focus = target;
         }
 
+        /// Publishes compositor-induced relocation separately from input motion.
+        /// A new focus gets enter only; a retained focus gets its own warp frame.
+        pub fn relocatePointerFocus(adapter: *Self, target: ?FocusTarget, point: Point, time_ms: u32) !void {
+            const relocated = target != null and optionalTargetEqual(adapter.deliveryTarget(), target) and
+                !std.meta.eql(adapter.pointer_point, point);
+            if (relocated) try adapter.ensureOutbound(adapter.pointerResourceCount(target.?.client) * 2);
+            try adapter.setPointerFocus(target, point);
+            if (!relocated) return;
+            const delivery = target.?;
+            for (adapter.pointers.entries.items, 0..) |slot, index| if (adapter.pointerBelongs(slot, delivery.client)) {
+                const id: Id = .{ .index = @intCast(index), .generation = slot.header.generation };
+                adapter.enqueue(delivery.client, .{ .pointer_warp = .{
+                    .pointer = id,
+                    .target = delivery,
+                    .time = time_ms,
+                    .point = point,
+                } }) catch unreachable;
+                adapter.enqueue(delivery.client, .{ .pointer_frame = .{
+                    .pointer = id,
+                    .target = delivery,
+                } }) catch unreachable;
+            };
+        }
+
         pub fn setKeyboardFocus(adapter: *Self, target: ?FocusTarget) !void {
             if (target) |value| _ = try adapter.core.getSurfaceById(value.surface);
             if (optionalTargetEqual(adapter.keyboard_focus, target)) return;
@@ -1174,7 +1221,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         /// Starts a contact on an exact generation-checked surface. The fixed
         /// offset retains its down-time coordinate space for the implicit grab.
-        pub fn touchDown(adapter: *Self, contact: TouchContactId, target: FocusTarget, time_ms: u32, point: Point, offset: Point) !?u32 {
+        /// Times retain the backend's microsecond clock, including epoch bits.
+        pub fn touchDown(adapter: *Self, contact: TouchContactId, target: FocusTarget, time_usec: u64, point: Point, offset: Point) !?u32 {
             if (adapter.touch_devices == 0) return error.TouchUnavailable;
             _ = try adapter.core.getSurfaceById(target.surface);
             if (adapter.findContact(contact) != null) return error.DuplicateContact;
@@ -1200,7 +1248,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 adapter.enqueue(target.client, .{ .touch_down = .{
                     .touch = .{ .index = @intCast(index), .generation = touch.header.generation },
                     .serial = serial,
-                    .time = time_ms,
+                    .time = millis(time_usec),
+                    .time_usec = time_usec,
                     .id = contact.id,
                     .target = target,
                     .point = point,
@@ -1211,7 +1260,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return serial;
         }
 
-        pub fn touchMotion(adapter: *Self, contact: TouchContactId, time_ms: u32, point: Point) !void {
+        pub fn touchMotion(adapter: *Self, contact: TouchContactId, time_usec: u64, point: Point) !void {
             const active = adapter.findContact(contact) orelse return error.StaleContact;
             const target = active.target orelse return;
             const count = adapter.touchResourceCountForContact(active);
@@ -1219,7 +1268,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             for (adapter.touches.entries.items, 0..) |touch, index| if (adapter.touchParticipates(touch, active)) {
                 adapter.enqueue(target.client, .{ .touch_motion = .{
                     .touch = .{ .index = @intCast(index), .generation = touch.header.generation },
-                    .time = time_ms,
+                    .time = millis(time_usec),
+                    .time_usec = time_usec,
                     .id = contact.id,
                     .point = point,
                 } }) catch unreachable;
@@ -1234,7 +1284,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return .{ .focus = active.target orelse return null, .offset = active.offset };
         }
 
-        pub fn touchUp(adapter: *Self, contact: TouchContactId, time_ms: u32) !?u32 {
+        pub fn touchUp(adapter: *Self, contact: TouchContactId, time_usec: u64) !?u32 {
             const active = adapter.findContact(contact) orelse return error.StaleContact;
             const target = active.target orelse {
                 active.active = false;
@@ -1247,7 +1297,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 adapter.enqueue(target.client, .{ .touch_up = .{
                     .touch = .{ .index = @intCast(index), .generation = touch.header.generation },
                     .serial = serial,
-                    .time = time_ms,
+                    .time = millis(time_usec),
+                    .time_usec = time_usec,
                     .id = contact.id,
                 } }) catch unreachable;
                 touch.pending_frame_events +|= 1;
@@ -1332,6 +1383,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     .pointer = id,
                     .target = target,
                     .time = millis(value.time_usec),
+                    .time_usec = value.time_usec,
                     .point = adapter.pointer_point,
                 } }) catch unreachable;
                 adapter.enqueue(target.client, .{ .pointer_frame = .{
@@ -1463,16 +1515,33 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .pointer_motion => |v| {
                     const slot = adapter.resolvePointer(v.pointer) catch return true;
                     _ = adapter.surfaceObject(server_objects, v.target) catch return true;
-                    try Pointer.encodeEvent(queue, slot.resource.id, .{ .motion = .{
+                    try adapter.sendTimestamped(Pointer, queue, slot, v.time_usec, .{ .motion = .{
                         .time = v.time,
                         .surface_x = v.point.x,
                         .surface_y = v.point.y,
                     } });
                 },
+                .pointer_warp => |v| {
+                    const slot = adapter.resolvePointer(v.pointer) catch return true;
+                    _ = adapter.surfaceObject(server_objects, v.target) catch return true;
+                    const object = server_objects.namespace.resolve(slot.resource) orelse return true;
+                    if (object.version >= 11) {
+                        try Pointer.encodeEvent(queue, slot.resource.id, .{ .warp = .{
+                            .surface_x = v.point.x,
+                            .surface_y = v.point.y,
+                        } });
+                    } else {
+                        try Pointer.encodeEvent(queue, slot.resource.id, .{ .motion = .{
+                            .time = v.time,
+                            .surface_x = v.point.x,
+                            .surface_y = v.point.y,
+                        } });
+                    }
+                },
                 .pointer_button => |v| {
                     const slot = adapter.resolvePointer(v.pointer) catch return true;
                     if (v.target) |target| _ = adapter.surfaceObject(server_objects, target) catch return true;
-                    try Pointer.encodeEvent(queue, slot.resource.id, .{ .button = .{
+                    try adapter.sendTimestamped(Pointer, queue, slot, v.time_usec, .{ .button = .{
                         .serial = v.serial,
                         .time = v.time,
                         .button = v.button,
@@ -1494,7 +1563,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .pointer_axis => |v| {
                     const slot = adapter.resolvePointer(v.pointer) catch return true;
                     _ = adapter.surfaceObject(server_objects, v.target) catch return true;
-                    try Pointer.encodeEvent(queue, slot.resource.id, .{ .axis = .{
+                    try adapter.sendTimestamped(Pointer, queue, slot, v.time_usec, .{ .axis = .{
                         .time = v.time,
                         .axis = protocolAxis(v.axis, Pointer),
                         .value = v.value,
@@ -1504,7 +1573,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     const slot = adapter.resolvePointer(v.pointer) catch return true;
                     _ = adapter.surfaceObject(server_objects, v.target) catch return true;
                     const object = server_objects.namespace.resolve(slot.resource) orelse return true;
-                    if (object.version >= 5) try Pointer.encodeEvent(queue, slot.resource.id, .{
+                    if (object.version >= 5) try adapter.sendTimestamped(Pointer, queue, slot, v.time_usec, .{
                         .axis_stop = .{ .time = v.time, .axis = protocolAxis(v.axis, Pointer) },
                     });
                 },
@@ -1579,7 +1648,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .keyboard_key => |v| {
                     const slot = adapter.resolveKeyboard(v.keyboard) catch return true;
                     _ = adapter.surfaceObject(server_objects, v.target) catch return true;
-                    try Keyboard.encodeEvent(queue, slot.resource.id, .{ .key = .{
+                    try adapter.sendTimestamped(Keyboard, queue, slot, v.time_usec, .{ .key = .{
                         .serial = v.serial,
                         .time = v.time,
                         .key = v.key,
@@ -1600,7 +1669,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .touch_down => |v| {
                     const slot = adapter.resolveTouch(v.touch) catch return true;
                     const surface = adapter.surfaceObject(server_objects, v.target) catch return true;
-                    try Touch.encodeEvent(queue, slot.resource.id, .{ .down = .{
+                    try adapter.sendTimestamped(Touch, queue, slot, v.time_usec, .{ .down = .{
                         .serial = v.serial,
                         .time = v.time,
                         .surface = surface.id,
@@ -1611,11 +1680,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 },
                 .touch_up => |v| {
                     const slot = adapter.resolveTouch(v.touch) catch return true;
-                    try Touch.encodeEvent(queue, slot.resource.id, .{ .up = .{ .serial = v.serial, .time = v.time, .id = v.id } });
+                    try adapter.sendTimestamped(Touch, queue, slot, v.time_usec, .{ .up = .{ .serial = v.serial, .time = v.time, .id = v.id } });
                 },
                 .touch_motion => |v| {
                     const slot = adapter.resolveTouch(v.touch) catch return true;
-                    try Touch.encodeEvent(queue, slot.resource.id, .{ .motion = .{ .time = v.time, .id = v.id, .x = v.point.x, .y = v.point.y } });
+                    try adapter.sendTimestamped(Touch, queue, slot, v.time_usec, .{ .motion = .{ .time = v.time, .id = v.id, .x = v.point.x, .y = v.point.y } });
                 },
                 .touch_frame => |v| {
                     const slot = adapter.resolveTouch(v.touch) catch return true;
@@ -1627,6 +1696,17 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 },
             }
             return true;
+        }
+
+        fn sendTimestamped(adapter: *Self, comptime Interface: type, queue: *wayring.tx.Queue, slot: anytype, time_usec: ?u64, event: Interface.Event) !void {
+            if (adapter.timestamps) |timestamps| {
+                try timestamps.send(Interface, queue, .{ .slot = @intCast(slot.client.slot), .generation = slot.client.generation }, slot.resource, time_usec, event);
+            } else try Interface.encodeEvent(queue, slot.resource.id, event);
+        }
+
+        fn invalidateTimestamps(adapter: *Self, slot: anytype) void {
+            if (adapter.timestamps) |timestamps|
+                timestamps.invalidate(.{ .slot = @intCast(slot.client.slot), .generation = slot.client.generation }, slot.resource);
         }
 
         fn addDevice(adapter: *Self, id: input.DeviceId, capabilities: @import("../backend/input/platform.zig").Capabilities) !void {
@@ -1740,6 +1820,18 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             }
             adapter.enqueueCapabilities(old, current) catch unreachable;
             if (slot.capabilities.pointer and pointer_devices == 0)
+                for (adapter.pointers.entries.items) |pointer| {
+                    if (pointer.header.active) adapter.invalidateTimestamps(pointer);
+                };
+            if (slot.capabilities.keyboard and keyboard_devices == 0)
+                for (adapter.keyboards.entries.items) |keyboard| {
+                    if (keyboard.header.active) adapter.invalidateTimestamps(keyboard);
+                };
+            if (slot.capabilities.touch and touch_devices == 0)
+                for (adapter.touches.entries.items) |touch| {
+                    if (touch.header.active) adapter.invalidateTimestamps(touch);
+                };
+            if (slot.capabilities.pointer and pointer_devices == 0)
                 advanceCapabilityGeneration(&adapter.pointer_capability_generation);
             if (slot.capabilities.keyboard and keyboard_devices == 0)
                 advanceCapabilityGeneration(&adapter.keyboard_capability_generation);
@@ -1778,6 +1870,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     .target = delivery,
                     .serial = serial,
                     .time = millis(value.time_usec),
+                    .time_usec = value.time_usec,
                     .button = value.button,
                     .pressed = value.pressed,
                 } }) catch unreachable;
@@ -1827,6 +1920,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                                 .pointer = pointer,
                                 .target = target,
                                 .time = time,
+                                .time_usec = value.time_usec,
                                 .axis = entry[0],
                             },
                         }) catch unreachable;
@@ -1842,6 +1936,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                             .pointer = pointer,
                             .target = target,
                             .time = time,
+                            .time_usec = value.time_usec,
                             .axis = entry[0],
                             .value = fixedFromDelta(present.value),
                         } }) catch unreachable;
@@ -1911,6 +2006,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     .serial = serial,
                     .target = delivery,
                     .time = millis(value.time_usec),
+                    .time_usec = value.time_usec,
                     .key = value.key,
                     .pressed = value.pressed,
                 } }) catch unreachable;
@@ -2035,7 +2131,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         fn capabilityPublicationCount(adapter: *const Self, old: u32, current: u32) usize {
             if (old == current) return 0;
             var count: usize = 0;
-            for (adapter.seats.entries.items) |seat| if (seat.header.active) {
+            for (adapter.seats.entries.items) |seat| if (seat.header.active and !seat.inert) {
                 count += 1;
             };
             return count;
@@ -2043,7 +2139,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         fn enqueueCapabilities(adapter: *Self, old: u32, current: u32) !void {
             if (old == current) return;
-            for (adapter.seats.entries.items, 0..) |seat, index| if (seat.header.active)
+            for (adapter.seats.entries.items, 0..) |seat, index| if (seat.header.active and !seat.inert)
                 adapter.enqueue(clientId(seat.peer), .{ .seat_capabilities = .{
                     .seat = .{ .index = @intCast(index), .generation = seat.header.generation },
                     .value = current,
@@ -2186,7 +2282,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const object = server_objects.namespace.resolve(handle) orelse return null;
             if (object.interface != &Seat.info) return null;
             const seat = adapter.seats.fromContext(object.context) orelse return null;
-            if (!std.meta.eql(seat.resource, handle) or !std.meta.eql(seat.peer, peer)) return null;
+            if (seat.inert or !std.meta.eql(seat.resource, handle) or !std.meta.eql(seat.peer, peer)) return null;
             return seat;
         }
 
@@ -2405,6 +2501,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     .pointer_enter => |v| if (kind == .pointer) v.pointer else null,
                     .pointer_leave => |v| if (kind == .pointer) v.pointer else null,
                     .pointer_motion => |v| if (kind == .pointer) v.pointer else null,
+                    .pointer_warp => |v| if (kind == .pointer) v.pointer else null,
                     .pointer_button => |v| if (kind == .pointer) v.pointer else null,
                     .pointer_axis_source => |v| if (kind == .pointer) v.pointer else null,
                     .pointer_axis => |v| if (kind == .pointer) v.pointer else null,
@@ -2558,6 +2655,7 @@ fn outboundTargets(value: anytype, surface: anytype) bool {
         .pointer_enter => |v| std.meta.eql(v.target.surface, surface),
         .pointer_leave => |v| std.meta.eql(v.target.surface, surface),
         .pointer_motion => |v| std.meta.eql(v.target.surface, surface),
+        .pointer_warp => |v| std.meta.eql(v.target.surface, surface),
         .pointer_button => |v| v.target != null and std.meta.eql(v.target.?.surface, surface),
         .pointer_axis_source => |v| std.meta.eql(v.target.surface, surface),
         .pointer_axis => |v| std.meta.eql(v.target.surface, surface),
@@ -2627,6 +2725,88 @@ fn testAdapterWithCapacity(core: *FakeCore, outbound_capacity: usize, event_capa
 
 fn clearTestOutbound(adapter: *TestAdapter) void {
     for (adapter.outbound) |*slot| if (slot.active) adapter.removeOutbound(slot);
+}
+
+test "seat: relocation emits versioned events in separate frames across backpressure" {
+    for ([_]u32{ 10, 11 }) |version| {
+        var core: FakeCore = .{};
+        var adapter = try testAdapter(&core);
+        defer adapter.deinit();
+        var server_objects = try wayring.objects.ServerObjects.init(std.testing.allocator, 16, 4, &TestCore.Display.info, null);
+        defer server_objects.deinit(std.testing.allocator);
+        var surface_context: u8 = 0;
+        const surface = try server_objects.insertClient(10, &test_protocol.wl_surface.info, 7, &surface_context);
+        core.generation = surface.generation;
+        const peer: wayring.io_uring.Peer = .{ .slot = 0, .generation = 3 };
+        const target = try adapter.makeTarget(peer, .{ .index = 0, .generation = surface.generation });
+        const pointer = try adapter.pointers.acquire();
+        pointer.client = clientId(peer);
+        pointer.resource = try server_objects.insertClient(3, &test_protocol.wl_pointer.info, version, pointer);
+
+        try adapter.relocatePointerFocus(target, .{ .x = 256, .y = 512 }, 19);
+        try adapter.relocatePointerFocus(target, .{ .x = 1793, .y = -769 }, 23);
+        try adapter.relocatePointerFocus(target, .{ .x = 1793, .y = -769 }, 24);
+        try std.testing.expectEqual(@as(usize, 4), adapter.pendingOutbound());
+
+        var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 2);
+        defer blocks.deinit(std.testing.allocator);
+        var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+        defer descriptors.deinit(std.testing.allocator);
+        var blocked = wayring.tx.Queue.init(&blocks, 8, &descriptors, 0);
+        defer blocked.deinit();
+        try std.testing.expectEqual(@as(usize, 0), try adapter.flushOn(peer, &server_objects, &blocked));
+        try std.testing.expectEqual(@as(usize, 4), adapter.pendingOutbound());
+        var output = wayring.tx.Queue.init(&blocks, 256, &descriptors, 0);
+        defer output.deinit();
+        try std.testing.expectEqual(@as(usize, 4), try adapter.flushOn(peer, &server_objects, &output));
+        var descriptor_scratch: [1]linux.fd_t = undefined;
+        var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+        const snapshot = try output.snapshot(&descriptor_scratch, &control);
+        var bytes = snapshot.first;
+        const expected = [_]std.meta.Tag(test_protocol.wl_pointer.Event){ .enter, .frame, if (version == 11) .warp else .motion, .frame };
+        for (expected) |tag| {
+            const message = (try wayring.wire.Message.decode(bytes)).?;
+            const event = try test_protocol.wl_pointer.decodeEvent(message, &output.descriptors);
+            try std.testing.expectEqual(tag, std.meta.activeTag(event));
+            switch (event) {
+                .enter => |value| {
+                    try std.testing.expectEqual(@as(i32, 256), value.surface_x);
+                    try std.testing.expectEqual(@as(i32, 512), value.surface_y);
+                },
+                .warp => |value| {
+                    try std.testing.expectEqual(@as(i32, 1793), value.surface_x);
+                    try std.testing.expectEqual(@as(i32, -769), value.surface_y);
+                },
+                .motion => |value| {
+                    try std.testing.expectEqual(@as(u32, 23), value.time);
+                    try std.testing.expectEqual(@as(i32, 1793), value.surface_x);
+                    try std.testing.expectEqual(@as(i32, -769), value.surface_y);
+                },
+                else => {},
+            }
+            bytes = bytes[message.header.size..];
+        }
+        try std.testing.expectEqual(@as(usize, 0), bytes.len);
+        try std.testing.expectEqual(@as(usize, 0), adapter.pendingOutbound());
+    }
+}
+
+test "seat: relocation admission failure preserves coordinates and removal drops pending warp" {
+    var core: FakeCore = .{};
+    var adapter = try testAdapterWithCapacity(&core, 2, 2);
+    defer adapter.deinit();
+    const peer: wayring.io_uring.Peer = .{ .slot = 0, .generation = 3 };
+    const target = try adapter.makeTarget(peer, .{ .index = 0, .generation = 1 });
+    const pointer = try adapter.pointers.acquire();
+    pointer.client = clientId(peer);
+    try adapter.setPointerFocus(target, .{ .x = 31, .y = 47 });
+    try std.testing.expectError(error.Exhausted, adapter.relocatePointerFocus(target, .{ .x = 53, .y = 71 }, 11));
+    try std.testing.expectEqual(TestAdapter.Point{ .x = 31, .y = 47 }, adapter.pointerState().point);
+    clearTestOutbound(&adapter);
+    try adapter.relocatePointerFocus(target, .{ .x = 53, .y = 71 }, 11);
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_warp));
+    adapter.surfaceRemoved(target.surface);
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingOutbound());
 }
 
 test "seat: pointer focus transitions complete frames atomically" {
@@ -3028,9 +3208,10 @@ test "seat: relative pointer lookup retains exact resource generation and focus"
         .{ .index = 1, .generation = 1 },
         44,
     ));
-    try std.testing.expect(adapter.applyPointerWarp(
+    try std.testing.expect(try adapter.applyPointerWarp(
         adapter.pointer_delivery.?.surface,
         .{ .x = 7 * 256, .y = 9 * 256 },
+        17,
     ));
     try std.testing.expectEqual(TestAdapter.Point{ .x = 7 * 256, .y = 9 * 256 }, adapter.pointerState().point);
     try std.testing.expect(!adapter.validateCursorShapeOn(

@@ -3,6 +3,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const completion = @import("../../runtime/completion.zig");
+const diagnostics = @import("../../diagnostics.zig");
 
 const c = @cImport({
     @cInclude("libudev.h");
@@ -82,7 +83,10 @@ pub const Monitor = struct {
                 mask & (linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL) != 0)
                 return error.ReadinessFailed;
             while (try self.platform.nextEvent(self.context)) |event| switch (event) {
-                .change, .remove => self.changed = true,
+                .change, .remove => {
+                    diagnostics.logDisplay("hotplug-event kind={t}", .{event});
+                    self.changed = true;
+                },
                 .ignored => {},
             };
             if (!self.draining) try self.preparePoll(router, ring);

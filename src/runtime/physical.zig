@@ -63,10 +63,12 @@ const protocol_xdg_toplevel_icon = @import("../protocol/xdg_toplevel_icon.zig");
 const protocol_wayland_fixes = @import("../protocol/wayland_fixes.zig");
 const protocol_xdg_system_bell = @import("../protocol/xdg_system_bell.zig");
 const protocol_relative_pointer = @import("../protocol/relative_pointer.zig");
+const protocol_input_timestamps = @import("../protocol/input_timestamps.zig");
 const protocol_pointer_gestures = @import("../protocol/pointer_gestures.zig");
 const protocol_idle_inhibit = @import("../protocol/idle_inhibit.zig");
 const protocol_idle_notify = @import("../protocol/idle_notify.zig");
 const protocol_shortcuts_inhibit = @import("../protocol/keyboard_shortcuts_inhibit.zig");
+const protocol_hotkey = @import("../protocol/hotkey.zig");
 const protocol_xdg_foreign = @import("../protocol/xdg_foreign.zig");
 const protocol_pointer_constraints = @import("../protocol/pointer_constraints.zig");
 const protocol_fractional_scale = @import("../protocol/fractional_scale.zig");
@@ -388,10 +390,12 @@ pub fn Coordinator(comptime protocol: type) type {
         const WaylandFixesAdapter = protocol_wayland_fixes.Adapter(protocol);
         const SystemBellAdapter = protocol_xdg_system_bell.Adapter(protocol);
         const RelativePointerAdapter = protocol_relative_pointer.Adapter(protocol, SeatAdapter);
+        const InputTimestampsAdapter = protocol_input_timestamps.Adapter(protocol);
         const PointerGesturesAdapter = protocol_pointer_gestures.Adapter(protocol);
         const IdleInhibitAdapter = protocol_idle_inhibit.Adapter(protocol, Adapter);
         const IdleNotifyAdapter = protocol_idle_notify.Adapter(protocol);
         const ShortcutsInhibitAdapter = protocol_shortcuts_inhibit.Adapter(protocol, Adapter);
+        const HotkeyAdapter = protocol_hotkey.Adapter(protocol);
         const ForeignAdapter = protocol_xdg_foreign.Adapter(protocol, Adapter, ShellAdapter);
         const PointerConstraintsAdapter = protocol_pointer_constraints.Adapter(protocol, Adapter, SeatAdapter);
         const FractionalScaleAdapter = protocol_fractional_scale.Adapter(protocol, Adapter);
@@ -727,6 +731,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const gamma_control: u64 = 1 << 35;
             const drm_lease: u64 = 1 << 36;
             const background_effect: u64 = 1 << 37;
+            const hotkey: u64 = 1 << 38;
             const all: u64 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
@@ -735,7 +740,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 idle_notify | tablet | ext_data_control | wlr_data_control | input_method |
                 screencopy | foreign_toplevel_list | image_copy_capture | xdg_toplevel_icon | gtk_shell |
                 workspace | xdg_session | output_management | output_power | gamma_control |
-                drm_lease | background_effect;
+                drm_lease | background_effect | hotkey;
         };
         const Client = struct {
             active: bool = false,
@@ -888,6 +893,8 @@ pub fn Coordinator(comptime protocol: type) type {
             background_effect: protocol_background_effect.Config = .{},
             pointer_warp: protocol_pointer_warp.Config = .{},
             security_context: protocol_security_context.Config = .{},
+            /// Require the color pipeline on Vulkan and publish color globals
+            /// only after selection proves it. Auto may still fall back to Pixman.
             enable_color_protocols: bool = false,
             protocol_output: protocol_output.Config = .{},
             xdg_output: protocol_xdg_output.Config = .{},
@@ -947,6 +954,7 @@ pub fn Coordinator(comptime protocol: type) type {
         input: ?*input_api.Backend = null,
         input_event_cursor: usize = 0,
         input_interaction_accepted: bool = false,
+        input_hotkey_accepted: bool = false,
         input_relative_accepted: bool = false,
         input_gesture_accepted: bool = false,
         input_idle_accepted: bool = false,
@@ -1031,10 +1039,12 @@ pub fn Coordinator(comptime protocol: type) type {
         wayland_fixes_adapter: WaylandFixesAdapter,
         system_bell_adapter: SystemBellAdapter,
         relative_pointer_adapter: RelativePointerAdapter,
+        input_timestamps_adapter: InputTimestampsAdapter,
         pointer_gestures_adapter: PointerGesturesAdapter,
         idle_inhibit_adapter: IdleInhibitAdapter,
         idle_notify_adapter: IdleNotifyAdapter,
         shortcuts_inhibit_adapter: ShortcutsInhibitAdapter,
+        hotkey_adapter: HotkeyAdapter,
         foreign_adapter: ForeignAdapter,
         pointer_constraints_adapter: PointerConstraintsAdapter,
         fractional_scale_adapter: FractionalScaleAdapter,
@@ -1144,6 +1154,7 @@ pub fn Coordinator(comptime protocol: type) type {
         consumer_timer_canceling: bool = false,
         consumer_timer_deadline_ns: ?u64 = null,
         cursor_layer: Layer,
+        cursor_offset_sequence: u64 = 0,
         drag_icon_root: ?Adapter.SurfaceId = null,
         output_power_transition: ?OutputPowerAdapter.Command = null,
         stopping: bool = false,
@@ -1176,6 +1187,8 @@ pub fn Coordinator(comptime protocol: type) type {
             self.root = root;
             self.platforms = platforms;
             self.output_config = config.output;
+            self.output_config.enable_color_management = config.output.enable_color_management or
+                config.enable_color_protocols;
             self.syncobj_config = config.linux_drm_syncobj;
             self.desktop_transaction_timeout_ns = config.desktop_transaction_timeout_ns;
             self.virtual_keyboard_reconciles_focus = config.virtual_keyboard_reconciles_focus;
@@ -1187,6 +1200,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input = null;
             self.input_event_cursor = 0;
             self.input_interaction_accepted = false;
+            self.input_hotkey_accepted = false;
             self.input_relative_accepted = false;
             self.input_idle_accepted = false;
             self.input_gesture_accepted = false;
@@ -1360,7 +1374,7 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer allocator.free(self.inhibitor_surface_ids);
             self.desktop_timer = null;
             self.desktop_timer_canceling = false;
-            self.color_protocols_enabled = config.enable_color_protocols and config.output.renderer == .vulkan;
+            self.color_protocols_enabled = config.enable_color_protocols;
             self.icc_poll = null;
             self.icc_poll_canceling = false;
             self.idle_timer = null;
@@ -1378,6 +1392,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.consumer_timer_canceling = false;
             self.consumer_timer_deadline_ns = null;
             self.cursor_layer = .{};
+            self.cursor_offset_sequence = 0;
             const cursor_path_requirement = std.math.add(
                 usize,
                 config.cursor_directory.len,
@@ -1564,6 +1579,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.protocol_seat,
             );
             errdefer self.seat_adapter.deinit();
+            self.input_timestamps_adapter = try InputTimestampsAdapter.init(allocator);
+            errdefer self.input_timestamps_adapter.deinit();
+            self.seat_adapter.timestamps = &self.input_timestamps_adapter;
             self.transient_seat_adapter = try TransientSeatAdapter.init(
                 allocator,
                 .{},
@@ -1611,6 +1629,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.shortcuts_inhibit,
             );
             errdefer self.shortcuts_inhibit_adapter.deinit();
+            self.hotkey_adapter = try HotkeyAdapter.init(allocator, .{ .context = self, .validateFn = validateShortcutSeat });
+            errdefer self.hotkey_adapter.deinit();
+            self.hotkey_adapter.keymap = &self.interaction.keymap_state;
             self.foreign_adapter = try ForeignAdapter.init(
                 allocator,
                 &self.adapter,
@@ -1715,6 +1736,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 .context = self,
                 .validateFn = validateInteractiveGrab,
             });
+            self.gtk_shell_adapter.titlebar_policy = .{
+                .context = self,
+                .toggleMaximizedFn = gtkToggleMaximized,
+            };
             self.wayland_fixes_adapter = .{};
             self.system_bell_adapter = .{};
             self.fractional_scale_adapter = try FractionalScaleAdapter.init(
@@ -1781,6 +1806,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .context = self,
                 .validate = validateActivation,
             });
+            self.activation_adapter.hotkey_validator = .{ .context = self, .validate = validateHotkeyActivation };
             self.shell_adapter.setGrabValidator(.{
                 .context = self,
                 .validate = validatePopupGrab,
@@ -1926,14 +1952,6 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.fractional_scale_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
-            if (self.color_protocols_enabled) {
-                _ = try self.color_management_adapter.install(&root.runtime);
-                if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
-                    return error.GlobalPublicationIncomplete;
-                _ = try self.color_representation_adapter.install(&root.runtime);
-                if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
-                    return error.GlobalPublicationIncomplete;
-            }
             _ = try self.alpha_modifier_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -2060,6 +2078,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.relative_pointer_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.input_timestamps_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.pointer_gestures_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -2151,6 +2172,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         pub fn installKeyConsumerSnapshot(self: *Self, candidate: *KeyConsumerSnapshot) !void {
             try self.interaction.canInstallKeyConsumerSnapshot();
+            try self.hotkey_adapter.configure(candidate.experimental_hotkeys, candidate.bindings);
             try self.interaction.installKeyConsumerSnapshot(candidate);
             try self.syncConsumerTimer();
         }
@@ -2487,6 +2509,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.dialog_adapter.deinit();
             self.decoration_adapter.deinit();
             self.activation_adapter.deinit();
+            self.hotkey_adapter.deinit();
             self.dmabuf_adapter.deinit();
             self.virtual_pointer_adapter.deinit();
             self.virtual_keyboard_adapter.deinit();
@@ -2508,6 +2531,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.tablet_adapter.deinit();
             self.tablet_state.deinit();
             self.seat_adapter.deinit();
+            self.input_timestamps_adapter.deinit();
             self.subcompositor_adapter.deinit();
             self.interaction.deinit();
             self.settings.deinit();
@@ -2575,6 +2599,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.idle_notify_adapter.disconnected(peer);
             self.syncIdleNotifications() catch {};
             self.shortcuts_inhibit_adapter.disconnected(peer);
+            self.hotkey_adapter.disconnected(peer);
             self.foreign_adapter.disconnected(peer);
             self.shell_maintenance_pending = true;
             self.xdg_session_adapter.disconnected(peer);
@@ -2849,6 +2874,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     return control;
                 }
             }
+            if (try self.hotkey_adapter.request(peer, target, message, fds)) |control| {
+                try self.flushProtocol();
+                return control;
+            }
             if (try self.activation_adapter.request(peer, target, message, fds)) |control| {
                 try self.processActivationEvents();
                 try self.advanceShell();
@@ -2877,6 +2906,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 return control;
             }
             if (try self.gtk_shell_adapter.request(peer, target, message, fds)) |control| {
+                try self.advanceShell();
                 if (self.gtk_shell_adapter.pendingOutbound(peer)) self.markProtocol(peer, ProtocolReady.gtk_shell);
                 try self.flushProtocol();
                 return control;
@@ -2890,6 +2920,8 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try self.wayland_fixes_adapter.request(peer, target, message, fds)) |control|
                 return control;
             if (try self.system_bell_adapter.request(peer, target, message, fds)) |control|
+                return control;
+            if (try self.input_timestamps_adapter.request(peer, target, message, fds)) |control|
                 return control;
             if (try self.relative_pointer_adapter.request(peer, target, message, fds)) |control| {
                 if (self.relative_pointer_adapter.pendingOutbound(peer))
@@ -3154,6 +3186,9 @@ pub fn Coordinator(comptime protocol: type) type {
             const connectors = probe.desktop;
             self.hotplug_connector_count = connectors.len;
             self.hotplug_updated_connector_count = probe.desktop_updated.len;
+            diagnostics.logDisplay("hotplug-probe generation={d} connected={any} changed={any} lease_changed={}", .{
+                handle.generation, connectors, probe.desktop_updated, probe.lease_changed,
+            });
             const primary_missing = std.mem.indexOfScalar(
                 u32,
                 connectors,
@@ -3165,6 +3200,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     if (!physical.connected or physical.removing or
                         std.mem.indexOfScalar(u32, connectors, physical.connector_id) == null)
                         continue;
+                    diagnostics.logDisplay("hotplug-promote connector={d}", .{physical.connector_id});
                     try self.promotePrimaryPhysicalOutput(physical);
                     primary_promoted = true;
                     break;
@@ -3179,12 +3215,16 @@ pub fn Coordinator(comptime protocol: type) type {
                         break;
                     }
                 }
-                if (!known) added = true;
+                if (!known) {
+                    diagnostics.logDisplay("hotplug-added connector={d}", .{connector_id});
+                    added = true;
+                }
             }
             var removal_requested = false;
             for (self.physical_outputs[0..self.physical_output_count]) |physical| {
                 if (!physical.connected or physical.removing) continue;
                 if (std.mem.indexOfScalar(u32, connectors, physical.connector_id) == null) {
+                    diagnostics.logDisplay("hotplug-removed connector={d}", .{physical.connector_id});
                     if (!primary_promoted and std.meta.eql(
                         physical.protocol_output,
                         self.output_adapter.primaryOutput(),
@@ -3206,6 +3246,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 return error.InvalidState;
             self.topology_refresh_pending = true;
             self.topology_refresh_draining = updated_connectors.len != 0;
+            diagnostics.logDisplay("refresh-request changed={any} draining={}", .{
+                updated_connectors, self.topology_refresh_draining,
+            });
             errdefer {
                 self.topology_refresh_pending = false;
                 self.topology_refresh_draining = false;
@@ -3382,6 +3425,11 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.shellMaintenancePending()) try self.advanceShell();
             _ = try self.retryRetainedOutcomes();
             if (self.pending_surface_len != 0) try self.applyReady();
+            // Child placement/stacking is parent-committed state, even when
+            // the parent's retained-buffer commit needs no repaint itself.
+            // Refresh and track damage before rendering, not only when a
+            // later unrelated frame happens to sample the subsurface tree.
+            if (self.subcompositor_adapter.takeSceneChanged()) try self.desktopSceneChanged();
             self.applyInteractionCommands() catch |err| switch (err) {
                 error.Exhausted => {},
                 else => return err,
@@ -3873,12 +3921,21 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.input_touch_delivery = self.touchDelivery(event);
                 self.input_delivery_prepared = true;
             }
-            if (!self.input_interaction_accepted) {
+            if (!self.input_hotkey_accepted) {
                 self.input_keyboard_consumed = false;
                 self.input_pointer_consumed = false;
+                try self.syncHotkeyPolicy();
+                if (self.input_delivery_event) |delivery_event| {
+                    const consumed = try self.hotkey_adapter.consume(delivery_event, &self.interaction.keymap_state, &self.seat_adapter, try monotonicNs());
+                    self.input_keyboard_consumed = consumed and delivery_event == .keyboard_key;
+                    self.input_pointer_consumed = consumed and delivery_event == .pointer_button;
+                }
+                self.input_hotkey_accepted = true;
+            }
+            if (!self.input_interaction_accepted) {
                 if (self.input_delivery_event) |delivery_event| {
                     const lock_keyboard = self.sessionLockActive() and delivery_event == .keyboard_key;
-                    if (!lock_keyboard) {
+                    if (!lock_keyboard and !self.input_keyboard_consumed and !self.input_pointer_consumed) {
                         var input_scene: InputScene = .{ .coordinator = self };
                         self.interaction.consumeWithShortcutPolicy(
                             &self.desktop,
@@ -4017,6 +4074,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn resetInputAdmission(self: *Self) void {
             self.input_interaction_accepted = false;
+            self.input_hotkey_accepted = false;
             self.input_relative_accepted = false;
             self.input_gesture_accepted = false;
             self.input_idle_accepted = false;
@@ -4352,7 +4410,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     _ = try self.seat_adapter.touchDown(
                         touchContact(value),
                         target,
-                        @truncate(value.time_usec / 1000),
+                        value.time_usec,
                         point,
                         delivery.offset,
                     );
@@ -4361,7 +4419,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     const point = delivery.point orelse return;
                     self.seat_adapter.touchMotion(
                         touchContact(value),
-                        @truncate(value.time_usec / 1000),
+                        value.time_usec,
                         point,
                     ) catch |err| switch (err) {
                         error.StaleContact => {},
@@ -4371,7 +4429,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .touch_up => |value| {
                     _ = self.seat_adapter.touchUp(
                         touchContact(value),
-                        @truncate(value.time_usec / 1000),
+                        value.time_usec,
                     ) catch |err| switch (err) {
                         error.StaleContact => return,
                         else => return err,
@@ -6317,7 +6375,7 @@ pub fn Coordinator(comptime protocol: type) type {
             var applied = false;
             while (self.interaction.peekCommand()) |command| {
                 switch (command) {
-                    .pointer_focus => |target| {
+                    .pointer_focus, .pointer_relocated => |target| {
                         const seat_target = if (target) |value|
                             try self.seatTarget(value.surface)
                         else
@@ -6334,7 +6392,13 @@ pub fn Coordinator(comptime protocol: type) type {
                             ) orelse self.seat_adapter.pointerState().point,
                             .idle => {},
                         }
-                        try self.seat_adapter.setPointerFocus(seat_target, delivery_point);
+                        if (command == .pointer_relocated) {
+                            try self.seat_adapter.relocatePointerFocus(
+                                seat_target,
+                                delivery_point,
+                                @truncate((try monotonicNs()) / std.time.ns_per_ms),
+                            );
+                        } else try self.seat_adapter.setPointerFocus(seat_target, delivery_point);
                         try self.pointer_constraints_adapter.updateFocus(
                             if (target) |value| value.surface else null,
                             .{ .x = focus_point.x, .y = focus_point.y },
@@ -6465,6 +6529,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn sessionLockChanged(self: *Self) !void {
             const unlocked = self.session_lock_adapter.takeUnlocked();
+            try self.syncHotkeyPolicy();
             self.output_associations_dirty = true;
             self.markProtocolAll(ProtocolReady.seat | ProtocolReady.data_device |
                 ProtocolReady.primary_selection | ProtocolReady.text_input |
@@ -6657,6 +6722,14 @@ pub fn Coordinator(comptime protocol: type) type {
             return self.seat_adapter.validateInteractiveGrab(peer, seat_object, serial, surface);
         }
 
+        fn gtkToggleMaximized(context: *anyopaque, surface: Adapter.SurfaceId) !void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            if (self.sessionLockActive()) return;
+            const scene = self.desktop.toplevelSceneForSurface(surface) catch return;
+            const state = try self.desktop.stateSnapshot(scene.id);
+            try self.desktop.setToplevelState(scene.id, .maximized, !state.maximized);
+        }
+
         fn adoptLayerPopup(
             context: *anyopaque,
             peer: wayring.io_uring.Peer,
@@ -6731,8 +6804,12 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             const global_x = @as(i64, origin_x) * 256 + x;
             const global_y = @as(i64, origin_y) * 256 + y;
-            if (!self.interaction.warpPointer(target, global_x, global_y)) return;
-            if (!self.seat_adapter.applyPointerWarp(surface, .{ .x = x, .y = y })) unreachable;
+            if (!self.interaction.canWarpPointer(global_x, global_y)) return;
+            const time_ms: u32 = @truncate((monotonicNs() catch return) / std.time.ns_per_ms);
+            if (!(self.seat_adapter.applyPointerWarp(surface, .{ .x = x, .y = y }, time_ms) catch return)) return;
+            const warped = self.interaction.warpPointer(target, global_x, global_y);
+            std.debug.assert(warped);
+            if (self.seat_adapter.pendingOutbound() != 0) self.markProtocolAll(ProtocolReady.seat);
             self.requestCursorRedraw() catch {};
         }
 
@@ -6749,6 +6826,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 !std.mem.eql(u8, name, "zwp_input_method_manager_v2") and
                 !std.mem.eql(u8, name, "zwp_virtual_keyboard_manager_v1") and
                 !std.mem.eql(u8, name, "zwlr_virtual_pointer_manager_v1") and
+                !std.mem.eql(u8, name, "xx_hotkey_manager_v1") and
                 !std.mem.eql(u8, name, "ext_transient_seat_manager_v1") and
                 !std.mem.eql(u8, name, "ext_foreign_toplevel_list_v1") and
                 !std.mem.eql(u8, name, "zwlr_foreign_toplevel_manager_v1") and
@@ -6890,6 +6968,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .name = "transient",
                 .keymap = protocol_seat.default_keymap,
             });
+            adapter.timestamps = &self.input_timestamps_adapter;
         }
 
         fn resolveVirtualPointerOutput(
@@ -7052,6 +7131,17 @@ pub fn Coordinator(comptime protocol: type) type {
             return true;
         }
 
+        fn syncHotkeyPolicy(self: *Self) !void {
+            try self.hotkey_adapter.setBlocked(self.sessionLockActive() or
+                self.shortcuts_inhibit_adapter.shortcutsInhibited() or self.input_method_adapter.activeGrab() != null);
+        }
+
+        fn validateHotkeyActivation(context: *anyopaque, peer: wayring.io_uring.Peer, seat: u32, serial: u32) bool {
+            const self: *Self = @ptrCast(@alignCast(context));
+            self.syncHotkeyPolicy() catch return false;
+            return self.hotkey_adapter.authorizeActivation(peer, seat, serial, monotonicNs() catch return false);
+        }
+
         fn validateActivation(
             context: *anyopaque,
             peer: wayring.io_uring.Peer,
@@ -7121,8 +7211,18 @@ pub fn Coordinator(comptime protocol: type) type {
                             request_value.surface,
                             .{ .x = request_value.hotspot.x, .y = request_value.hotspot.y },
                         );
-                        try self.applyReady();
+                        // set_cursor supplies an absolute hotspot. Older
+                        // commits waiting for admission must not offset it.
+                        self.cursor_offset_sequence = if (request_value.surface) |id|
+                            (try self.adapter.getSurfaceById(id)).sequence
+                        else
+                            0;
                         try self.requestCursorRedraw();
+                        self.seat_adapter.dropEvent();
+                        // Admission may update the hotspot. Do not replay the
+                        // absolute request if later content work has to retry.
+                        try self.applyReady();
+                        continue;
                     },
                     .pointer_grab_cancelled => {
                         // Retain the event until cancellation fits, and let
@@ -7307,7 +7407,9 @@ pub fn Coordinator(comptime protocol: type) type {
         fn flushProtocol(self: *Self) !void {
             try self.advancePhysicalOutputRemovals();
             try self.advanceOutputGlobals();
+            try self.advanceHotkeyGlobal();
             try self.advanceDrmLeaseGlobal();
+            try self.ensureColorProtocols();
             while (try self.manager.pollRevokedLease()) |token| {
                 self.drm_lease_adapter.leaseRevoked(token) catch continue;
                 self.markProtocolAll(ProtocolReady.drm_lease);
@@ -7325,6 +7427,9 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncWorkspace();
             self.input_method_adapter.advance();
             try self.reconcileInputMethod();
+            try self.syncHotkeyPolicy();
+            for (self.clients.items) |client| if (client.active and self.hotkey_adapter.pendingOutbound(client.peer))
+                self.markProtocol(client.peer, ProtocolReady.hotkey);
             _ = try self.refreshImageCopySources();
             if (self.image_copy_capture_adapter.refreshCursors(self)) |changed| {
                 if (changed != 0) self.markProtocolAll(ProtocolReady.image_copy_capture);
@@ -7335,6 +7440,27 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.publishPresentedSessionLock();
             for (self.clients.items) |client| if (client.active and client.protocol_ready != 0)
                 try self.flushProtocolOn(client.peer);
+        }
+
+        fn advanceHotkeyGlobal(self: *Self) !void {
+            self.hotkey_adapter.syncGlobal(&self.root.runtime) catch |err| switch (err) {
+                error.GlobalUpdateActive => return,
+                else => return err,
+            };
+            if (!self.hotkey_adapter.publishing) return;
+            while (true) switch (try self.root.runtime.publishNext()) {
+                .sent => |peer| {
+                    if (self.loop) |loop| _ = try loop.driver.schedule(peer);
+                },
+                .blocked => |peer| {
+                    if (self.loop) |loop| _ = try loop.driver.schedule(peer);
+                    return;
+                },
+                .complete => {
+                    self.hotkey_adapter.publishing = false;
+                    return;
+                },
+            };
         }
 
         fn advanceOutputGlobals(self: *Self) !void {
@@ -7791,6 +7917,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.dmabuf_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.activation != 0)
                 flushed += try self.activation_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.hotkey != 0)
+                flushed += try self.hotkey_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.relative_pointer != 0)
                 flushed += try self.relative_pointer_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.pointer_gestures != 0)
@@ -8206,6 +8334,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.activation != 0 and
                 !self.activation_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.activation;
+            if (ready & ProtocolReady.hotkey != 0 and
+                !self.hotkey_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.hotkey;
             if (ready & ProtocolReady.relative_pointer != 0 and
                 !self.relative_pointer_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.relative_pointer;
@@ -8815,8 +8946,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 ) catch return error.ActivatedOutputFailure))
                     return error.ActivatedOutputFailure;
             var name_buffer: [64]u8 = undefined;
-            std.log.info(
-                "activated output {s} at {d}x{d}, logical {d}x{d}, scale {d}/120; output={d}:{d} connector={d} crtc={d}",
+            diagnostics.logDisplay(
+                "activated output {s} at {d}x{d}, logical {d}x{d}, scale {d}/120; output={d}:{d} connector={d} crtc={d} plane={d} topology={d} scheduler_generation={d}",
                 .{
                     try drmConnectorName(&name_buffer, connector),
                     mode.hdisplay,
@@ -8828,6 +8959,9 @@ pub fn Coordinator(comptime protocol: type) type {
                     physical.id.generation,
                     connector.id,
                     snapshot.selectedCrtc().id,
+                    snapshot.selectedPlane().id,
+                    snapshot.handle.generation,
+                    generation,
                 },
             );
         }
@@ -8931,6 +9065,38 @@ pub fn Coordinator(comptime protocol: type) type {
                 return error.GlobalPublicationIncomplete;
         }
 
+        /// Color globals belong to the shared render device, not a connector.
+        /// It survives output disable/re-enable and never switches renderer on
+        /// recreation, so bound color resources remain valid while outputs sleep.
+        fn ensureColorProtocols(self: *Self) !void {
+            if (!self.color_protocols_enabled or self.stopping) return;
+            const device = self.render_device orelse return;
+            if (!device.color_management_enabled) return;
+            // Installation is not publication completion. Driver.prepare runs
+            // after coordinator preparation on every loop turn and resumes a
+            // blocked final global, including after both handles are installed.
+            if (self.color_management_adapter.global != null and
+                self.color_representation_adapter.global != null) return;
+            inline for (.{ &self.color_management_adapter, &self.color_representation_adapter }) |adapter| {
+                if (adapter.global == null) {
+                    _ = adapter.install(&self.root.runtime) catch |err| switch (err) {
+                        error.GlobalUpdateActive => return,
+                        else => return err,
+                    };
+                }
+                while (true) switch (try self.root.runtime.publishNext()) {
+                    .sent => |peer| {
+                        if (self.loop) |loop| _ = try loop.driver.schedule(peer);
+                    },
+                    .blocked => |peer| {
+                        if (self.loop) |loop| _ = try loop.driver.schedule(peer);
+                        return;
+                    },
+                    .complete => break,
+                };
+            }
+        }
+
         /// The global is advertised only after the selected renderer/KMS DRM
         /// device proves timeline-syncobj support. The duplicated descriptor
         /// survives output disable/re-enable and keeps imported timelines valid.
@@ -9006,6 +9172,8 @@ pub fn Coordinator(comptime protocol: type) type {
             const output_bounds = self.globalOutputBounds() catch return false;
             var visibility_changed = false;
             for (self.app_layers[0..self.app_layer_count]) |*layer| if (layer.active) {
+                // Cursor and drag-icon trees have their own placement path.
+                if (layer.floating) continue;
                 const id = layer.id orelse unreachable;
                 if (self.layer_shell_adapter.stateForSurface(id)) |state| {
                     if (self.physicalOutputForProtocolId(state.output)) |physical|
@@ -9895,6 +10063,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.applied_updates,
             );
             std.debug.assert(applied.len == ready.len);
+            // Consume every cursor-root delta exactly once, before attachment
+            // forwarding or discard can erase detached/superseded commits.
+            applyCursorOffsets(&self.interaction.cursor, self.cursor_offset_sequence, applied);
             forwardEffectiveAttachments(applied);
             for (applied, 0..) |*update, index| {
                 const id = update.surface;
@@ -13259,6 +13430,12 @@ pub fn Coordinator(comptime protocol: type) type {
         fn pausePhysicalOutput(self: *Self, physical: *PhysicalOutput) !void {
             const output = physical.kms_output orelse return;
             if (!output.accepting_frames) return;
+            diagnostics.logDisplay("pause-request connector={d} removing={} topology_refresh={} reconfigure={} power_transition={} session_disable={} stopping={}", .{
+                physical.connector_id,                physical.removing,
+                self.topology_refresh_pending,        self.output_reconfigure != null,
+                self.output_power_transition != null, self.session_disable_pending,
+                self.stopping,
+            });
             try self.output_adapter.setAvailable(physical.protocol_output, false);
             self.markProtocolAll(ProtocolReady.output);
             if (try output.requestPause()) |action| try self.consumeRetireAction(action);
@@ -13597,6 +13774,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.failCapturesForOutput(output.outputId());
             try self.invalidateCaptureSource(.{ .output = output.outputId() });
             try output.destroy();
+            diagnostics.logDisplay("output-destroyed connector={d}", .{physical.connector_id});
             physical.kms_output = null;
             physical.damage_applied = physical.damage_requested;
             self.clearFifoBarriersAfterOutputAttempts();
@@ -13750,6 +13928,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 error.NoConnectedOutput => return,
                 else => return cause,
             }) orelse return error.DrmHardwareUnavailable;
+            diagnostics.logDisplay("refresh-rescan path=full generation={d}", .{handle.generation});
             self.manager.clearEvents();
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
                 physical.claim = null;
@@ -13816,6 +13995,9 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn refreshChangedTopology(self: *Self) !void {
+            diagnostics.logDisplay("refresh-rescan path=changed connectors={any}", .{
+                self.hotplug_updated_connector_ids[0..self.hotplug_updated_connector_count],
+            });
             const previous = self.manager.currentHandle() orelse
                 return error.DrmHardwareUnavailable;
             var claim_count: usize = 0;
@@ -13853,12 +14035,14 @@ pub fn Coordinator(comptime protocol: type) type {
                 error.NoCompatibleCrtc,
                 error.NoPrimaryPlane,
                 => {
+                    diagnostics.logDisplay("refresh-fallback path=changed reason={t} action=pause-all", .{cause});
                     self.hotplug_updated_connector_count = 0;
                     try self.pauseAllOutputs();
                     return;
                 },
                 else => return cause,
             } orelse {
+                diagnostics.logDisplay("refresh-fallback path=changed reason=device-unavailable action=pause-all", .{});
                 self.hotplug_updated_connector_count = 0;
                 try self.pauseAllOutputs();
                 return;
@@ -13883,6 +14067,10 @@ pub fn Coordinator(comptime protocol: type) type {
             var management_update = true;
             defer if (management_update) self.output_management_adapter.endUpdate();
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                // The probe compares against the pre-unplug snapshot, so a
+                // returning connector can also be reported as changed. Its
+                // old head is retired; activateAdditionalOutputs adds it anew.
+                if (!physical.connected) continue;
                 if (physical.kms_output != null) continue;
                 if (std.mem.indexOfScalar(
                     u32,
@@ -13928,6 +14116,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn refreshActiveTopology(self: *Self) !void {
+            diagnostics.logDisplay("refresh-rescan path=preserve", .{});
             const previous = self.manager.currentHandle() orelse
                 return error.DrmHardwareUnavailable;
             var claim_count: usize = 0;
@@ -13951,6 +14140,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 error.NoCompatibleCrtc,
                 error.NoPrimaryPlane,
                 => {
+                    diagnostics.logDisplay("refresh-fallback path=preserve reason={t} action=pause-all", .{cause});
                     self.topology_refresh_draining = true;
                     try self.pauseAllOutputs();
                     return;
@@ -14392,6 +14582,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.dmabuf_adapter.resourceRemoved(handle, object);
             if (self.syncobj_adapter) |*adapter| _ = adapter.resourceRemoved(handle, object);
             _ = self.activation_adapter.resourceRemoved(handle, object);
+            _ = self.hotkey_adapter.resourceRemoved(handle, object);
             _ = self.decoration_adapter.resourceRemoved(handle, object);
             _ = self.dialog_adapter.resourceRemoved(handle, object);
             _ = self.toplevel_tag_adapter.resourceRemoved(handle, object);
@@ -14402,6 +14593,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.wayland_fixes_adapter.resourceRemoved(handle, object);
             _ = self.system_bell_adapter.resourceRemoved(handle, object);
             _ = self.relative_pointer_adapter.resourceRemoved(handle, object);
+            _ = self.input_timestamps_adapter.resourceRemoved(handle, object);
             _ = self.pointer_gestures_adapter.resourceRemoved(handle, object);
             const idle_inhibit_removed = self.idle_inhibit_adapter.resourceRemoved(handle, object);
             const idle_notify_removed = self.idle_notify_adapter.resourceRemoved(handle, object);
@@ -15192,6 +15384,24 @@ fn lastSurfaceOccurrence(surfaces: anytype, index: usize) bool {
     for (surfaces[index + 1 ..]) |later|
         if (std.meta.eql(surfaces[index], later)) return false;
     return true;
+}
+
+fn applyCursorOffsets(cursor: anytype, since: u64, applied: anytype) void {
+    const root = cursor.surface orelse return;
+    for (applied) |*update| {
+        if (!std.meta.eql(update.surface, root)) continue;
+        const state = &update.payload.surface;
+        if (state.sequence > since) {
+            const attach_x: i64 = if (state.attachment) |attachment| attachment.offset.x else 0;
+            const attach_y: i64 = if (state.attachment) |attachment| attachment.offset.y else 0;
+            cursor.hotspot.x = translatedCoordinate(cursor.hotspot.x, -attach_x - @as(i64, state.offset.x));
+            cursor.hotspot.y = translatedCoordinate(cursor.hotspot.y, -attach_y - @as(i64, state.offset.y));
+        }
+        // Cursor placement now has one source of truth, shared by screen
+        // composition and capture metadata. Do not also move its buffer.
+        state.offset = .{ .x = 0, .y = 0 };
+        if (state.attachment) |*attachment| attachment.offset = .{ .x = 0, .y = 0 };
+    }
 }
 
 /// A later commit without wl_surface.attach retains the attachment transition
@@ -16139,6 +16349,46 @@ test "physical: retained candidate matches only its exact pending owner" {
         .id = Id{ .index = 5, .generation = 8 },
         .handle = Handle{ .id = 15, .generation = 18 },
     }));
+}
+
+test "gtk cursor offsets consume all commits before coalescing and respect absolute resets" {
+    const Cursor = @import("../scene/cursor.zig").Cursor(u8);
+    const Applied = struct {
+        surface: u8,
+        payload: struct {
+            surface: struct {
+                sequence: u64,
+                offset: geometry.Point = .{ .x = 0, .y = 0 },
+                attachment: ?struct { buffer: ?u8, offset: geometry.Point = .{ .x = 0, .y = 0 } } = null,
+            },
+        },
+    };
+    var cursor: Cursor = .{ .surface = 1, .hotspot = .{ .x = 7, .y = 11 } };
+    var updates = [_]Applied{
+        // This commit predates set_cursor's absolute hotspot, even if its
+        // renderer work has not yet run. Its delta must not be replayed.
+        .{ .surface = 1, .payload = .{ .surface = .{ .sequence = 4, .offset = .{ .x = 100, .y = -100 } } } },
+        .{ .surface = 1, .payload = .{ .surface = .{ .sequence = 5, .offset = .{ .x = 3, .y = -2 } } } },
+        // A detached commit still updates the hotspot, and another surface
+        // (including a subsurface) must retain its own offset unchanged.
+        .{ .surface = 1, .payload = .{ .surface = .{ .sequence = 6, .offset = .{ .x = -5, .y = 4 }, .attachment = .{ .buffer = null } } } },
+        .{ .surface = 2, .payload = .{ .surface = .{ .sequence = 7, .offset = .{ .x = 9, .y = 13 } } } },
+        .{ .surface = 1, .payload = .{ .surface = .{ .sequence = 7, .attachment = .{ .buffer = 2, .offset = .{ .x = 1, .y = 6 } } } } },
+    };
+    applyCursorOffsets(&cursor, 4, &updates);
+    try std.testing.expectEqual(geometry.Point{ .x = 8, .y = 3 }, cursor.hotspot);
+    try std.testing.expectEqual(geometry.Point{ .x = 9, .y = 13 }, updates[3].payload.surface.offset);
+    for (updates) |update| if (update.surface == 1) {
+        try std.testing.expectEqual(geometry.Point{ .x = 0, .y = 0 }, update.payload.surface.offset);
+        if (update.payload.surface.attachment) |attachment|
+            try std.testing.expectEqual(geometry.Point{ .x = 0, .y = 0 }, attachment.offset);
+    };
+    // Retrying later render work cannot apply already-consumed deltas twice.
+    applyCursorOffsets(&cursor, 4, &updates);
+    try std.testing.expectEqual(geometry.Point{ .x = 8, .y = 3 }, cursor.hotspot);
+    cursor.request(1, .{ .x = 2, .y = 5 });
+    applyCursorOffsets(&cursor, 7, &updates);
+    try std.testing.expectEqual(geometry.Point{ .x = 2, .y = 5 }, cursor.hotspot);
 }
 
 test "physical: superseded attachment transitions advance to the final commit" {

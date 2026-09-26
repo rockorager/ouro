@@ -1,7 +1,9 @@
 //! Bounded xdg-activation-v1 owner with one-shot, unguessable tokens.
 //!
-//! Tokens are only effective when committed with the exact focused surface
-//! and most recent user-action serial. Invalid requests still receive an
+//! Ordinary tokens require the exact focused surface and most recent
+//! user-action serial. An optional, separate hotkey validator can admit a
+//! one-shot global user interaction without a focused surface.
+//! Invalid requests still receive an
 //! opaque token, as required by the protocol, but that token is never admitted
 //! to the activation table. Valid tokens may cross client connections and are
 //! consumed by the first matching activate request.
@@ -55,6 +57,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 SurfaceId,
             ) bool,
         };
+        pub const HotkeyValidator = struct {
+            context: *anyopaque,
+            validate: *const fn (*anyopaque, wayring.io_uring.Peer, u32, u32) bool,
+        };
 
         const ManagerSlot = struct {
             header: slot_pool.Header = .{},
@@ -92,6 +98,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         done_pending_len: usize = 0,
         next_sequence: u64 = 1,
         validator: ?SerialValidator = null,
+        hotkey_validator: ?HotkeyValidator = null,
 
         pub fn init(allocator: std.mem.Allocator, core: *CoreSurface, config: Config) !Self {
             try config.validate();
@@ -247,6 +254,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             slot.done_pending = true;
             self.done_pending_len += 1;
             const serial = slot.serial orelse return;
+            if (self.hotkey_validator) |validator| {
+                if (validator.validate(validator.context, slot.peer, serial.seat_object, serial.value)) {
+                    self.admitIssued(slot.token);
+                    return;
+                }
+            }
             const surface = slot.surface orelse return;
             const validator = self.validator orelse return;
             if (!validator.validate(

@@ -80,6 +80,7 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
         };
         pub const Command = union(enum) {
             pointer_focus: ?Target,
+            pointer_relocated: ?Target,
             keyboard_focus: Target,
             cancel: Cancellation,
             key_consumed,
@@ -369,9 +370,13 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             return self.output_areas[0..self.output_area_len];
         }
 
+        pub fn canWarpPointer(self: *const Self, x_fixed: i64, y_fixed: i64) bool {
+            return fixedPointInAreas(x_fixed, y_fixed, self.outputAreas());
+        }
+
         /// Applies a validated surface-local warp without synthesizing input.
         pub fn warpPointer(self: *Self, target: Target, x_fixed: i64, y_fixed: i64) bool {
-            if (!fixedPointInAreas(x_fixed, y_fixed, self.outputAreas())) return false;
+            if (!self.canWarpPointer(x_fixed, y_fixed)) return false;
             self.x_fixed = x_fixed;
             self.y_fixed = y_fixed;
             self.hover = target;
@@ -434,9 +439,13 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             self.bounds = bounds;
             @memcpy(self.output_areas[0..output_areas.len], output_areas);
             self.output_area_len = output_areas.len;
-            const clamped = clampFixedToAreas(self.x_fixed, self.y_fixed, self.outputAreas());
-            self.x_fixed = clamped.x;
-            self.y_fixed = clamped.y;
+            // If the cursor's output disappeared, make it easy to find on a
+            // remaining output. Preserve exact positions that are still valid.
+            if (!fixedPointInAreas(self.x_fixed, self.y_fixed, self.outputAreas())) {
+                const area = self.output_areas[0];
+                self.x_fixed = @as(i64, area.x) * 256 + @as(i64, area.width) * 128;
+                self.y_fixed = @as(i64, area.y) * 256 + @as(i64, area.height) * 128;
+            }
             self.cursor.move(self.pointerPosition());
         }
 
@@ -608,7 +617,13 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             if (self.mode != .default) return;
             const target = try self.targetAtPointer(desktop, surfaces, self.x_fixed, self.y_fixed);
             try self.ensureCommandCapacity(1);
-            if (!std.meta.eql(self.hover, target)) self.enqueue(.{ .pointer_focus = target });
+            if (!std.meta.eql(self.hover, target)) {
+                if (self.hover != null and target != null and
+                    std.meta.eql(self.hover.?.surface, target.?.surface))
+                {
+                    self.enqueue(.{ .pointer_relocated = target });
+                } else self.enqueue(.{ .pointer_focus = target });
+            }
             self.hover = target;
             self.pointer_inside = target != null;
             self.resize_handle = if (target != null and !target.?.managed) null else try desktop.resizeHandleAt(self.pointerPosition());
@@ -1043,7 +1058,7 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             while (offset < self.command_len) : (offset += 1) {
                 const command = self.commands[(self.command_head + offset) % self.commands.len];
                 switch (command) {
-                    .pointer_focus, .keyboard_focus => continue,
+                    .pointer_focus, .pointer_relocated, .keyboard_focus => continue,
                     else => {},
                 }
                 self.commands[(self.command_head + retained) % self.commands.len] = command;
@@ -1152,7 +1167,7 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             surface: ?SurfaceId,
         ) bool {
             return switch (command) {
-                .pointer_focus => |target| matches(target, toplevel, surface),
+                .pointer_focus, .pointer_relocated => |target| matches(target, toplevel, surface),
                 .keyboard_focus => |target| matches(target, toplevel, surface),
                 .cancel => false,
                 .key_consumed => false,
@@ -1746,6 +1761,21 @@ test "interaction: stationary pointer reflow does not override policy keyboard f
     interaction.dropCommand();
     try std.testing.expectEqual(desktop.windows[0].surface, interaction.keyboard_focus.?.surface);
     try std.testing.expectEqual(desktop.windows[0].id, desktop.focused.?);
+
+    // Moving the same surface beneath a stationary pointer is relocation,
+    // not device motion or a new enter, and keeps policy-selected focus.
+    const position = interaction.pointerPositionFixed();
+    desktop.windows[1].geometry.x = 11;
+    try interaction.reconcilePointer(&desktop, &surfaces);
+    const relocated = interaction.peekCommand().?.pointer_relocated.?;
+    try std.testing.expectEqual(desktop.windows[1].surface, relocated.surface);
+    // Initial (1, 1) plus physical motion (12, 7), minus window (11, 5).
+    try std.testing.expectEqual(@as(i32, 2 * 256), relocated.point.x);
+    try std.testing.expectEqual(@as(i32, 3 * 256), relocated.point.y);
+    try std.testing.expectEqual(position, interaction.pointerPositionFixed());
+    interaction.dropCommand();
+    try interaction.reconcilePointer(&desktop, &surfaces);
+    try std.testing.expectEqual(@as(usize, 0), interaction.pendingCommands());
 
     // Actual movement still follows the mouse.
     try interaction.consume(&desktop, &surfaces, .{ .pointer_motion = .{
@@ -2429,8 +2459,42 @@ test "interaction: pointer cannot remain between disjoint outputs" {
 
     const remaining = [_]geometry.Rect{areas[0]};
     interaction.applyTopology(areas[0], &remaining);
-    try std.testing.expectEqual(geometry.Point{ .x = 9, .y = 9 }, interaction.pointerPosition());
+    try std.testing.expectEqual(geometry.Point{ .x = 5, .y = 5 }, interaction.pointerPosition());
     try std.testing.expectEqual(interaction.pointerPosition(), interaction.cursor.position);
+}
+
+test "interaction: output removal centers only an off-screen pointer" {
+    var interaction = try initTestInteraction(2);
+    defer interaction.deinit();
+    const areas = [_]geometry.Rect{
+        .{ .x = -31, .y = -17, .width = 11, .height = 7 },
+        .{ .x = 0, .y = 0, .width = 20, .height = 15 },
+        .{ .x = 20, .y = 5, .width = 10, .height = 10 },
+    };
+    const bounds: geometry.Rect = .{ .x = -31, .y = -17, .width = 61, .height = 32 };
+    const remaining = [_]geometry.Rect{ areas[0], areas[2] };
+    const cases = [_]struct { position: TestInteraction.GlobalFixedPoint, expected: TestInteraction.GlobalFixedPoint }{
+        // Just outside the survivor, but still inside the union bounds:
+        // move to (-25.5, -13.5), the first remaining output's exact center.
+        .{ .position = .{ .x = 20 * 256 - 1, .y = 7 * 256 }, .expected = .{ .x = -6528, .y = -3456 } },
+        .{ .position = .{ .x = 20 * 256, .y = 7 * 256 }, .expected = .{ .x = 20 * 256, .y = 7 * 256 } },
+        .{ .position = .{ .x = 7616, .y = 1344 }, .expected = .{ .x = 7616, .y = 1344 } },
+        .{ .position = .{ .x = -7872, .y = -4160 }, .expected = .{ .x = -7872, .y = -4160 } },
+    };
+    for (cases) |case| {
+        interaction.applyTopology(bounds, &areas);
+        try std.testing.expect(interaction.warpPointer(
+            targetFor(testDesktop().windows[0]),
+            case.position.x,
+            case.position.y,
+        ));
+        interaction.applyTopology(bounds, &remaining);
+        try std.testing.expectEqual(case.expected, interaction.pointerPositionFixed());
+        try std.testing.expectEqual(interaction.pointerPosition(), interaction.cursor.position);
+        // Reconnecting an output must not move a cursor already on screen.
+        interaction.applyTopology(bounds, &areas);
+        try std.testing.expectEqual(case.expected, interaction.pointerPositionFixed());
+    }
 }
 
 test "interaction: mapped motion retains exact fixed pointer state" {

@@ -74,6 +74,36 @@ pub const State = struct {
         );
     }
 
+    /// Hotkeys use level zero in every layout, not just the active group.
+    pub fn matches(self: *const State, evdev_code: u32, keysym: u32) bool {
+        if (evdev_code > 767) return false;
+        const keycode = evdev_code + 8;
+        for (0..c.xkb_keymap_num_layouts_for_key(self.keymap, keycode)) |layout| {
+            var syms: [*c]const c.xkb_keysym_t = null;
+            const count = c.xkb_keymap_key_get_syms_by_level(self.keymap, keycode, @intCast(layout), 0, &syms);
+            for (0..@intCast(count)) |i| if (syms[i] == keysym) return true;
+        }
+        return false;
+    }
+
+    pub fn overlaps(self: *const State, a: u32, b: u32) bool {
+        if (a == b) return true;
+        for (0..768) |code| {
+            const key: u32 = @intCast(code);
+            if (self.matches(key, a) and self.matches(key, b)) return true;
+        }
+        return false;
+    }
+
+    /// Custom keymaps can make an ordinary-looking keysym a modifier. Such a
+    /// key must never be swallowed as a normal hotkey (modifier taps are denied).
+    pub fn changesModifiers(self: *const State, evdev_code: u32) bool {
+        const probe = c.xkb_state_new(self.keymap) orelse return true;
+        defer c.xkb_state_unref(probe);
+        _ = c.xkb_state_update_mask(probe, c.xkb_state_serialize_mods(self.state, c.XKB_STATE_MODS_DEPRESSED), c.xkb_state_serialize_mods(self.state, c.XKB_STATE_MODS_LATCHED), c.xkb_state_serialize_mods(self.state, c.XKB_STATE_MODS_LOCKED), c.xkb_state_serialize_layout(self.state, c.XKB_STATE_LAYOUT_DEPRESSED), c.xkb_state_serialize_layout(self.state, c.XKB_STATE_LAYOUT_LATCHED), c.xkb_state_serialize_layout(self.state, c.XKB_STATE_LAYOUT_LOCKED));
+        return c.xkb_state_update_key(probe, evdev_code + 8, c.XKB_KEY_DOWN) != 0;
+    }
+
     fn modifierActive(self: *const State, name: [*:0]const u8) bool {
         return c.xkb_state_mod_name_is_active(
             self.state,
@@ -96,4 +126,28 @@ test "semantic trigger follows active modifier state" {
         c.xkb_keysym_from_name("j", c.XKB_KEYSYM_NO_FLAGS),
         trigger.keysym,
     );
+}
+
+test "hotkey: level zero matching spans layouts and ignores lock modifiers" {
+    const context = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS) orelse return error.XkbContextFailed;
+    const names: c.xkb_rule_names = .{ .layout = "us,de" };
+    const map = c.xkb_keymap_new_from_names(context, &names, c.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse return error.XkbKeymapFailed;
+    const xkb = c.xkb_state_new(map) orelse return error.XkbStateFailed;
+    var state: State = .{ .context = context, .keymap = map, .state = xkb };
+    defer state.deinit();
+    // The US Y position is Z in German. Both bind in either active group.
+    try std.testing.expect(state.matches(21, 'y'));
+    try std.testing.expect(state.matches(21, 'z'));
+    try std.testing.expect(!state.matches(21, 'x'));
+    try std.testing.expect(state.overlaps('y', 'z'));
+    try std.testing.expect(!state.overlaps('x', 'z'));
+    _ = c.xkb_state_update_mask(xkb, 0, 0, 0, 0, 0, 1);
+    state.update(58, true); // Caps Lock
+    state.update(58, false);
+    state.update(42, true); // Shift
+    try std.testing.expect(state.matches(21, 'y') and state.matches(21, 'z'));
+    try std.testing.expect(!state.matches(21, 'Y'));
+    try std.testing.expectEqual(@as(u4, 1), @as(u4, @bitCast(state.trigger(21).modifiers)));
+    try std.testing.expect(state.changesModifiers(29));
+    try std.testing.expect(!state.changesModifiers(21));
 }

@@ -19,6 +19,357 @@ const pixels = [_]u8{
     0xa0, 0xb0, 0xc0, 0xff, 0xd0, 0xe0, 0xf0, 0xff, 0x11, 0x22, 0x33, 0xff, 0, 0, 0, 0,
 };
 
+test "hotkey: generated client defaults, opt-out, consumed pairs and unfocused activation" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-hotkey-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 96;
+    root_config.runtime.object_quota = 64;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
+    var config = physical_fixture.coordinatorConfig();
+    config.router_capacity = 32;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    // Startup installs the parsed configuration before accepting clients.
+    try installHotkeyConfig(coordinator, "{}");
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 32 });
+    try coordinator.start(&loop);
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var client = try ClientConnection.attach(allocator, &reactor, try wayring.unix_socket.connect(path), .{ .received_fd_budget = 2, .transmit_byte_budget = 8192, .transmit_fd_budget = 2 }, .{ .max_objects = 64, .max_client_ids = 63 });
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: HotkeyHandler = .{ .queue = &actor.transmit, .app = .{ .objects = &client.objects, .queue = &actor.transmit, .registry = registry } };
+    try submitClient(&reactor, &driver, &handler);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    const device: ouro.input_backend.DeviceId = .{ .slot = 7, .generation = 1, .seat_generation = 1 };
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{ .device = device, .info = .{ .capabilities = .{ .keyboard = true, .pointer = true } } } }));
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.app.frame_done_order != 0 and handler.app.input_ready) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(handler.app.mapped and handler.app.input_ready);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.bound == 1 and handler.denied == 2) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(handler.manager != null);
+    try std.testing.expectEqual(@as(usize, 1), handler.bound);
+    try std.testing.expectEqual(@as(usize, 2), handler.denied);
+    try std.testing.expectEqual(@as(u32, 0), handler.last_denied); // compositor Super+Q conflict
+    // Manager destruction leaves its children valid, including recommits.
+    try wayring.client.sendRequest(protocol.xx_hotkey_manager_v1, &client.objects, &actor.transmit, handler.manager.?, .{ .destroy = .{} });
+    try protocol.xx_hotkey_v1.encodeRequest(&actor.transmit, handler.hotkey.?.id, .{ .commit = .{} });
+    try submitClient(&reactor, &driver, &handler);
+    for (0..64) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.bound == 2) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.bound);
+    const key_count = handler.app.keyboard_key;
+    // Ctrl+Alt+P, duplicate press, modifiers released first, then P release.
+    for ([_]struct { u32, bool }{ .{ 29, true }, .{ 56, true }, .{ 25, true }, .{ 25, true }, .{ 29, false }, .{ 56, false }, .{ 25, false } }, 0..) |key, i|
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .keyboard_key = .{ .device = device, .time_usec = (20 + i) * 1000, .key = key[0], .pressed = key[1] } }));
+    for (0..64) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.released == 1) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.triggered);
+    try std.testing.expectEqual(@as(usize, 1), handler.released);
+    try std.testing.expectEqual(@as(u32, 22), handler.trigger_time);
+    try std.testing.expectEqual(@as(u32, 26), handler.release_time);
+    try std.testing.expectEqual(key_count + 4, handler.app.keyboard_key);
+
+    // Hide the application and clear keyboard focus. Its hotkey serial, with
+    // no set_surface at all, must authorize activation from this unfocused peer.
+    try coordinator.switchWorkspace(2);
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.seat_adapter.keyboard_focus == null) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(coordinator.seat_adapter.keyboard_focus == null);
+    for ([_]struct { u32, bool }{ .{ 29, true }, .{ 56, true }, .{ 25, true }, .{ 29, false }, .{ 56, false }, .{ 25, false } }, 0..) |key, i|
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .keyboard_key = .{ .device = device, .time_usec = (40 + i) * 1000, .key = key[0], .pressed = key[1] } }));
+    for (0..64) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.released == 2) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.triggered);
+    try std.testing.expectEqual(@as(usize, 2), handler.released);
+    try std.testing.expectEqual(key_count + 4, handler.app.keyboard_key);
+    try std.testing.expect(coordinator.seat_adapter.keyboard_focus == null);
+    try handler.requestActivation(handler.trigger_serial);
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.activation_done == 1 and coordinator.seat_adapter.keyboard_focus != null) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.activation_done);
+    try std.testing.expect(coordinator.seat_adapter.keyboard_focus != null);
+    // Same serial cannot mint another effective token.
+    try coordinator.switchWorkspace(2);
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.seat_adapter.keyboard_focus == null) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(coordinator.seat_adapter.keyboard_focus == null);
+    try handler.requestActivation(handler.trigger_serial);
+    try submitClient(&reactor, &driver, &handler);
+    for (0..64) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.activation_done);
+    try std.testing.expect(coordinator.seat_adapter.keyboard_focus == null);
+
+    try coordinator.switchWorkspace(1);
+    try protocol.xx_hotkey_v1.encodeRequest(&actor.transmit, handler.hotkey.?.id, .{ .set_button_trigger = .{ .button = 275, .modifiers = .{ .value = 0 } } });
+    try protocol.xx_hotkey_v1.encodeRequest(&actor.transmit, handler.hotkey.?.id, .{ .commit = .{} });
+    try submitClient(&reactor, &driver, &handler);
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.bound == 3 and coordinator.seat_adapter.keyboard_focus != null) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 3), handler.bound);
+    const inhibitor = (try protocol.zwp_keyboard_shortcuts_inhibit_manager_v1.construct_inhibit_shortcuts(&client.objects, &actor.transmit, handler.shortcut_manager.?, .{ .seat = handler.app.seat.?.id, .surface = handler.app.surface.?.id })).id;
+    try submitClient(&reactor, &driver, &handler);
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.hotkey_adapter.blocked) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(coordinator.shortcuts_inhibit_adapter.shortcutsInhibited());
+    for ([_]bool{ true, false }) |pressed|
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{ .device = device, .time_usec = 60_000, .button = 275, .pressed = pressed } }));
+    try wayring.client.sendRequest(protocol.zwp_keyboard_shortcuts_inhibitor_v1, &client.objects, &actor.transmit, inhibitor, .{ .destroy = .{} });
+    try submitClient(&reactor, &driver, &handler);
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!coordinator.hotkey_adapter.blocked) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(!coordinator.hotkey_adapter.blocked);
+    try std.testing.expectEqual(@as(usize, 2), handler.triggered);
+    const method = (try protocol.zwp_input_method_manager_v2.construct_get_input_method(&client.objects, &actor.transmit, handler.method_manager.?, .{ .seat = handler.app.seat.?.id })).input_method;
+    const grab = (try protocol.zwp_input_method_v2.construct_grab_keyboard(&client.objects, &actor.transmit, method, .{})).keyboard;
+    try submitClient(&reactor, &driver, &handler);
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.hotkey_adapter.blocked) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(coordinator.input_method_adapter.activeGrab() != null);
+    for ([_]bool{ true, false }) |pressed|
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{ .device = device, .time_usec = 70_000, .button = 275, .pressed = pressed } }));
+    try wayring.client.sendRequest(protocol.zwp_input_method_keyboard_grab_v2, &client.objects, &actor.transmit, grab, .{ .release = .{} });
+    try wayring.client.sendRequest(protocol.zwp_input_method_v2, &client.objects, &actor.transmit, method, .{ .destroy = .{} });
+    try submitClient(&reactor, &driver, &handler);
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!coordinator.hotkey_adapter.blocked) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(!coordinator.hotkey_adapter.blocked);
+    try std.testing.expectEqual(@as(usize, 2), handler.triggered);
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{ .device = device, .time_usec = 80_000, .button = 275, .pressed = true } }));
+    _ = try protocol.ext_session_lock_manager_v1.construct_lock(&client.objects, &actor.transmit, handler.lock_manager.?, .{});
+    try submitClient(&reactor, &driver, &handler);
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.revoked == 1) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 3), handler.triggered);
+    try std.testing.expectEqual(@as(usize, 1), handler.revoked);
+    try std.testing.expect(coordinator.hotkey_adapter.blocked);
+    for ([_]bool{ false, true, false }) |pressed|
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{ .device = device, .time_usec = 90_000, .button = 275, .pressed = pressed } }));
+    try installHotkeyConfig(coordinator, "{\"general\":{\"experimental_hotkeys\":false}}");
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.revoked == 1 and handler.global_removed) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.revoked);
+    try std.testing.expectEqual(@as(usize, 3), handler.triggered);
+    try std.testing.expectEqual(@as(usize, 2), handler.released);
+    try std.testing.expect(handler.global_removed);
+    try std.testing.expectEqual(@as(usize, 0), handler.app.event_failures);
+    _ = try client.prepareClose();
+    try submitClient(&reactor, &driver, &handler);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..512) |_| {
+        const c = try drainClient(&reactor, &driver, &handler);
+        const p = try loop.turn(coordinator);
+        if (c.quiescent and p.wayring.shutdown_complete and coordinator.backendDrainComplete()) {
+            drained = true;
+            break;
+        }
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
+fn installHotkeyConfig(coordinator: *Coordinator, source: []const u8) !void {
+    var reference = try ouro.config.mergeSources(std.testing.allocator, &.{source});
+    defer reference.deinit();
+    var snapshot = try Coordinator.Bindings.snapshotFromReferenceConfig(std.testing.allocator, &reference);
+    errdefer snapshot.deinit();
+    try coordinator.installKeyConsumerSnapshot(&snapshot);
+}
+
+const HotkeyHandler = struct {
+    app: Handler,
+    queue: *wayring.tx.Queue,
+    manager: ?wayring.objects.Handle = null,
+    hotkey: ?wayring.objects.Handle = null,
+    activation: ?wayring.objects.Handle = null,
+    token: ?wayring.objects.Handle = null,
+    shortcut_manager: ?wayring.objects.Handle = null,
+    method_manager: ?wayring.objects.Handle = null,
+    lock_manager: ?wayring.objects.Handle = null,
+    global: u32 = 0,
+    global_removed: bool = false,
+    bound: usize = 0,
+    denied: usize = 0,
+    last_denied: u32 = 0,
+    triggered: usize = 0,
+    released: usize = 0,
+    revoked: usize = 0,
+    trigger_serial: u32 = 0,
+    trigger_time: u32 = 0,
+    release_time: u32 = 0,
+    activation_done: usize = 0,
+
+    pub fn eventError(self: *@This(), peer: wayring.io_uring.Peer, failure: ClientCore.EventFailure) void {
+        self.app.eventError(peer, failure);
+    }
+
+    pub fn event(self: *@This(), target: wayring.objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
+        if (target.object.interface == &protocol.wl_registry.info) {
+            switch (try protocol.wl_registry.decodeEvent(message, fds)) {
+                .global => |g| {
+                    if (std.mem.eql(u8, g.interface, protocol.xx_hotkey_manager_v1.info.name)) {
+                        self.global = g.name;
+                    }
+                    if (std.mem.eql(u8, g.interface, protocol.xdg_activation_v1.info.name))
+                        self.activation = try ClientCore.bind(self.app.objects, self.queue, self.app.registry, g.name, &protocol.xdg_activation_v1.info, 1, null);
+                    if (std.mem.eql(u8, g.interface, protocol.zwp_keyboard_shortcuts_inhibit_manager_v1.info.name))
+                        self.shortcut_manager = try ClientCore.bind(self.app.objects, self.queue, self.app.registry, g.name, &protocol.zwp_keyboard_shortcuts_inhibit_manager_v1.info, 1, null);
+                    if (std.mem.eql(u8, g.interface, protocol.zwp_input_method_manager_v2.info.name))
+                        self.method_manager = try ClientCore.bind(self.app.objects, self.queue, self.app.registry, g.name, &protocol.zwp_input_method_manager_v2.info, 1, null);
+                    if (std.mem.eql(u8, g.interface, protocol.ext_session_lock_manager_v1.info.name))
+                        self.lock_manager = try ClientCore.bind(self.app.objects, self.queue, self.app.registry, g.name, &protocol.ext_session_lock_manager_v1.info, 1, null);
+                },
+                .global_remove => |g| if (g.name == self.global) {
+                    self.global_removed = true;
+                },
+            }
+            _ = try self.app.event(target, message, fds);
+            // Registry order is unspecified, so wait for both globals.
+            if (self.manager == null and self.global != 0 and self.app.seat != null) {
+                self.manager = try ClientCore.bind(self.app.objects, self.queue, self.app.registry, self.global, &protocol.xx_hotkey_manager_v1.info, 1, null);
+                try protocol.xx_hotkey_manager_v1.encodeRequest(self.queue, self.manager.?.id, .{ .set_app_id = .{ .app_id = "ouro.hotkey.test" } });
+                self.hotkey = (try protocol.xx_hotkey_manager_v1.construct_create_hotkey(self.app.objects, self.queue, self.manager.?, .{})).id;
+                try protocol.xx_hotkey_v1.encodeRequest(self.queue, self.hotkey.?.id, .{ .set_seat = .{ .seat = self.app.seat.?.id } });
+                try self.describe(self.hotkey.?, 'p', 6);
+                const denied = (try protocol.xx_hotkey_manager_v1.construct_create_hotkey(self.app.objects, self.queue, self.manager.?, .{})).id;
+                try self.describe(denied, 'a', 0); // unsafe text
+                try self.describe(denied, 'q', 8); // compositor conflict
+            }
+            return .continue_dispatch;
+        } else if (target.object.interface == &protocol.zwp_keyboard_shortcuts_inhibitor_v1.info) {
+            _ = try protocol.zwp_keyboard_shortcuts_inhibitor_v1.decodeEvent(message, fds);
+            return .continue_dispatch;
+        } else if (target.object.interface == &protocol.zwp_input_method_v2.info) {
+            _ = try protocol.zwp_input_method_v2.decodeEvent(message, fds);
+            return .continue_dispatch;
+        } else if (target.object.interface == &protocol.zwp_input_method_keyboard_grab_v2.info) {
+            const v = try protocol.zwp_input_method_keyboard_grab_v2.decodeEvent(message, fds);
+            if (v == .keymap) _ = linux.close(v.keymap.fd);
+            return .continue_dispatch;
+        } else if (target.object.interface == &protocol.ext_session_lock_v1.info) {
+            _ = try protocol.ext_session_lock_v1.decodeEvent(message, fds);
+            return .continue_dispatch;
+        } else if (target.object.interface == &protocol.xx_hotkey_v1.info) {
+            switch (try protocol.xx_hotkey_v1.decodeEvent(message, fds)) {
+                .bound => self.bound += 1,
+                .denied => |v| {
+                    self.denied += 1;
+                    self.last_denied = v.reason.value;
+                },
+                .revoked => self.revoked += 1,
+                .triggered => |v| {
+                    self.triggered += 1;
+                    self.trigger_serial = v.serial;
+                    self.trigger_time = v.time;
+                },
+                .released => |v| {
+                    self.released += 1;
+                    self.release_time = v.time;
+                },
+            }
+            return .continue_dispatch;
+        } else if (target.object.interface == &protocol.xdg_activation_token_v1.info) {
+            const v = try protocol.xdg_activation_token_v1.decodeEvent(message, fds);
+            try protocol.xdg_activation_v1.encodeRequest(self.queue, self.activation.?.id, .{ .activate = .{ .token = v.done.token, .surface = self.app.surface.?.id } });
+            try wayring.client.sendRequest(protocol.xdg_activation_token_v1, self.app.objects, self.queue, self.token.?, .{ .destroy = .{} });
+            self.token = null;
+            self.activation_done += 1;
+            return .continue_dispatch;
+        }
+        return self.app.event(target, message, fds);
+    }
+
+    fn describe(self: *@This(), hotkey: wayring.objects.Handle, keysym: u32, modifiers: u32) !void {
+        try protocol.xx_hotkey_v1.encodeRequest(self.queue, hotkey.id, .{ .set_key_trigger = .{ .keysym = keysym, .modifiers = .{ .value = modifiers } } });
+        try protocol.xx_hotkey_v1.encodeRequest(self.queue, hotkey.id, .{ .commit = .{} });
+    }
+
+    fn requestActivation(self: *@This(), serial: u32) !void {
+        self.token = (try protocol.xdg_activation_v1.construct_get_activation_token(self.app.objects, self.queue, self.activation.?, .{})).id;
+        try protocol.xdg_activation_token_v1.encodeRequest(self.queue, self.token.?.id, .{ .set_serial = .{ .seat = self.app.seat.?.id, .serial = serial } });
+        try protocol.xdg_activation_token_v1.encodeRequest(self.queue, self.token.?.id, .{ .commit = .{} });
+    }
+};
+
 test "shell-input: core compatibility extensions cross generated runtime" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
@@ -67,15 +418,18 @@ test "shell-input: core compatibility extensions cross generated runtime" {
         _ = linux.sched_yield();
     }
     try std.testing.expect(handler.fixes != null);
-    try std.testing.expectEqual(@as(u32, 1), handler.fixes_version);
+    try std.testing.expectEqual(@as(u32, 2), handler.fixes_version);
     try std.testing.expect(handler.system_bell != null);
     try std.testing.expectEqual(@as(u32, 1), handler.system_bell_version);
     try std.testing.expect(handler.toplevel_drag_manager != null);
     try std.testing.expect(handler.toplevel_icon_manager != null);
     try std.testing.expectEqual(@as(usize, 1), handler.toplevel_icon_done);
-    try std.testing.expectEqual(@as(u32, 5), handler.gtk_shell_version);
+    try std.testing.expectEqual(@as(u32, 7), handler.gtk_shell_version);
     try std.testing.expectEqual(@as(usize, 1), handler.gtk_capabilities);
 
+    try wayring.client.sendRequest(protocol.gtk_surface1, &client.objects, &actor.transmit, handler.gtk_surface.?, .{
+        .set_a11y_properties = .{ .a11y_dbus_name = ":1.42", .toplevel_object_path = "/accessible/7" },
+    });
     try protocol.gtk_surface1.encodeRequest(
         &actor.transmit,
         handler.gtk_surface.?.id,
@@ -89,6 +443,24 @@ test "shell-input: core compatibility extensions cross generated runtime" {
         } },
     );
     try protocol.gtk_surface1.encodeRequest(&actor.transmit, handler.gtk_surface.?.id, .{ .set_modal = .{} });
+    try submitClient(&reactor, &driver, &handler);
+    for (0..64) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        _ = linux.sched_yield();
+    }
+    const server_objects = try root.runtime.clients.get(coordinator.peer.?);
+    const sid = try coordinator.adapter.surfaceIdOn(server_objects, handler.surface.?.id);
+    const metadata = coordinator.gtk_shell_adapter.metadata(sid).?;
+    try std.testing.expectEqualStrings("org.ouro.Test", metadata.dbus[0].?);
+    try std.testing.expectEqualStrings(":1.42", metadata.a11y_dbus_name.?);
+    try std.testing.expectEqualStrings("/accessible/7", metadata.toplevel_object_path.?);
+    try std.testing.expect(metadata.modal);
+    try wayring.client.sendRequest(protocol.wl_surface, &client.objects, &actor.transmit, handler.surface.?, .{ .destroy = .{} });
+    // GTK resources outlive wl_surface, but subsequent metadata requests are inert.
+    try protocol.gtk_surface1.encodeRequest(&actor.transmit, handler.gtk_surface.?.id, .{
+        .set_a11y_properties = .{ .a11y_dbus_name = "ignored", .toplevel_object_path = "/gone" },
+    });
     try wayring.client.sendRequest(
         protocol.gtk_surface1,
         &client.objects,
@@ -125,6 +497,8 @@ test "shell-input: core compatibility extensions cross generated runtime" {
         _ = try loop.turn(coordinator);
         _ = linux.sched_yield();
     }
+    try std.testing.expect(coordinator.gtk_shell_adapter.metadata(sid) == null);
+    try std.testing.expect(client.objects.namespace.resolve(handler.gtk_surface.?) == null);
     try std.testing.expect(client.objects.namespace.resolve(second_registry) == null);
     const replacement_registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
     try std.testing.expectEqual(second_registry.id, replacement_registry.id);
@@ -282,7 +656,7 @@ const WaylandFixesHandler = struct {
                     self.registry,
                     value.name,
                     &protocol.gtk_shell1.info,
-                    @min(value.version, 5),
+                    @min(value.version, 7),
                     null,
                 );
                 try self.maybeCreateGtkSurface();
@@ -1319,7 +1693,7 @@ test "shell-input: generated primary selection validates focus serial and transf
     try root.deinit();
 }
 
-test "shell-input: security context filters nested manager before registry discovery" {
+test "shell-input: hotkey: security context filters privileged globals and rejects guessed binds" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     var child_path_storage: [128]u8 = undefined;
@@ -1351,6 +1725,7 @@ test "shell-input: security context filters nested manager before registry disco
         .metadata_bytes = 64,
     };
     const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    try installHotkeyConfig(coordinator, "{}");
     var loop = try Loop.init(
         allocator,
         root,
@@ -1394,6 +1769,7 @@ test "shell-input: security context filters nested manager before registry disco
             parent_handler.input_method_global_seen and
             parent_handler.virtual_keyboard_global_seen and
             parent_handler.virtual_pointer_global_seen and
+            parent_handler.hotkey_global != null and
             parent_handler.transient_seat_global_seen and
             parent_handler.foreign_toplevel_global_seen and
             parent_handler.workspace_global_seen and
@@ -1410,6 +1786,7 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(parent_handler.input_method_global_seen);
     try std.testing.expect(parent_handler.virtual_keyboard_global_seen);
     try std.testing.expect(parent_handler.virtual_pointer_global_seen);
+    try std.testing.expect(parent_handler.hotkey_global != null);
     try std.testing.expect(parent_handler.transient_seat_global_seen);
     try std.testing.expect(parent_handler.foreign_toplevel_global_seen);
     try std.testing.expect(parent_handler.workspace_global_seen);
@@ -1513,6 +1890,7 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(!child_handler.input_method_global_seen);
     try std.testing.expect(!child_handler.virtual_keyboard_global_seen);
     try std.testing.expect(!child_handler.virtual_pointer_global_seen);
+    try std.testing.expect(child_handler.hotkey_global == null);
     try std.testing.expect(!child_handler.transient_seat_global_seen);
     try std.testing.expect(!child_handler.foreign_toplevel_global_seen);
     try std.testing.expect(!child_handler.workspace_global_seen);
@@ -1533,6 +1911,18 @@ test "shell-input: security context filters nested manager before registry disco
     const metadata = coordinator.security_context_adapter.metadata(sandbox_peer.?).?;
     try std.testing.expectEqualStrings("org.example.Sandbox", metadata.sandbox_engine.?);
     try std.testing.expectEqualStrings("org.example.Client", metadata.app_id.?);
+
+    // Discovery filtering alone is insufficient: a sandbox may learn the
+    // global name from another client. Exercise the registry's bind boundary.
+    try std.testing.expectError(error.UnknownGlobal, root.runtime.bindGlobal(sandbox_peer.?, .{ .bind = .{
+        .name = parent_handler.hotkey_global.?,
+        .id = .{
+            .interface = protocol.xx_hotkey_manager_v1.info.name,
+            .version = 1,
+            .id = 7,
+        },
+    } }));
+    try std.testing.expect((try root.runtime.clients.get(sandbox_peer.?)).namespace.lookupHandle(7) == null);
 
     _ = linux.close(close_signal);
     close_signal = -1;
@@ -2343,22 +2733,59 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 24), &denied_pixels);
     coordinator.session_lock_adapter.fail_closed = false;
 
+    _ = linux.close(handler.image_capture_read_fd);
+    handler.image_capture_read_fd = -1;
+    handler.image_capture_ready = false;
+    handler.image_capture_failed = false;
+    handler.image_capture_cursor = true;
+    handler.image_capture_session = (try protocol.ext_image_copy_capture_cursor_session_v1.construct_get_capture_session(
+        &client.objects,
+        &actor.transmit,
+        handler.image_cursor_session.?,
+        .{},
+    )).session;
+    try submitClient(&client_reactor, &driver, &handler);
+    for (0..128) |_| {
+        client_progress = try drainClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.image_capture_ready or handler.image_capture_failed) break;
+        try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(handler.image_capture_ready);
+    try std.testing.expect(!handler.image_capture_failed);
+    try std.testing.expectEqual(@as(u32, 1), handler.image_capture_width);
+    try std.testing.expectEqual(@as(u32, 1), handler.image_capture_height);
+    var cursor_pixels: [24]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 24), linux.pread(handler.image_capture_read_fd, &cursor_pixels, cursor_pixels.len, 0));
+    try std.testing.expectEqualSlices(u8, &.{ 0x23, 0x71, 0xc9, 0xff }, cursor_pixels[0..4]);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 20), cursor_pixels[4..]);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
     const motion_before_warp = handler.pointer_motion;
+    const warp_before_request = handler.pointer_warp;
+    const frames_before_warp = handler.pointer_frame;
+    const previous_point = coordinator.seat_adapter.pointerState().point;
+    try std.testing.expect(previous_point.x != 384 or previous_point.y != 128);
     try handler.queuePointerWarp();
     try submitClient(&client_reactor, &driver, &handler);
     for (0..64) |_| {
         client_progress = try drainClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
         const point = coordinator.seat_adapter.pointerState().point;
-        if (point.x == 256 and point.y == 256) break;
+        if (point.x == 384 and point.y == 128 and handler.pointer_warp > warp_before_request and
+            handler.pointer_frame > frames_before_warp) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
     try std.testing.expectEqual(
-        ouro.seat.Adapter(protocol, ouro.core_surface.Adapter(protocol)).Point{ .x = 256, .y = 256 },
+        ouro.seat.Adapter(protocol, ouro.core_surface.Adapter(protocol)).Point{ .x = 384, .y = 128 },
         coordinator.seat_adapter.pointerState().point,
     );
     try std.testing.expectEqual(motion_before_warp, handler.pointer_motion);
+    try std.testing.expectEqual(warp_before_request + 1, handler.pointer_warp);
+    try std.testing.expectEqual(@as(i32, 384), handler.pointer_warp_x);
+    try std.testing.expectEqual(@as(i32, 128), handler.pointer_warp_y);
+    try std.testing.expectEqual(frames_before_warp + 1, handler.pointer_frame);
     for (0..64) |_| {
         if (coordinator.stats.presented >= 4) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
@@ -2414,6 +2841,130 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         capture_objects,
         handler.image_output_source.?.id,
     ).?.target == null);
+
+    // GTK v6 relies on offsets changing the cursor hotspot, not a second
+    // rendering-only origin. Exercise retained, absolute-reset and null-buffer
+    // commits through the generated wire path after output recreation.
+    try input.publish(&.{
+        .{ .device_added = .{ .device = 42, .info = .{ .capabilities = .{ .pointer = true, .keyboard = true } } } },
+        .{ .pointer_motion = .{ .device = 42, .time_usec = 6_000, .dx = @floatFromInt(1 - coordinator.interaction.pointerPosition().x), .dy = @floatFromInt(-coordinator.interaction.pointerPosition().y) } },
+    });
+    for (0..64) |_| {
+        _ = try drainClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        const pause: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = linux.nanosleep(&pause, null);
+    }
+    // Capability removal makes existing pointer objects permanently inert.
+    // Rebind before checking cursor requests after the session restart.
+    try wayring.client.sendRequest(protocol.wl_pointer, &client.objects, &actor.transmit, handler.pointer.?, .{ .release = .{} });
+    handler.pointer = (try protocol.wl_seat.construct_get_pointer(&client.objects, &actor.transmit, handler.seat.?, .{})).id;
+    const enters_before_cursor = handler.pointer_enter;
+    try submitClient(&client_reactor, &driver, &handler);
+    for (0..128) |_| {
+        _ = try drainClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.pointer_enter > enters_before_cursor) break;
+        const pause: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = linux.nanosleep(&pause, null);
+    }
+    try std.testing.expect(handler.pointer_enter > enters_before_cursor);
+    // This 3x2 fixture has no interior outside the compositor's resize grip.
+    // Test the client cursor rather than the resize-policy cursor override.
+    coordinator.interaction.resize_handle = null;
+    const cursor_pool = try protocol.wl_shm.construct_create_pool(&client.objects, &actor.transmit, handler.shm.?, .{
+        .fd = try ordinaryMemfd(4, 0, &.{ 0x23, 0x71, 0xc9, 0xff }),
+        .size = 4,
+    });
+    const cursor_buffer = (try protocol.wl_shm_pool.construct_create_buffer(&client.objects, &actor.transmit, cursor_pool.id, .{
+        .offset = 0,
+        .width = 1,
+        .height = 1,
+        .stride = 4,
+        .format = .argb8888,
+    })).id;
+    const cursor_id = handler.cursor_surface.?.id;
+    const cursor_pointer = try coordinator.seat_adapter.pointerIdOn(capture_objects, handler.pointer.?.id);
+    try protocol.wl_pointer.encodeRequest(&actor.transmit, handler.pointer.?.id, .{ .set_cursor = .{
+        .serial = handler.pointer_enter_serial,
+        .surface = cursor_id,
+        .hotspot_x = 0,
+        .hotspot_y = 0,
+    } });
+    for ([_]ouro.scene_geometry.Point{ .{ .x = 1, .y = -1 }, .{ .x = -1, .y = 0 }, .{ .x = -3, .y = 3 }, .{ .x = -1, .y = 0 } }, 0..) |expected, step| {
+        if (step == 1) {
+            try protocol.wl_pointer.encodeRequest(&actor.transmit, handler.pointer.?.id, .{ .set_cursor = .{
+                .serial = handler.pointer_enter_serial,
+                .surface = cursor_id,
+                .hotspot_x = -1,
+                .hotspot_y = 0,
+            } });
+        } else {
+            const delta: ouro.scene_geometry.Point = switch (step) {
+                0 => .{ .x = -1, .y = 1 },
+                2 => .{ .x = 2, .y = -3 },
+                3 => .{ .x = -2, .y = 3 },
+                else => unreachable,
+            };
+            if (step >= 2) try protocol.wl_surface.encodeRequest(&actor.transmit, cursor_id, .{ .attach = .{
+                .buffer = if (step == 2) null else cursor_buffer.id,
+                .x = 0,
+                .y = 0,
+            } });
+            try protocol.wl_surface.encodeRequest(&actor.transmit, cursor_id, .{ .offset = .{ .x = delta.x, .y = delta.y } });
+            try protocol.wl_surface.encodeRequest(&actor.transmit, cursor_id, .{ .commit = .{} });
+        }
+        try submitClient(&client_reactor, &driver, &handler);
+        for (0..256) |_| {
+            _ = try drainClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (std.meta.eql(expected, coordinator.interaction.cursor.hotspot) and
+                coordinator.cursor_layer.active == (step != 2) and
+                coordinator.pending_surface_len == 0 and
+                (step == 2 or (coordinator.cursor_layer.sample.?.destination.x == coordinator.interaction.pointerPosition().x - expected.x and
+                    coordinator.cursor_layer.sample.?.destination.y == coordinator.interaction.pointerPosition().y - expected.y))) break;
+            const pause: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = linux.nanosleep(&pause, null);
+        }
+        try std.testing.expectEqual(expected, coordinator.interaction.cursor.hotspot);
+        try std.testing.expectEqual(step != 2, coordinator.cursor_layer.active);
+        if (step != 2) {
+            const pointer = coordinator.interaction.pointerPosition();
+            try std.testing.expectEqual(pointer.x - expected.x, coordinator.cursor_layer.sample.?.destination.x);
+            try std.testing.expectEqual(pointer.y - expected.y, coordinator.cursor_layer.sample.?.destination.y);
+            const info = coordinator.cursorCaptureInfo(.{ .cursor = .{
+                .source = .{ .output = coordinator.primaryKmsOutput().?.outputId() },
+                .cursor = cursor_pointer,
+            } }).?;
+            try std.testing.expectEqual(expected.x, info.hotspot.x);
+            try std.testing.expectEqual(expected.y, info.hotspot.y);
+        }
+        // The dragged application is shifted one pixel left. Check the actual
+        // Pixman scanout, including erasure of the previous cursor position.
+        var expected_rows = [2][12]u8{
+            .{ 0x40, 0x50, 0x60, 0xff, 0x70, 0x80, 0x90, 0xff, 0, 0, 0, 0xff },
+            .{ 0xd0, 0xe0, 0xf0, 0xff, 0x11, 0x22, 0x33, 0xff, 0, 0, 0, 0xff },
+        };
+        if (step == 0) @memcpy(expected_rows[1][0..4], &[_]u8{ 0x23, 0x71, 0xc9, 0xff });
+        if (step == 1 or step == 3) @memcpy(expected_rows[0][8..12], &[_]u8{ 0x23, 0x71, 0xc9, 0xff });
+        const cursor_output = coordinator.primaryKmsOutput().?;
+        for (0..256) |_| {
+            _ = try drainClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            const current = cursor_output.kms_output.current.?;
+            const bytes = cursor_output.pool.slots[current.slot].dumb.?.bytes;
+            if (std.mem.eql(u8, &expected_rows[0], bytes[0..12]) and
+                std.mem.eql(u8, &expected_rows[1], bytes[16..28])) break;
+            const pause: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = linux.nanosleep(&pause, null);
+        }
+        const current = cursor_output.kms_output.current.?;
+        const bytes = cursor_output.pool.slots[current.slot].dumb.?.bytes;
+        try std.testing.expectEqualSlices(u8, &expected_rows[0], bytes[0..12]);
+        try std.testing.expectEqualSlices(u8, &expected_rows[1], bytes[16..28]);
+    }
+    try wayring.client.sendRequest(protocol.wl_buffer, &client.objects, &actor.transmit, cursor_buffer, .{ .destroy = .{} });
+    try wayring.client.sendRequest(protocol.wl_shm_pool, &client.objects, &actor.transmit, cursor_pool.id, .{ .destroy = .{} });
 
     try handler.destroyCursor();
     try submitClient(&client_reactor, &driver, &handler);
@@ -5389,14 +5940,25 @@ fn runScreencopyCapture(
 }
 
 test "shell-input: image copy capture publishes constraints and writes output SHM" {
-    try runImageCopyCapture(false);
+    try runImageCopyCapture(false, .shm);
 }
 
 test "shell-input: session disable fails image copy frame and stops session" {
-    try runImageCopyCapture(true);
+    try runImageCopyCapture(true, .shm);
 }
 
-fn runImageCopyCapture(interrupt: bool) !void {
+test "shell-input: image copy negotiates DMA-BUF success and import rejection" {
+    try runImageCopyCapture(false, .dmabuf);
+    try runImageCopyCapture(false, .reject_dmabuf);
+}
+
+test "shell-input: image copy negotiates high precision SHM without losing low bits" {
+    try runImageCopyCapture(false, .precise);
+}
+
+const ImageCopyKind = enum { shm, precise, dmabuf, reject_dmabuf };
+
+fn runImageCopyCapture(interrupt: bool, kind: ImageCopyKind) !void {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-image-copy-{d}.sock", .{linux.getpid()});
@@ -5405,6 +5967,8 @@ fn runImageCopyCapture(interrupt: bool) !void {
 
     var fixture = try physical_fixture.Fixture.init();
     defer fixture.deinit();
+    fixture.capture_vulkan = kind != .shm;
+    var renderer: physical_fixture.CaptureRenderer = .{ .reject_import = kind == .reject_dmabuf };
     var root_config = physical_fixture.compositorConfig();
     root_config.runtime.object_capacity = 24;
     root_config.runtime.object_quota = 24;
@@ -5415,7 +5979,12 @@ fn runImageCopyCapture(interrupt: bool) !void {
     );
     var config = physical_fixture.coordinatorConfig();
     config.router_capacity = 24;
-    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    var platforms = fixture.platforms();
+    if (kind != .shm) {
+        config.output.renderer = .vulkan;
+        platforms.output.vulkan = renderer.platform();
+    }
+    const coordinator = try Coordinator.create(allocator, root, platforms, config);
     var loop = try Loop.init(
         allocator,
         root,
@@ -5452,6 +6021,7 @@ fn runImageCopyCapture(interrupt: bool) !void {
         .objects = &client.objects,
         .queue = &actor.transmit,
         .registry = registry,
+        .kind = kind,
     };
     defer {
         if (handler.read_fd >= 0) _ = linux.close(handler.read_fd);
@@ -5469,7 +6039,7 @@ fn runImageCopyCapture(interrupt: bool) !void {
             try fixture.signalSession(.disable);
             disable_sent = true;
         }
-        if ((!interrupt and handler.ready) or
+        if ((!interrupt and (handler.ready or handler.failed)) or
             (interrupt and handler.failed and handler.stopped and
                 !coordinator.anyPendingImageCopy() and
                 coordinator.session.state == .disabled)) break;
@@ -5477,27 +6047,57 @@ fn runImageCopyCapture(interrupt: bool) !void {
             try waitForEither(&root.ring, client_reactor.ring);
     }
     try std.testing.expectEqual(interrupt, disable_sent);
-    try std.testing.expectEqual(!interrupt, handler.ready);
-    try std.testing.expectEqual(interrupt, handler.failed);
+    const rejected = kind == .reject_dmabuf;
+    try std.testing.expectEqual(!interrupt and !rejected, handler.ready);
+    try std.testing.expectEqual(interrupt or rejected, handler.failed);
     try std.testing.expectEqual(interrupt, handler.stopped);
     try std.testing.expectEqual(@as(usize, 1), handler.buffer_size_events);
-    try std.testing.expectEqual(@as(usize, 2), handler.shm_format_events);
+    try std.testing.expectEqual(@as(usize, if (kind == .shm) 2 else 3), handler.shm_format_events);
+    try std.testing.expectEqual(@as(usize, if (kind == .shm) 0 else 2), handler.dmabuf_format_events);
+    try std.testing.expectEqual(kind != .shm, handler.dmabuf_device_seen);
     try std.testing.expectEqual(@as(usize, 1), handler.constraints_done_events);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
     if (interrupt) {
         try std.testing.expect(!coordinator.anyPendingImageCopy());
         try std.testing.expectEqual(.disabled, coordinator.session.state);
+    } else if (rejected) {
+        try std.testing.expect(!coordinator.anyPendingImageCopy());
+        try std.testing.expectEqual(@as(usize, 1), renderer.imports);
+        try std.testing.expectEqual(@as(usize, 0), renderer.writes);
+        try std.testing.expectEqual(@as(usize, 0), handler.transform_events);
+        var untouched: [64]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 64), linux.pread(handler.read_fd, &untouched, untouched.len, 0));
+        try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 64), &untouched);
     } else {
         try std.testing.expectEqual(@as(usize, 1), handler.transform_events);
         try std.testing.expectEqual(@as(usize, 1), handler.damage_events);
         try std.testing.expectEqual(@as(usize, 1), handler.presentation_events);
-        var captured: [24]u8 = undefined;
+        var captured: [64]u8 = undefined;
         const read = linux.pread(handler.read_fd, &captured, captured.len, 0);
         try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(read));
         try std.testing.expectEqual(@as(usize, captured.len), read);
-        const black_pixel = [_]u8{ 0, 0, 0, 0xff };
-        for (0..6) |pixel|
-            try std.testing.expectEqualSlices(u8, &black_pixel, captured[pixel * 4 ..][0..4]);
+        if (kind == .precise) {
+            for (0..6) |pixel| {
+                const channels = [_]u16{ @intCast(0x1234 + pixel * 0x1111), @intCast(0x5678 + pixel * 0x1111), @intCast(0x9abc + pixel * 0x1111), 0xffff };
+                for (channels, 0..) |channel, c| try std.testing.expectEqual(channel, std.mem.readInt(u16, captured[pixel * 8 + c * 2 ..][0..2], .little));
+            }
+            try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 16), captured[48..]);
+            try std.testing.expectEqual(@as(usize, 1), renderer.precise_reads);
+        } else if (kind == .dmabuf) {
+            for (0..6) |pixel| {
+                const base: u8 = @intCast(pixel * 16);
+                const offset = 8 + (pixel / 3) * 16 + (pixel % 3) * 4;
+                try std.testing.expectEqualSlices(u8, &.{ base + 4, base + 3, base + 2, 255 }, captured[offset..][0..4]);
+            }
+            try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 8), captured[0..8]);
+            try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 4), captured[20..24]);
+            try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 28), captured[36..]);
+            try std.testing.expectEqual(@as(usize, 1), renderer.imports);
+            try std.testing.expectEqual(@as(usize, 1), renderer.writes);
+        } else {
+            for (0..6) |pixel| try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0xff }, captured[pixel * 4 ..][0..4]);
+            try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 40), captured[24..]);
+        }
     }
 
     coordinator.disconnected(coordinator.peer.?);
@@ -5519,6 +6119,8 @@ fn runImageCopyCapture(interrupt: bool) !void {
     loop.deinit();
     try coordinator.destroy();
     try root.deinit();
+    try std.testing.expectEqual(@as(linux.fd_t, -1), renderer.fd);
+    try std.testing.expectEqual(@as(usize, if (kind == .dmabuf) 1 else 0), renderer.destroys);
 }
 
 test "shell-input: synchronized cursor subsurface batch renders root and child" {
@@ -6436,6 +7038,78 @@ test "shell-input: synchronized subsurface publishes with parent and receives po
     try std.testing.expectEqual(handler.surfaces[0].?.id, handler.key_surface.?);
     try std.testing.expectEqual(keyboard_leaves, handler.keyboard_leaves);
 
+    // Chromium's toast/status bubble is desynchronized. Moving it commits
+    // only the parent, without attaching a buffer or damaging either surface.
+    // Fix the parent's window geometry so child movement cannot resize it.
+    try protocol.wl_subsurface.encodeRequest(&actor.transmit, handler.subsurfaces[1].?.id, .{ .set_desync = .{} });
+    try protocol.xdg_surface.encodeRequest(&actor.transmit, handler.xdg_surfaces[0].?.id, .{
+        .set_window_geometry = .{ .x = 0, .y = 0, .width = 3, .height = 2 },
+    });
+    try protocol.wl_surface.encodeRequest(&actor.transmit, handler.surfaces[0].?.id, .{ .commit = .{} });
+    var applied_before = coordinator.stats.applied;
+    try submitMultiClient(&client_reactor, &driver, &handler);
+    for (0..256) |_| {
+        _ = try drainMultiClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.stats.applied > applied_before and coordinator.pending_surface_len == 0 and
+            fixture.flip_len == 0 and coordinator.primaryKmsOutput().?.in_flight_frame == null and
+            !coordinator.desktop.transactionPending()) break;
+        const delay: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = linux.nanosleep(&delay, null);
+    }
+    const positions = [_]ouro.scene_geometry.Point{
+        .{ .x = 0, .y = 1 },
+        .{ .x = 2, .y = 0 },
+        .{ .x = 6, .y = 1 },
+        .{ .x = 1, .y = 0 },
+    };
+    for (positions, 0..) |position, step| {
+        const presented_before = coordinator.stats.presented;
+        applied_before = coordinator.stats.applied;
+        try protocol.wl_subsurface.encodeRequest(&actor.transmit, handler.subsurfaces[1].?.id, .{
+            .set_position = .{ .x = position.x, .y = position.y },
+        });
+        try protocol.wl_surface.encodeRequest(&actor.transmit, handler.surfaces[0].?.id, .{ .commit = .{} });
+        try submitMultiClient(&client_reactor, &driver, &handler);
+        for (0..256) |_| {
+            _ = try drainMultiClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (coordinator.stats.presented > presented_before) break;
+            const delay: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = linux.nanosleep(&delay, null);
+        }
+        const output = coordinator.primaryKmsOutput().?;
+        const image = output.pool.slots[output.kms_output.current.?.slot].dumb.?.bytes;
+        if (std.c.getenv("OURO_SUBSURFACE_CAPTURE")) |prefix| {
+            var filename: [512]u8 = undefined;
+            const capture = try std.fmt.bufPrint(&filename, "{s}-{d}.ppm", .{ std.mem.span(prefix), step });
+            const header = "P6\n3 2\n255\n";
+            var ppm: [header.len + 3 * 2 * 3]u8 = undefined;
+            @memcpy(ppm[0..header.len], header);
+            for (0..2) |y| for (0..3) |x| {
+                const pixel = y * 3 + x;
+                ppm[header.len + pixel * 3] = image[y * 16 + x * 4 + 2];
+                ppm[header.len + pixel * 3 + 1] = image[y * 16 + x * 4 + 1];
+                ppm[header.len + pixel * 3 + 2] = image[y * 16 + x * 4];
+            };
+            try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = capture, .data = &ppm });
+        }
+        try std.testing.expectEqual(applied_before + 1, coordinator.stats.applied);
+        try std.testing.expectEqual(presented_before + 1, coordinator.stats.presented);
+        // Check both the new content and the erased old location, including
+        // a completely offscreen move and scanout-image reuse on return.
+        for (0..2) |y| for (0..3) |x| {
+            const child_x = @as(i32, @intCast(x)) - position.x;
+            const child_y = @as(i32, @intCast(y)) - position.y;
+            const source_offset = if (child_x >= 0 and child_x < 3 and child_y >= 0 and child_y < 2)
+                @as(usize, @intCast(child_y)) * 16 + @as(usize, @intCast(child_x)) * 4
+            else
+                y * 16 + x * 4;
+            try std.testing.expectEqualSlices(u8, pixels[source_offset..][0..4], image[y * 16 + x * 4 ..][0..4]);
+        };
+    }
+    const presented_before_destroy = coordinator.stats.presented;
+
     try wayring.client.sendRequest(
         protocol.wl_subsurface,
         &client.objects,
@@ -6448,12 +7122,12 @@ test "shell-input: synchronized subsurface publishes with parent and receives po
     for (0..256) |_| {
         client_progress = try drainMultiClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (coordinator.stats.presented == 2) break;
+        if (coordinator.stats.presented == presented_before_destroy + 1) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
-    try std.testing.expectEqual(@as(usize, 2), coordinator.stats.submitted);
-    try std.testing.expectEqual(@as(usize, 2), coordinator.stats.presented);
+    try std.testing.expectEqual(presented_before_destroy + 1, coordinator.stats.submitted);
+    try std.testing.expectEqual(presented_before_destroy + 1, coordinator.stats.presented);
     try std.testing.expectEqual(@as(usize, 0), coordinator.removed_layer_len);
     try std.testing.expect(coordinator.seat_adapter.pointerState().focus == null);
     const root_id = try coordinator.adapter.surfaceId(handler.surfaces[0].?);
@@ -7077,6 +7751,290 @@ test "shell-input: one client disconnect does not interrupt another client" {
     try coordinator.destroy();
     try root.deinit();
 }
+
+test "shell-input: cross-client DnD transfers an FD and negotiates move before finish" {
+    try runCrossClientDrag(false);
+    try runCrossClientDrag(true);
+}
+
+fn runCrossClientDrag(disconnect_target: bool) !void {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-dnd-transfer-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var input = try FakeInput.init();
+    defer input.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 64;
+    root_config.runtime.object_quota = 64;
+    root_config.runtime.registry_capacity = 2;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 2), root_config);
+    var config = physical_fixture.coordinatorConfig();
+    config.shm.pool_capacity = 2;
+    config.shm.buffer_capacity = 2;
+    config.surface.surface_capacity = 2;
+    config.surface.frame_callback_capacity = 2;
+    config.surface.content_update_capacity = 3;
+    config.surface.dependency_capacity = 2;
+    config.surface.attachment_capacity = 2;
+    config.surface.copy_capacity = 2;
+    config.output.max_samples = 3;
+    config.output.max_source_bytes = pixels.len * 2;
+    var platforms = fixture.platforms();
+    platforms.input = input.platform();
+    const coordinator = try Coordinator.create(allocator, root, platforms, config);
+    coordinator.desktop.policy.inner_gap = 0;
+    coordinator.desktop.policy.outer_gap = 0;
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    var reactors: [2]wayring.io_uring.Reactor = undefined;
+    var clients: [2]ClientConnection = undefined;
+    var drivers: [2]ClientDriver = undefined;
+    var handlers: [2]DragTransferHandler = undefined;
+    for (0..2) |i| {
+        try reactors[i].initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+        clients[i] = try ClientConnection.attach(allocator, &reactors[i], try wayring.unix_socket.connect(path), .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .{ .max_objects = 64, .max_client_ids = 63 });
+        const actor = try clients[i].actor();
+        drivers[i] = ClientDriver.init(&clients[i]);
+        handlers[i] = .{ .queue = &actor.transmit, .shell = .{
+            .objects = &clients[i].objects,
+            .queue = &actor.transmit,
+            .registry = try ClientCore.getRegistry(&clients[i].objects, &actor.transmit, null),
+            .surface_count = 1,
+            .cycle_count = 1,
+            .bind_seat = true,
+        }, .source_client = i == 1 };
+        try submitClient(&reactors[i], &drivers[i], &handlers[i]);
+    }
+    defer for (&handlers) |*handler| {
+        if (handler.read_fd >= 0) _ = linux.close(handler.read_fd);
+        if (handler.write_fd >= 0) _ = linux.close(handler.write_fd);
+    };
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    var stage: u8 = 0;
+    var target_closed = false;
+    for (0..1024) |_| {
+        for (0..2) |i| _ = try drainClient(&reactors[i], &drivers[i], &handlers[i]);
+        _ = try loop.turn(coordinator);
+        if (stage == 0 and handlers[0].shell.shell_created and handlers[1].shell.frame_done == 1 and
+            handlers[1].device != null and coordinator.input != null)
+        {
+            try input.publish(&.{
+                .{ .device_added = .{ .device = 42, .info = .{ .capabilities = .{ .pointer = true } } } },
+                .{ .pointer_motion = .{ .device = 42, .time_usec = 1000, .dx = -100, .dy = -100 } },
+            });
+            stage = 1;
+        }
+        if (stage == 1 and handlers[1].shell.pointer_surface != null and input.cursor == input.event_count) {
+            try input.publish(&.{.{ .pointer_button = .{ .device = 42, .time_usec = 2000, .button = 0x110, .pressed = true } }});
+            stage = 2;
+        }
+        if (stage == 2 and coordinator.data_device_adapter.dragActive()) {
+            // Supply the destination hit independently of desktop placement.
+            // All client requests/events, including the origin grab, use wire IO.
+            // The offer and MIME fit, but source_actions must wait for a send.
+            (try root.reactor.getActor(coordinator.clients.items[0].peer)).transmit.byte_budget = 52;
+            try coordinator.data_device_adapter.updateDragTarget(.{
+                .peer = coordinator.clients.items[0].peer,
+                .surface_object = handlers[0].shell.surfaces[0].?.id,
+                .x = 257,
+                .y = 129,
+            }, 73, 3, true);
+            stage = 3;
+        }
+        if (stage == 3 and handlers[1].write_fd >= 0 and handlers[0].action == 2) {
+            // The receive pipe is deliberately full. A blocked producer must
+            // not prevent Wayland from completing action negotiation.
+            const result = linux.write(handlers[1].write_fd, DragTransferHandler.payload.ptr, DragTransferHandler.payload.len);
+            try std.testing.expectEqual(linux.E.AGAIN, linux.errno(result));
+            var scratch: [4096]u8 = undefined;
+            while (true) {
+                const count = linux.read(handlers[0].read_fd, &scratch, scratch.len);
+                if (linux.errno(count) == .AGAIN) break;
+                try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(count));
+                try std.testing.expect(count != 0);
+                for (scratch[0..count]) |byte| try std.testing.expectEqual(@as(u8, 0xa7), byte);
+            }
+            try std.testing.expectEqual(DragTransferHandler.payload.len, linux.write(handlers[1].write_fd, DragTransferHandler.payload.ptr, DragTransferHandler.payload.len));
+            _ = linux.close(handlers[1].write_fd);
+            handlers[1].write_fd = -1;
+            var received: [DragTransferHandler.payload.len + 1]u8 = undefined;
+            const count = linux.read(handlers[0].read_fd, &received, received.len);
+            try std.testing.expectEqual(DragTransferHandler.payload.len, count);
+            try std.testing.expectEqualSlices(u8, DragTransferHandler.payload, received[0..count]);
+            try std.testing.expectEqual(@as(usize, 0), linux.read(handlers[0].read_fd, &received, received.len));
+            if (disconnect_target) {
+                _ = try clients[0].prepareClose();
+                try submitClient(&reactors[0], &drivers[0], &handlers[0]);
+                target_closed = true;
+            } else {
+                try coordinator.data_device_adapter.dropDrag();
+            }
+            stage = 4;
+        }
+        if (stage == 4 and (if (disconnect_target) coordinator.client_count == 1 else handlers[1].finished == 1)) break;
+        try waitForAny(&root.ring, reactors[0].ring, reactors[1].ring);
+    }
+    try std.testing.expectEqual(@as(u8, 4), stage);
+    try std.testing.expectEqual(@as(usize, 1), handlers[1].sent);
+    try std.testing.expectEqual(@as(usize, 1), handlers[1].accepted);
+    try std.testing.expectEqual(@as(u32, 2), handlers[1].action);
+    if (!disconnect_target) {
+        try std.testing.expectEqual(@as(usize, 1), handlers[0].drops);
+        try std.testing.expectEqual(@as(usize, 1), handlers[1].drop_performed);
+        try std.testing.expectEqual(@as(usize, 1), handlers[1].finished);
+        try std.testing.expectEqual(@as(usize, 0), handlers[1].cancelled);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), handlers[1].finished);
+        try std.testing.expectEqual(@as(usize, 0), handlers[0].drops);
+        try std.testing.expect(!coordinator.stopping);
+    }
+    for (0..2) |i| {
+        try std.testing.expectEqual(@as(usize, 0), handlers[i].shell.event_failures);
+        if (i != 0 or !target_closed) _ = try clients[i].prepareClose();
+        try submitClient(&reactors[i], &drivers[i], &handlers[i]);
+    }
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..512) |_| {
+        const first = try drainClient(&reactors[0], &drivers[0], &handlers[0]);
+        const second = try drainClient(&reactors[1], &drivers[1], &handlers[1]);
+        const progress = try loop.turn(coordinator);
+        drained = first.quiescent and second.quiescent and progress.wayring.shutdown_complete and coordinator.backendDrainComplete();
+        if (drained) break;
+        try waitForAny(&root.ring, reactors[0].ring, reactors[1].ring);
+    }
+    try std.testing.expect(drained);
+    for (0..2) |i| {
+        try clients[i].deinit(allocator);
+        reactors[i].deinit(allocator);
+    }
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
+const DragTransferHandler = struct {
+    const payload = "ouro DnD\x00\xff: move, not copy\n";
+    queue: *wayring.tx.Queue,
+    shell: MultiHandler,
+    source_client: bool,
+    manager: ?wayring.objects.Handle = null,
+    device: ?wayring.objects.Handle = null,
+    source: ?wayring.objects.Handle = null,
+    offer: ?wayring.objects.Handle = null,
+    read_fd: linux.fd_t = -1,
+    write_fd: linux.fd_t = -1,
+    action: u32 = 0,
+    source_actions_events: usize = 0,
+    sent: usize = 0,
+    accepted: usize = 0,
+    drops: usize = 0,
+    drop_performed: usize = 0,
+    finished: usize = 0,
+    cancelled: usize = 0,
+
+    pub fn eventError(self: *@This(), peer: wayring.io_uring.Peer, failure: ClientCore.EventFailure) void {
+        self.shell.eventError(peer, failure);
+    }
+
+    pub fn event(self: *@This(), target: wayring.objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
+        const objects = self.shell.objects;
+        if (target.object.interface == &ClientCore.Registry.info) {
+            const value = try ClientCore.decodeRegistryEvent(objects, self.shell.registry, message, fds);
+            if (value == .global and std.mem.eql(u8, value.global.interface, protocol.wl_data_device_manager.info.name))
+                self.manager = try ClientCore.bind(objects, self.queue, self.shell.registry, value.global.name, &protocol.wl_data_device_manager.info, 3, null);
+            if (value == .global) try self.shell.bindGlobal(value.global);
+            if (self.source_client) {
+                try self.shell.maybeCreateShells();
+            } else if (!self.shell.shell_created and self.shell.compositor != null) {
+                self.shell.surfaces[0] = (try protocol.wl_compositor.construct_create_surface(objects, self.queue, self.shell.compositor.?, .{})).id;
+                self.shell.shell_created = true;
+            }
+            if (self.device == null and self.manager != null and self.shell.seat != null) {
+                self.device = (try protocol.wl_data_device_manager.construct_get_data_device(objects, self.queue, self.manager.?, .{ .seat = self.shell.seat.?.id })).id;
+                if (self.source_client) {
+                    self.source = (try protocol.wl_data_device_manager.construct_create_data_source(objects, self.queue, self.manager.?, .{})).id;
+                    try protocol.wl_data_source.encodeRequest(self.queue, self.source.?.id, .{ .offer = .{ .mime_type = "application/x-ouro-test" } });
+                    try protocol.wl_data_source.encodeRequest(self.queue, self.source.?.id, .{ .set_actions = .{ .dnd_actions = .fromWire(3) } });
+                }
+            }
+        } else if (target.object.interface == &protocol.wl_pointer.info) {
+            const value = try protocol.wl_pointer.decodeEvent(message, fds);
+            if (value == .button and self.source_client and value.button.state.value == protocol.wl_pointer.button_state.pressed.value)
+                try protocol.wl_data_device.encodeRequest(self.queue, self.device.?.id, .{ .start_drag = .{
+                    .source = self.source.?.id,
+                    .origin = self.shell.surfaces[0].?.id,
+                    .icon = null,
+                    .serial = value.button.serial,
+                } });
+            _ = try self.shell.event(target, message, fds);
+        } else if (target.object.interface == &protocol.wl_data_device.info) {
+            switch (try protocol.wl_data_device.decodeEvent(message, fds)) {
+                .data_offer => |value| self.offer = (try protocol.wl_data_device.admit_event_data_offer(objects, self.device.?, value, .{})).id,
+                .enter => |value| if (!self.source_client) {
+                    try std.testing.expectEqual(@as(usize, 1), self.source_actions_events);
+                    try std.testing.expectEqual(self.shell.surfaces[0].?.id, value.surface);
+                    try std.testing.expectEqual(@as(i32, 257), value.x);
+                    try std.testing.expectEqual(@as(i32, 129), value.y);
+                    try protocol.wl_data_offer.encodeRequest(self.queue, value.id.?, .{ .set_actions = .{ .dnd_actions = .fromWire(3), .preferred_action = .move } });
+                    try protocol.wl_data_offer.encodeRequest(self.queue, value.id.?, .{ .accept = .{ .serial = value.serial, .mime_type = "application/x-ouro-test" } });
+                    var pipe: [2]linux.fd_t = undefined;
+                    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true, .NONBLOCK = true })));
+                    self.read_fd = pipe[0];
+                    const filler = [_]u8{0xa7} ** 4096;
+                    while (true) {
+                        const result = linux.write(pipe[1], &filler, filler.len);
+                        if (linux.errno(result) == .SUCCESS) continue;
+                        try std.testing.expectEqual(linux.E.AGAIN, linux.errno(result));
+                        break;
+                    }
+                    try protocol.wl_data_offer.encodeRequest(self.queue, value.id.?, .{ .receive = .{ .mime_type = "application/x-ouro-test", .fd = pipe[1] } });
+                },
+                .drop => {
+                    self.drops += 1;
+                    try std.testing.expectEqual(@as(u32, 2), self.action);
+                    try protocol.wl_data_offer.encodeRequest(self.queue, self.offer.?.id, .{ .finish = .{} });
+                    try wayring.client.sendRequest(protocol.wl_data_offer, objects, self.queue, self.offer.?, .{ .destroy = .{} });
+                },
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.wl_data_offer.info) {
+            switch (try protocol.wl_data_offer.decodeEvent(message, fds)) {
+                .offer => |value| try std.testing.expectEqualStrings("application/x-ouro-test", value.mime_type),
+                .source_actions => |value| {
+                    try std.testing.expectEqual(@as(u32, 3), value.source_actions.value);
+                    self.source_actions_events += 1;
+                },
+                .action => |value| self.action = value.dnd_action.value,
+            }
+        } else if (target.object.interface == &protocol.wl_data_source.info) {
+            switch (try protocol.wl_data_source.decodeEvent(message, fds)) {
+                .target => |value| if (value.mime_type) |mime| {
+                    try std.testing.expectEqualStrings("application/x-ouro-test", mime);
+                    self.accepted += 1;
+                },
+                .send => |value| {
+                    try std.testing.expectEqualStrings("application/x-ouro-test", value.mime_type);
+                    self.write_fd = value.fd;
+                    self.sent += 1;
+                },
+                .action => |value| self.action = value.dnd_action.value,
+                .dnd_drop_performed => self.drop_performed += 1,
+                .dnd_finished => {
+                    try std.testing.expectEqual(@as(usize, 1), self.drop_performed);
+                    self.finished += 1;
+                },
+                .cancelled => self.cancelled += 1,
+            }
+        } else return self.shell.event(target, message, fds);
+        return .continue_dispatch;
+    }
+};
 
 const FakeInput = struct {
     fd: linux.fd_t,
@@ -7785,7 +8743,12 @@ const MultiHandler = struct {
         } else if (target.object.interface == &protocol.wl_shm.info) {
             _ = try protocol.wl_shm.decodeEvent(message, fds);
         } else if (target.object.interface == &protocol.wl_output.info) {
-            _ = try protocol.wl_output.decodeEvent(message, fds);
+            switch (try protocol.wl_output.decodeEvent(message, fds)) {
+                .name => |value| if (self.repaint_lifecycle_mode and std.mem.eql(u8, value.name, "ouro-0")) {
+                    self.output = self.objects.namespace.lookupHandle(message.header.object_id);
+                },
+                else => {},
+            }
         } else if (target.object.interface == &protocol.zwlr_output_power_v1.info) {
             switch (try protocol.zwlr_output_power_v1.decodeEvent(message, fds)) {
                 .mode => {},
@@ -7972,6 +8935,13 @@ const MultiHandler = struct {
                 .@"error" => return error.ServerProtocolError,
             }
         } else return error.UnexpectedEvent;
+        if (self.repaint_lifecycle_mode and self.power == null and self.output != null and self.power_manager != null)
+            self.power = (try protocol.zwlr_output_power_manager_v1.construct_get_output_power(
+                self.objects,
+                self.queue,
+                self.power_manager.?,
+                .{ .output = self.output.?.id },
+            )).id;
         return .continue_dispatch;
     }
 
@@ -7986,19 +8956,12 @@ const MultiHandler = struct {
             self.wm_base = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_wm_base.info, @min(value.version, 7), null);
         if (self.layer_mode and std.mem.eql(u8, value.interface, protocol.zwlr_layer_shell_v1.info.name))
             self.layer_shell = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwlr_layer_shell_v1.info, @min(value.version, 5), null);
-        if (self.repaint_lifecycle_mode and self.output == null and std.mem.eql(u8, value.interface, protocol.wl_output.info.name))
-            self.output = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
+        if (self.repaint_lifecycle_mode and std.mem.eql(u8, value.interface, protocol.wl_output.info.name))
+            _ = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
         if (self.repaint_lifecycle_mode and std.mem.eql(u8, value.interface, protocol.zwlr_output_power_manager_v1.info.name))
             self.power_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwlr_output_power_manager_v1.info, 1, null);
         if (self.repaint_lifecycle_mode and std.mem.eql(u8, value.interface, protocol.ext_session_lock_manager_v1.info.name))
             self.lock_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.ext_session_lock_manager_v1.info, 1, null);
-        if (self.repaint_lifecycle_mode and self.power == null and self.output != null and self.power_manager != null)
-            self.power = (try protocol.zwlr_output_power_manager_v1.construct_get_output_power(
-                self.objects,
-                self.queue,
-                self.power_manager.?,
-                .{ .output = self.output.?.id },
-            )).id;
         if (self.decoration_mode and std.mem.eql(u8, value.interface, protocol.zxdg_decoration_manager_v1.info.name))
             self.decoration_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zxdg_decoration_manager_v1.info, @min(value.version, 2), null);
         if ((self.activation_mode or self.subsurface_mode or self.bind_seat) and std.mem.eql(u8, value.interface, protocol.wl_seat.info.name))
@@ -8419,6 +9382,10 @@ const ImageCopyHandler = struct {
     objects: *wayring.objects.ClientObjects,
     queue: *wayring.tx.Queue,
     registry: wayring.objects.Handle,
+    kind: ImageCopyKind = .shm,
+    dmabuf: ?wayring.objects.Handle = null,
+    dmabuf_device_seen: bool = false,
+    dmabuf_format_events: usize = 0,
     shm: ?wayring.objects.Handle = null,
     output: ?wayring.objects.Handle = null,
     source_manager: ?wayring.objects.Handle = null,
@@ -8466,6 +9433,8 @@ const ImageCopyHandler = struct {
             try self.maybeCreateSession();
         } else if (target.object.interface == &protocol.wl_shm.info) {
             _ = try protocol.wl_shm.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.zwp_linux_dmabuf_v1.info) {
+            _ = try protocol.zwp_linux_dmabuf_v1.decodeEvent(message, fds);
         } else if (target.object.interface == &protocol.wl_output.info) {
             switch (try protocol.wl_output.decodeEvent(message, fds)) {
                 .done => {
@@ -8486,7 +9455,8 @@ const ImageCopyHandler = struct {
                 .shm_format => |value| {
                     try std.testing.expect(
                         value.format.value == protocol.wl_shm.format.argb8888.value or
-                            value.format.value == protocol.wl_shm.format.xrgb8888.value,
+                            value.format.value == protocol.wl_shm.format.xrgb8888.value or
+                            (self.kind != .shm and value.format.value == protocol.wl_shm.format.abgr16161616.value),
                     );
                     self.shm_format_events += 1;
                 },
@@ -8495,7 +9465,17 @@ const ImageCopyHandler = struct {
                     try self.requestFrame();
                 },
                 .stopped => self.stopped = true,
-                .dmabuf_device, .dmabuf_format => return error.UnexpectedDmabufCapture,
+                .dmabuf_device => |value| {
+                    try std.testing.expect(self.kind != .shm);
+                    try std.testing.expectEqual(@as(usize, 8), value.device.len);
+                    self.dmabuf_device_seen = true;
+                },
+                .dmabuf_format => |value| {
+                    try std.testing.expect(self.dmabuf_device_seen);
+                    try std.testing.expect(value.format == ouro.gbm.format_argb8888 or value.format == ouro.gbm.format_xrgb8888);
+                    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 8), value.modifiers);
+                    self.dmabuf_format_events += 1;
+                },
             }
         } else if (target.object.interface == &protocol.ext_image_copy_capture_frame_v1.info) {
             switch (try protocol.ext_image_copy_capture_frame_v1.decodeEvent(message, fds)) {
@@ -8527,6 +9507,8 @@ const ImageCopyHandler = struct {
     }
 
     fn bindGlobal(self: *ImageCopyHandler, value: anytype) !void {
+        if (self.kind != .shm and std.mem.eql(u8, value.interface, protocol.zwp_linux_dmabuf_v1.info.name))
+            self.dmabuf = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwp_linux_dmabuf_v1.info, 3, null);
         if (std.mem.eql(u8, value.interface, protocol.wl_shm.info.name))
             self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_shm.info, @min(value.version, 2), null);
         if (std.mem.eql(u8, value.interface, protocol.wl_output.info.name))
@@ -8563,7 +9545,7 @@ const ImageCopyHandler = struct {
         if (self.frame_requested) return;
         try std.testing.expectEqual(@as(u32, 3), self.width);
         try std.testing.expectEqual(@as(u32, 2), self.height);
-        const descriptor = try ordinaryMemfd(24, 0, &([_]u8{0x55} ** 24));
+        const descriptor = try ordinaryMemfd(64, 0, &([_]u8{0x55} ** 64));
         const retained = linux.fcntl(descriptor, linux.F.DUPFD_CLOEXEC, 0);
         if (linux.errno(retained) != .SUCCESS) return error.DuplicateFailed;
         self.read_fd = @intCast(retained);
@@ -8571,31 +9553,35 @@ const ImageCopyHandler = struct {
             _ = linux.close(self.read_fd);
             self.read_fd = -1;
         }
-        const pool = try protocol.wl_shm.construct_create_pool(
-            self.objects,
-            self.queue,
-            self.shm.?,
-            .{ .fd = descriptor, .size = 24 },
-        );
-        self.buffer = (try protocol.wl_shm_pool.construct_create_buffer(
-            self.objects,
-            self.queue,
-            pool.id,
-            .{
+        if (self.kind == .dmabuf or self.kind == .reject_dmabuf) {
+            try std.testing.expectEqual(@as(usize, 2), self.dmabuf_format_events);
+            const params = (try protocol.zwp_linux_dmabuf_v1.construct_create_params(self.objects, self.queue, self.dmabuf.?, .{})).params_id;
+            try protocol.zwp_linux_buffer_params_v1.encodeRequest(self.queue, params.id, .{ .add = .{
+                .fd = descriptor,
+                .plane_idx = 0,
+                .offset = 8,
+                .stride = 16,
+                .modifier_hi = 0,
+                .modifier_lo = 0,
+            } });
+            self.buffer = (try protocol.zwp_linux_buffer_params_v1.construct_create_immed(self.objects, self.queue, params, .{
+                .width = 3,
+                .height = 2,
+                .format = ouro.gbm.format_xrgb8888,
+                .flags = .fromInt(0),
+            })).buffer_id;
+            try wayring.client.sendRequest(protocol.zwp_linux_buffer_params_v1, self.objects, self.queue, params, .{ .destroy = .{} });
+        } else {
+            const pool = try protocol.wl_shm.construct_create_pool(self.objects, self.queue, self.shm.?, .{ .fd = descriptor, .size = 64 });
+            self.buffer = (try protocol.wl_shm_pool.construct_create_buffer(self.objects, self.queue, pool.id, .{
                 .offset = 0,
                 .width = 3,
                 .height = 2,
-                .stride = 12,
-                .format = .xrgb8888,
-            },
-        )).id;
-        try wayring.client.sendRequest(
-            protocol.wl_shm_pool,
-            self.objects,
-            self.queue,
-            pool.id,
-            .{ .destroy = .{} },
-        );
+                .stride = if (self.kind == .precise) 24 else 12,
+                .format = if (self.kind == .precise) .abgr16161616 else .xrgb8888,
+            })).id;
+            try wayring.client.sendRequest(protocol.wl_shm_pool, self.objects, self.queue, pool.id, .{ .destroy = .{} });
+        }
         self.frame = (try protocol.ext_image_copy_capture_session_v1.construct_create_frame(
             self.objects,
             self.queue,
@@ -8743,7 +9729,20 @@ const LayerPopupHandler = struct {
         } else if (target.object.interface == &protocol.wl_shm.info) {
             _ = try protocol.wl_shm.decodeEvent(message, fds);
         } else if (target.object.interface == &protocol.wl_output.info) {
-            _ = try protocol.wl_output.decodeEvent(message, fds);
+            switch (try protocol.wl_output.decodeEvent(message, fds)) {
+                .name => |value| {
+                    const desired = if (self.minimum_outputs == 2) "VGA-2" else "ouro-0";
+                    const output = self.objects.namespace.lookupHandle(message.header.object_id).?;
+                    if (std.mem.eql(u8, value.name, desired)) self.output = output;
+                    if (self.test_output_power and !self.created) {
+                        const index: usize = if (std.mem.eql(u8, value.name, "ouro-0")) 0 else if (std.mem.eql(u8, value.name, "VGA-2")) 1 else return error.UnexpectedOutput;
+                        self.power_outputs[index] = output;
+                    }
+                    self.output_count += 1;
+                    try self.maybeCreate();
+                },
+                else => {},
+            }
         } else if (target.object.interface == &protocol.zwlr_output_power_v1.info) {
             switch (try protocol.zwlr_output_power_v1.decodeEvent(message, fds)) {
                 .mode => self.power_modes += 1,
@@ -8877,12 +9876,8 @@ const LayerPopupHandler = struct {
             self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_seat.info, @min(value.version, 9), null);
         if (std.mem.eql(u8, value.interface, protocol.xdg_wm_base.info.name))
             self.wm_base = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_wm_base.info, @min(value.version, 7), null);
-        if (std.mem.eql(u8, value.interface, protocol.wl_output.info.name)) {
-            self.output = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
-            if (self.test_output_power and !self.created)
-                self.power_outputs[self.output_count] = self.output;
-            self.output_count += 1;
-        }
+        if (std.mem.eql(u8, value.interface, protocol.wl_output.info.name))
+            _ = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
         if (self.test_output_power and std.mem.eql(u8, value.interface, protocol.zwlr_output_power_manager_v1.info.name))
             self.power_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwlr_output_power_manager_v1.info, 1, null);
         if (self.fractional_scale and std.mem.eql(u8, value.interface, protocol.wp_fractional_scale_manager_v1.info.name))
@@ -8892,7 +9887,7 @@ const LayerPopupHandler = struct {
     }
 
     fn maybeCreate(self: *LayerPopupHandler) !void {
-        if (self.created or self.compositor == null or self.shm == null or
+        if (self.created or self.compositor == null or self.shm == null or self.output == null or
             self.wm_base == null or (!self.toplevel_root and self.layer_shell == null) or
             (self.test_output_power and self.power_manager == null) or
             (self.fractional_scale and self.fractional_manager == null) or
@@ -9436,6 +10431,7 @@ const Handler = struct {
     image_capture_height: u32 = 0,
     image_capture_ready: bool = false,
     image_capture_failed: bool = false,
+    image_capture_cursor: bool = false,
     test_image_capture_sources: bool = false,
     image_output_global_seen: bool = false,
     image_toplevel_global_seen: bool = false,
@@ -9452,6 +10448,7 @@ const Handler = struct {
     input_method_global_seen: bool = false,
     virtual_keyboard_global_seen: bool = false,
     virtual_pointer_global_seen: bool = false,
+    hotkey_global: ?u32 = null,
     transient_seat_global_seen: bool = false,
     text_input_manager: ?wayring.objects.Handle = null,
     text_input: ?wayring.objects.Handle = null,
@@ -9495,6 +10492,9 @@ const Handler = struct {
     pointer_warp_queued: bool = false,
     test_pointer_warp: bool = false,
     pointer_motion: usize = 0,
+    pointer_warp: usize = 0,
+    pointer_warp_x: i32 = 0,
+    pointer_warp_y: i32 = 0,
     pointer_button: usize = 0,
     virtual_pointer_button_times: u4 = 0,
     zero_time_pointer_buttons: usize = 0,
@@ -9707,8 +10707,8 @@ const Handler = struct {
                 .damage => |value| {
                     try std.testing.expectEqual(@as(i32, 0), value.x);
                     try std.testing.expectEqual(@as(i32, 0), value.y);
-                    try std.testing.expectEqual(@as(i32, 3), value.width);
-                    try std.testing.expectEqual(@as(i32, 2), value.height);
+                    try std.testing.expectEqual(@as(i32, if (self.image_capture_cursor) 1 else 3), value.width);
+                    try std.testing.expectEqual(@as(i32, if (self.image_capture_cursor) 1 else 2), value.height);
                 },
                 .presentation_time => {},
                 .ready => {
@@ -9814,6 +10814,11 @@ const Handler = struct {
                     }
                 },
                 .motion => self.pointer_motion += 1,
+                .warp => |value| {
+                    self.pointer_warp += 1;
+                    self.pointer_warp_x = value.surface_x;
+                    self.pointer_warp_y = value.surface_y;
+                },
                 .button => |value| {
                     self.pointer_button += 1;
                     if (value.time >= 13 and value.time <= 16)
@@ -10049,6 +11054,8 @@ const Handler = struct {
                 self.virtual_keyboard_global_seen = true;
             if (std.mem.eql(u8, value.interface, protocol.zwlr_virtual_pointer_manager_v1.info.name))
                 self.virtual_pointer_global_seen = true;
+            if (std.mem.eql(u8, value.interface, protocol.xx_hotkey_manager_v1.info.name))
+                self.hotkey_global = value.name;
             if (std.mem.eql(u8, value.interface, protocol.ext_transient_seat_manager_v1.info.name))
                 self.transient_seat_global_seen = true;
             if (std.mem.eql(u8, value.interface, protocol.ext_foreign_toplevel_list_v1.info.name))
@@ -10074,7 +11081,7 @@ const Handler = struct {
         if (std.mem.eql(u8, value.interface, protocol.xdg_wm_base.info.name))
             self.wm_base = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_wm_base.info, @min(value.version, 7), null);
         if (std.mem.eql(u8, value.interface, protocol.wl_seat.info.name))
-            self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_seat.info, @min(value.version, 9), null);
+            self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_seat.info, @min(value.version, 11), null);
         if (self.test_text_input and std.mem.eql(u8, value.interface, protocol.zwp_text_input_manager_v3.info.name))
             self.text_input_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwp_text_input_manager_v3.info, 1, null);
         if (self.test_text_input) {
@@ -10244,8 +11251,10 @@ const Handler = struct {
 
     fn queueToplevelCaptureFrame(self: *Handler) !void {
         if (self.image_capture_frame != null) return;
-        try std.testing.expectEqual(@as(u32, 3), self.image_capture_width);
-        try std.testing.expectEqual(@as(u32, 2), self.image_capture_height);
+        const width: i32 = if (self.image_capture_cursor) 1 else 3;
+        const height: i32 = if (self.image_capture_cursor) 1 else 2;
+        try std.testing.expectEqual(@as(u32, @intCast(width)), self.image_capture_width);
+        try std.testing.expectEqual(@as(u32, @intCast(height)), self.image_capture_height);
         const descriptor = try ordinaryMemfd(24, 0, &([_]u8{0x55} ** 24));
         const retained = linux.fcntl(descriptor, linux.F.DUPFD_CLOEXEC, 0);
         if (linux.errno(retained) != .SUCCESS) return error.DuplicateFailed;
@@ -10262,9 +11271,9 @@ const Handler = struct {
             pool.id,
             .{
                 .offset = 0,
-                .width = 3,
-                .height = 2,
-                .stride = 12,
+                .width = width,
+                .height = height,
+                .stride = width * 4,
                 .format = .argb8888,
             },
         )).id;
@@ -10460,7 +11469,7 @@ const Handler = struct {
     }
 
     fn queueCursor(self: *Handler, serial: u32) !void {
-        const descriptor = try ordinaryMemfd(4096, 0, &.{ 0xff, 0xff, 0xff, 0xff });
+        const descriptor = try ordinaryMemfd(4096, 0, &.{ 0x23, 0x71, 0xc9, 0xff });
         const pool = try protocol.wl_shm.construct_create_pool(
             self.objects,
             self.queue,
@@ -10544,8 +11553,8 @@ const Handler = struct {
             .{ .warp_pointer = .{
                 .surface = self.surface.?.id,
                 .pointer = self.pointer.?.id,
-                .x = 256,
-                .y = 256,
+                .x = 384,
+                .y = 128,
                 .serial = self.pointer_enter_serial,
             } },
         );
@@ -10816,3 +11825,284 @@ test "shell-input: cursor composition retains source identities" {
     try std.testing.expectEqual(source.sample, placed.sample);
     try std.testing.expectEqual(source.presentation, placed.presentation);
 }
+
+test "shell-input: input timestamps generated subscriptions preserve event association and lifetimes" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-input-timestamps-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 64;
+    root_config.runtime.object_quota = 64;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), physical_fixture.coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    const seat = &coordinator.seat_adapter;
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    const device: ouro.input_backend.DeviceId = .{ .slot = 0, .generation = 1, .seat_generation = 1 };
+    try seat.consume(.{ .device_added = .{ .device = device, .info = .{ .capabilities = .{ .pointer = true, .keyboard = true, .touch = true } } } });
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var client = try ClientConnection.attach(allocator, &reactor, try wayring.unix_socket.connect(path), .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .{ .max_objects = 64, .max_client_ids = 63 });
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    var handler: InputTimestampsHandler = .{ .objects = &client.objects, .queue = &actor.transmit, .registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null) };
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.syncs == 1 and coordinator.physical_output_count != 0 and coordinator.physical_outputs[0].kms_output != null) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.syncs);
+    try std.testing.expect(coordinator.physical_output_count != 0 and coordinator.physical_outputs[0].kms_output != null);
+    const peer = coordinator.peer.?;
+    const target = try seat.makeTarget(peer, try coordinator.adapter.surfaceId(handler.surface.?));
+    try seat.setPointerFocus(target, .{ .x = 0, .y = 0 });
+    try seat.setKeyboardFocus(target);
+    // Values straddle second and millisecond rollover, and carry seconds above
+    // 32 bits. Input timestamps are asserted independently by the client below.
+    try seat.consumePointerMotionAt(.{ .pointer_motion = .{ .device = device, .time_usec = 4_294_967_301_123_456, .dx = 1, .dy = -1 } }, .{ .x = 256, .y = -256 });
+    try seat.consume(.{ .pointer_button = .{ .device = device, .time_usec = 999_999, .button = 272, .pressed = true } });
+    try seat.consume(.{ .pointer_axis = .{ .device = device, .time_usec = 1_000_001, .source = .finger, .vertical = .{ .value = 3 }, .horizontal = .{ .value = 0, .stop = true } } });
+    try seat.consume(.{ .keyboard_key = .{ .device = device, .time_usec = 4_294_967_296_999, .key = 30, .pressed = true } });
+    const contact: @TypeOf(seat.*).TouchContactId = .{ .device = device, .id = 7 };
+    _ = try seat.touchDown(contact, target, 999, .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 0 });
+    // Exercise the physical touch coordinator conversion too, not just seat's
+    // microsecond API. The existing contact supplies its implicit grab target.
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .touch_motion = .{ .device = device, .time_usec = 1_000_001, .slot = 0, .seat_slot = 7, .x = 0.25, .y = 0.5 } }));
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .touch_up = .{ .device = device, .time_usec = 4_294_967_296_000_001, .slot = 0, .seat_slot = 7 } }));
+    try seat.touchFrame();
+    try seat.cancelPointerGrab(); // Synthetic release has no extension timestamp.
+    // Marks seat work and flushes through the physical coordinator, including
+    // the timestamp adapter installed in the generated registry.
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .touch_frame = .{ .device = device } }));
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.events == 14) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 14), handler.events);
+    try std.testing.expectEqual(@as(usize, 12), handler.timestamps_received);
+    try std.testing.expectEqual(@as(usize, 0), handler.pending_count);
+
+    // Destroy one of two pointer subscriptions and release the subscribed
+    // pointer. Its timestamp child remains alive but inert; a newly created
+    // pointer does not inherit either subscription, including on ID reuse.
+    try wayring.client.sendRequest(protocol.zwp_input_timestamps_v1, &client.objects, &actor.transmit, handler.subscriptions[0].?, .{ .destroy = .{} });
+    try wayring.client.sendRequest(protocol.wl_pointer, &client.objects, &actor.transmit, handler.pointer.?, .{ .release = .{} });
+    _ = try ClientCore.sync(&client.objects, &actor.transmit, null);
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.syncs == 2) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.syncs);
+    handler.pointer = (try protocol.wl_seat.construct_get_pointer(&client.objects, &actor.transmit, handler.seat.?, .{})).id;
+    _ = try ClientCore.sync(&client.objects, &actor.transmit, null);
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.syncs == 3) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 3), handler.syncs);
+    handler.after_release = true;
+    try seat.setPointerFocus(target, .{ .x = 0, .y = 0 });
+    try seat.consumePointerMotionAt(.{ .pointer_motion = .{ .device = device, .time_usec = 123_457, .dx = 1, .dy = 0 } }, .{ .x = 512, .y = 0 });
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .touch_frame = .{ .device = device } }));
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.events == 16) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 16), handler.events);
+    try std.testing.expectEqual(@as(usize, 12), handler.timestamps_received);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+    // Server-side capability loss also makes the keyboard subscription inert.
+    // Its queued synthetic release must not acquire an invented timestamp.
+    try seat.consume(.{ .device_removed = device });
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .touch_frame = .{ .device = device } }));
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.events == 17) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 17), handler.events);
+    try std.testing.expectEqual(@as(usize, 12), handler.timestamps_received);
+    try seat.consume(.{ .device_added = .{ .device = device, .info = .{ .capabilities = .{ .keyboard = true } } } });
+    handler.keyboard = (try protocol.wl_seat.construct_get_keyboard(&client.objects, &actor.transmit, handler.seat.?, .{})).id;
+    _ = try ClientCore.sync(&client.objects, &actor.transmit, null);
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.syncs == 4) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 4), handler.syncs);
+    handler.after_capability_loss = true;
+    try seat.consume(.{ .keyboard_key = .{ .device = device, .time_usec = 999_999, .key = 30, .pressed = true } });
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .touch_frame = .{ .device = device } }));
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.events == 18) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 18), handler.events);
+    try std.testing.expectEqual(@as(usize, 12), handler.timestamps_received);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+    // Destroy the remaining children after manager and input destruction.
+    for (handler.subscriptions[1..]) |subscription|
+        try wayring.client.sendRequest(protocol.zwp_input_timestamps_v1, &client.objects, &actor.transmit, subscription.?, .{ .destroy = .{} });
+    _ = try client.prepareClose();
+    try submitClient(&reactor, &driver, &handler);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..512) |_| {
+        const cp = try drainClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and cp.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
+const InputTimestampsHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    manager: ?wayring.objects.Handle = null,
+    seat: ?wayring.objects.Handle = null,
+    surface: ?wayring.objects.Handle = null,
+    pointer: ?wayring.objects.Handle = null,
+    old_pointer: ?wayring.objects.Handle = null,
+    keyboard: ?wayring.objects.Handle = null,
+    touch: ?wayring.objects.Handle = null,
+    subscriptions: [4]?wayring.objects.Handle = .{ null, null, null, null },
+    pending: [2]protocol.zwp_input_timestamps_v1.Event_timestamp = undefined,
+    pending_ids: [2]u32 = undefined,
+    pending_count: usize = 0,
+    timestamps_received: usize = 0,
+    events: usize = 0,
+    syncs: usize = 0,
+    after_release: bool = false,
+    after_capability_loss: bool = false,
+    event_failures: usize = 0,
+
+    pub fn eventError(self: *@This(), _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
+        self.event_failures += 1;
+    }
+
+    pub fn event(self: *@This(), target: wayring.objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
+        if (target.object.interface == &ClientCore.Display.info) {
+            switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
+                .@"error" => return error.ServerProtocolError,
+                else => {},
+            }
+        } else if (target.object.interface == &ClientCore.Registry.info) {
+            switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
+                .global => |v| {
+                    if (std.mem.eql(u8, v.interface, protocol.zwp_input_timestamps_manager_v1.info.name)) {
+                        try std.testing.expectEqual(@as(u32, 1), v.version);
+                        self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, v.name, &protocol.zwp_input_timestamps_manager_v1.info, 1, null);
+                    } else if (std.mem.eql(u8, v.interface, protocol.wl_seat.info.name)) {
+                        self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, v.name, &protocol.wl_seat.info, 9, null);
+                    } else if (std.mem.eql(u8, v.interface, protocol.wl_compositor.info.name)) {
+                        const compositor = try ClientCore.bind(self.objects, self.queue, self.registry, v.name, &protocol.wl_compositor.info, 6, null);
+                        self.surface = (try protocol.wl_compositor.construct_create_surface(self.objects, self.queue, compositor, .{})).id;
+                    }
+                },
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.wl_callback.info) {
+            _ = try ClientCore.decodeCallbackEvent(self.objects, self.objects.namespace.lookupHandle(message.header.object_id).?, message, fds);
+            self.syncs += 1;
+        } else if (target.object.interface == &protocol.wl_seat.info) {
+            switch (try protocol.wl_seat.decodeEvent(message, fds)) {
+                .capabilities => |v| if (self.pointer == null and v.capabilities.contains(protocol.wl_seat.capability.touch)) {
+                    self.pointer = (try protocol.wl_seat.construct_get_pointer(self.objects, self.queue, self.seat.?, .{})).id;
+                    self.old_pointer = (try protocol.wl_seat.construct_get_pointer(self.objects, self.queue, self.seat.?, .{})).id;
+                    self.keyboard = (try protocol.wl_seat.construct_get_keyboard(self.objects, self.queue, self.seat.?, .{})).id;
+                    self.touch = (try protocol.wl_seat.construct_get_touch(self.objects, self.queue, self.seat.?, .{})).id;
+                },
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.zwp_input_timestamps_v1.info) {
+            try std.testing.expect(self.pending_count < 2);
+            self.pending[self.pending_count] = (try protocol.zwp_input_timestamps_v1.decodeEvent(message, fds)).timestamp;
+            self.pending_ids[self.pending_count] = message.header.object_id;
+            self.pending_count += 1;
+            self.timestamps_received += 1;
+        } else if (target.object.interface == &protocol.wl_pointer.info) {
+            const subscribed = message.header.object_id == self.pointer.?.id and !self.after_release;
+            switch (try protocol.wl_pointer.decodeEvent(message, fds)) {
+                .motion => |v| try self.check(v.time, if (self.after_release) 123 else 5123, 1, 5, 123456000, if (subscribed) 2 else 0, 0),
+                .button => |v| if (v.state.value == protocol.wl_pointer.button_state.pressed.value) {
+                    try self.check(v.time, 999, 0, 0, 999999000, if (subscribed) 2 else 0, 0);
+                } else try self.check(v.time, 0, 0, 0, 0, 0, 0),
+                inline .axis, .axis_stop => |v| try self.check(v.time, 1000, 0, 1, 1000, if (subscribed) 2 else 0, 0),
+                else => try std.testing.expectEqual(@as(usize, 0), self.pending_count),
+            }
+        } else if (target.object.interface == &protocol.wl_keyboard.info) {
+            switch (try protocol.wl_keyboard.decodeEvent(message, fds)) {
+                .keymap => |v| {
+                    _ = linux.close(v.fd);
+                },
+                .key => |v| if (v.state.value == protocol.wl_keyboard.key_state.released.value) {
+                    try self.check(v.time, 0, 0, 0, 0, 0, 0);
+                } else if (self.after_capability_loss) {
+                    try self.check(v.time, 999, 0, 0, 0, 0, 0);
+                } else try self.check(v.time, 0, 0, 4294967, 296999000, 1, 2),
+                else => try std.testing.expectEqual(@as(usize, 0), self.pending_count),
+            }
+        } else if (target.object.interface == &protocol.wl_touch.info) {
+            switch (try protocol.wl_touch.decodeEvent(message, fds)) {
+                .down => |v| try self.check(v.time, 0, 0, 0, 999000, 1, 3),
+                .motion => |v| try self.check(v.time, 1000, 0, 1, 1000, 1, 3),
+                .up => |v| try self.check(v.time, 0, 1, 0, 1000, 1, 3),
+                else => try std.testing.expectEqual(@as(usize, 0), self.pending_count),
+            }
+        }
+        if (self.manager != null and self.touch != null and self.subscriptions[0] == null) {
+            self.subscriptions[0] = (try protocol.zwp_input_timestamps_manager_v1.construct_get_pointer_timestamps(self.objects, self.queue, self.manager.?, .{ .pointer = self.pointer.?.id })).id;
+            self.subscriptions[1] = (try protocol.zwp_input_timestamps_manager_v1.construct_get_pointer_timestamps(self.objects, self.queue, self.manager.?, .{ .pointer = self.pointer.?.id })).id;
+            self.subscriptions[2] = (try protocol.zwp_input_timestamps_manager_v1.construct_get_keyboard_timestamps(self.objects, self.queue, self.manager.?, .{ .keyboard = self.keyboard.?.id })).id;
+            self.subscriptions[3] = (try protocol.zwp_input_timestamps_manager_v1.construct_get_touch_timestamps(self.objects, self.queue, self.manager.?, .{ .touch = self.touch.?.id })).id;
+            try wayring.client.sendRequest(protocol.zwp_input_timestamps_manager_v1, self.objects, self.queue, self.manager.?, .{ .destroy = .{} });
+            _ = try ClientCore.sync(self.objects, self.queue, null);
+        }
+        return .continue_dispatch;
+    }
+
+    fn check(self: *@This(), ms: u32, expected_ms: u32, hi: u32, lo: u32, nsec: u32, count: usize, first: usize) !void {
+        try std.testing.expectEqual(expected_ms, ms);
+        try std.testing.expectEqual(count, self.pending_count);
+        for (self.pending[0..count], 0..) |timestamp, i| {
+            try std.testing.expectEqual(self.subscriptions[first + i].?.id, self.pending_ids[i]);
+            try std.testing.expectEqual(hi, timestamp.tv_sec_hi);
+            try std.testing.expectEqual(lo, timestamp.tv_sec_lo);
+            try std.testing.expectEqual(nsec, timestamp.tv_nsec);
+        }
+        self.pending_count = 0;
+        self.events += 1;
+    }
+};
