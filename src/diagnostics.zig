@@ -70,6 +70,16 @@ fn clock(id: c.clockid_t) ?u64 {
     return @as(u64, @intCast(value.tv_sec)) * std.time.ns_per_s + @as(u64, @intCast(value.tv_nsec));
 }
 
+/// Low-frequency display lifecycle diagnostics. Wall time correlates with the
+/// journal; monotonic time preserves ordering and intervals across clock changes.
+pub fn logDisplay(comptime format: []const u8, args: anytype) void {
+    const realtime = clock(c.CLOCK_REALTIME);
+    std.log.info("display unix_ms={?d} mono_ns={?d} " ++ format, .{
+        if (realtime) |ns| ns / std.time.ns_per_ms else null,
+        clock(c.CLOCK_MONOTONIC),
+    } ++ args);
+}
+
 /// Stack-owned context installed only while processing a candidate. No client
 /// pointers, strings, pixel data, titles, or input events enter the recorder.
 pub const Scope = struct {

@@ -862,7 +862,8 @@ erased from scanout; capture does not bake a duplicate into the display.
 ### Startup and frame-pacing diagnostics
 
 Normal stderr logs include output activation identities, power transitions,
-and failure-only DRM diagnostics without enabling protocol or frame tracing.
+display lifecycle transitions, and DRM failures without enabling protocol or
+frame tracing.
 Before a generic `KmsFailed`, look for `DRM output failed` and its `reason`,
 connector, CRTC, generation, and prior state. Adjacent diagnostics include the
 raw event-read result and errno, event-dispatch error, mismatched/duplicate
@@ -874,6 +875,17 @@ Match connector/CRTC IDs to the `activated output` records. The DRM event FD
 is shared: an event-read diagnostic identifies the reader, not necessarily the
 display whose event was in the batch. These diagnostics do not log keyboard
 events, protocol payloads, or framebuffer contents.
+
+For a hotplug blackout, capture normal stderr and filter with
+`grep 'display ' ouro.log`. These records include `unix_ms` (milliseconds since
+the Unix epoch) and `mono_ns` (monotonic nanoseconds). Follow `hotplug-event` and `hotplug-probe`,
+then `candidate-diff` for the old/new fields classifying a surviving connector
+as changed. `refresh-fallback` identifies the error requiring an all-output
+pause. `pause-request` records coordinator state; `kms-pause` records KMS state.
+`kms-disabled` means the disable commit succeeded, whereas
+`kms-modeset-submitted` means the kernel accepted an asynchronous modeset, not
+that its page flip has completed. Activation records include connector, CRTC,
+plane, topology generation, and scheduler generation. No per-frame tracing is needed.
 
 With the recorder enabled (`set-performance-recorder {"enabled": true}` over
 MCP), the `ouro` executable records performance incidents without

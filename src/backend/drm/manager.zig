@@ -6,6 +6,7 @@ const std = @import("std");
 const api = @import("platform.zig");
 const seat_platform = @import("../platform.zig");
 const session_api = @import("../session.zig");
+const diagnostics = @import("../../diagnostics.zig");
 
 pub const Card = api.Card;
 pub const Connector = api.Connector;
@@ -656,6 +657,7 @@ pub const Manager = struct {
                     probe,
                     probed,
                 )) {
+                    logCandidateChanges(current, candidate, probe, probed);
                     if (desktop_updated_count == updated_output.len)
                         return error.OutputTooSmall;
                     updated_output[desktop_updated_count] = connector_id;
@@ -1172,6 +1174,54 @@ fn recordsEqual(comptime T: type, left: []const T, right: []const T) bool {
     if (left.len != right.len) return false;
     for (left, right) |a, b| if (!std.meta.eql(a, b)) return false;
     return true;
+}
+
+fn logCandidateChanges(
+    left: *const Storage,
+    old: ScanoutCandidate,
+    right: *const Storage,
+    new: ScanoutCandidate,
+) void {
+    const a = left.buffer.connectors[old.connector_index];
+    const b = right.buffer.connectors[new.connector_index];
+    diagnostics.logDisplay("candidate-changed connector={d} crtc={d}->{d} plane={d}->{d}", .{
+        a.id,
+        left.buffer.crtcs[old.crtc_index].id,
+        right.buffer.crtcs[new.crtc_index].id,
+        left.buffer.planes[old.plane_index].id,
+        right.buffer.planes[new.plane_index].id,
+    });
+    // Match the fields compared above, excluding inventory offsets and mutable
+    // plane attachment state that do not participate in classification.
+    inline for (.{ "id", "connector_type", "connector_type_id", "width_mm", "height_mm", "encoder_id", "mode_count", "encoder_count", "properties" }) |field|
+        logConfigurationDifference(a.id, "connector." ++ field, @field(a, field), @field(b, field));
+    logConfigurationDifference(a.id, "crtc", left.buffer.crtcs[old.crtc_index], right.buffer.crtcs[new.crtc_index]);
+    const old_plane = left.buffer.planes[old.plane_index];
+    const new_plane = right.buffer.planes[new.plane_index];
+    inline for (.{ "id", "possible_crtcs", "plane_type_value", "has_in_formats", "format_count", "properties" }) |field|
+        logConfigurationDifference(a.id, "plane." ++ field, @field(old_plane, field), @field(new_plane, field));
+    const old_modes = left.buffer.modes[a.mode_start..][0..a.mode_count];
+    const new_modes = right.buffer.modes[b.mode_start..][0..b.mode_count];
+    if (!recordsEqual(Mode, old_modes, new_modes))
+        diagnostics.logDisplay("candidate-diff connector={d} field=modes old={any} new={any}", .{ a.id, old_modes, new_modes });
+    const old_encoders = left.buffer.connector_encoders[a.encoder_start..][0..a.encoder_count];
+    const new_encoders = right.buffer.connector_encoders[b.encoder_start..][0..b.encoder_count];
+    if (!std.mem.eql(u32, old_encoders, new_encoders))
+        diagnostics.logDisplay("candidate-diff connector={d} field=encoders old={any} new={any}", .{ a.id, old_encoders, new_encoders });
+    const old_formats = left.buffer.formats[old_plane.format_start..][0..old_plane.format_count];
+    const new_formats = right.buffer.formats[new_plane.format_start..][0..new_plane.format_count];
+    if (!recordsEqual(api.Format, old_formats, new_formats))
+        diagnostics.logDisplay("candidate-diff connector={d} field=formats old={any} new={any}", .{ a.id, old_formats, new_formats });
+}
+
+fn logConfigurationDifference(connector: u32, comptime field: []const u8, old: anytype, new: @TypeOf(old)) void {
+    if (std.meta.eql(old, new)) return;
+    if (@typeInfo(@TypeOf(old)) == .@"struct") {
+        inline for (std.meta.fields(@TypeOf(old))) |member|
+            logConfigurationDifference(connector, field ++ "." ++ member.name, @field(old, member.name), @field(new, member.name));
+    } else {
+        diagnostics.logDisplay("candidate-diff connector={d} field={s} old={any} new={any}", .{ connector, field, old, new });
+    }
 }
 
 fn candidateTuplePresent(

@@ -9,6 +9,7 @@ const drm = @import("manager.zig");
 const framebuffer = @import("framebuffer.zig");
 const atomic = @import("atomic.zig");
 const cursor = @import("cursor.zig");
+const diagnostics = @import("../../diagnostics.zig");
 
 pub const State = enum {
     initial,
@@ -491,6 +492,9 @@ pub const Output = struct {
             try self.rollbackRecordAndQueued(record);
             return err;
         };
+        if (modeset) diagnostics.logDisplay("kms-modeset-submitted connector={d} crtc={d} plane={d} topology={d} kms_generation={d}", .{
+            self.connector.id, self.crtc.id, self.plane.id, self.snapshot_handle.generation, self.output_generation,
+        });
         // validateSubmit above makes this infallible under the single-thread
         // turn contract; a failure here means that contract was violated after
         // KMS accepted the image and therefore cannot be rolled back safely.
@@ -519,6 +523,9 @@ pub const Output = struct {
     /// in-flight image is first allowed to flip, then immediately disabled so
     /// neither old nor new scanout is recycled while KMS may still use it.
     pub fn requestPause(self: *Output) !void {
+        diagnostics.logDisplay("kms-pause connector={d} crtc={d} state={t}", .{
+            self.connector.id, self.crtc.id, self.state,
+        });
         switch (self.state) {
             .initial, .paused => {
                 try self.pushEvent(.paused);
@@ -820,6 +827,9 @@ pub const Output = struct {
             try self.markFailed(.disable_commit);
             return err;
         };
+        diagnostics.logDisplay("kms-disabled connector={d} crtc={d} plane={d} topology={d} kms_generation={d}", .{
+            self.connector.id, self.crtc.id, self.plane.id, self.snapshot_handle.generation, self.output_generation,
+        });
         const old = self.current.?;
         self.current = null;
         try releaseDisplayed(self.images, old);

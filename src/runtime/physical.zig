@@ -3167,6 +3167,9 @@ pub fn Coordinator(comptime protocol: type) type {
             const connectors = probe.desktop;
             self.hotplug_connector_count = connectors.len;
             self.hotplug_updated_connector_count = probe.desktop_updated.len;
+            diagnostics.logDisplay("hotplug-probe generation={d} connected={any} changed={any} lease_changed={}", .{
+                handle.generation, connectors, probe.desktop_updated, probe.lease_changed,
+            });
             const primary_missing = std.mem.indexOfScalar(
                 u32,
                 connectors,
@@ -3178,6 +3181,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     if (!physical.connected or physical.removing or
                         std.mem.indexOfScalar(u32, connectors, physical.connector_id) == null)
                         continue;
+                    diagnostics.logDisplay("hotplug-promote connector={d}", .{physical.connector_id});
                     try self.promotePrimaryPhysicalOutput(physical);
                     primary_promoted = true;
                     break;
@@ -3192,12 +3196,16 @@ pub fn Coordinator(comptime protocol: type) type {
                         break;
                     }
                 }
-                if (!known) added = true;
+                if (!known) {
+                    diagnostics.logDisplay("hotplug-added connector={d}", .{connector_id});
+                    added = true;
+                }
             }
             var removal_requested = false;
             for (self.physical_outputs[0..self.physical_output_count]) |physical| {
                 if (!physical.connected or physical.removing) continue;
                 if (std.mem.indexOfScalar(u32, connectors, physical.connector_id) == null) {
+                    diagnostics.logDisplay("hotplug-removed connector={d}", .{physical.connector_id});
                     if (!primary_promoted and std.meta.eql(
                         physical.protocol_output,
                         self.output_adapter.primaryOutput(),
@@ -3219,6 +3227,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 return error.InvalidState;
             self.topology_refresh_pending = true;
             self.topology_refresh_draining = updated_connectors.len != 0;
+            diagnostics.logDisplay("refresh-request changed={any} draining={}", .{
+                updated_connectors, self.topology_refresh_draining,
+            });
             errdefer {
                 self.topology_refresh_pending = false;
                 self.topology_refresh_draining = false;
@@ -8897,8 +8908,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 ) catch return error.ActivatedOutputFailure))
                     return error.ActivatedOutputFailure;
             var name_buffer: [64]u8 = undefined;
-            std.log.info(
-                "activated output {s} at {d}x{d}, logical {d}x{d}, scale {d}/120; output={d}:{d} connector={d} crtc={d}",
+            diagnostics.logDisplay(
+                "activated output {s} at {d}x{d}, logical {d}x{d}, scale {d}/120; output={d}:{d} connector={d} crtc={d} plane={d} topology={d} scheduler_generation={d}",
                 .{
                     try drmConnectorName(&name_buffer, connector),
                     mode.hdisplay,
@@ -8910,6 +8921,9 @@ pub fn Coordinator(comptime protocol: type) type {
                     physical.id.generation,
                     connector.id,
                     snapshot.selectedCrtc().id,
+                    snapshot.selectedPlane().id,
+                    snapshot.handle.generation,
+                    generation,
                 },
             );
         }
@@ -13251,6 +13265,12 @@ pub fn Coordinator(comptime protocol: type) type {
         fn pausePhysicalOutput(self: *Self, physical: *PhysicalOutput) !void {
             const output = physical.kms_output orelse return;
             if (!output.accepting_frames) return;
+            diagnostics.logDisplay("pause-request connector={d} removing={} topology_refresh={} reconfigure={} power_transition={} session_disable={} stopping={}", .{
+                physical.connector_id,                physical.removing,
+                self.topology_refresh_pending,        self.output_reconfigure != null,
+                self.output_power_transition != null, self.session_disable_pending,
+                self.stopping,
+            });
             try self.output_adapter.setAvailable(physical.protocol_output, false);
             self.markProtocolAll(ProtocolReady.output);
             if (try output.requestPause()) |action| try self.consumeRetireAction(action);
@@ -13589,6 +13609,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.failCapturesForOutput(output.outputId());
             try self.invalidateCaptureSource(.{ .output = output.outputId() });
             try output.destroy();
+            diagnostics.logDisplay("output-destroyed connector={d}", .{physical.connector_id});
             physical.kms_output = null;
             physical.damage_applied = physical.damage_requested;
             self.clearFifoBarriersAfterOutputAttempts();
@@ -13742,6 +13763,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 error.NoConnectedOutput => return,
                 else => return cause,
             }) orelse return error.DrmHardwareUnavailable;
+            diagnostics.logDisplay("refresh-rescan path=full generation={d}", .{handle.generation});
             self.manager.clearEvents();
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
                 physical.claim = null;
@@ -13808,6 +13830,9 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn refreshChangedTopology(self: *Self) !void {
+            diagnostics.logDisplay("refresh-rescan path=changed connectors={any}", .{
+                self.hotplug_updated_connector_ids[0..self.hotplug_updated_connector_count],
+            });
             const previous = self.manager.currentHandle() orelse
                 return error.DrmHardwareUnavailable;
             var claim_count: usize = 0;
@@ -13845,12 +13870,14 @@ pub fn Coordinator(comptime protocol: type) type {
                 error.NoCompatibleCrtc,
                 error.NoPrimaryPlane,
                 => {
+                    diagnostics.logDisplay("refresh-fallback path=changed reason={t} action=pause-all", .{cause});
                     self.hotplug_updated_connector_count = 0;
                     try self.pauseAllOutputs();
                     return;
                 },
                 else => return cause,
             } orelse {
+                diagnostics.logDisplay("refresh-fallback path=changed reason=device-unavailable action=pause-all", .{});
                 self.hotplug_updated_connector_count = 0;
                 try self.pauseAllOutputs();
                 return;
@@ -13920,6 +13947,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn refreshActiveTopology(self: *Self) !void {
+            diagnostics.logDisplay("refresh-rescan path=preserve", .{});
             const previous = self.manager.currentHandle() orelse
                 return error.DrmHardwareUnavailable;
             var claim_count: usize = 0;
@@ -13943,6 +13971,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 error.NoCompatibleCrtc,
                 error.NoPrimaryPlane,
                 => {
+                    diagnostics.logDisplay("refresh-fallback path=preserve reason={t} action=pause-all", .{cause});
                     self.topology_refresh_draining = true;
                     try self.pauseAllOutputs();
                     return;
