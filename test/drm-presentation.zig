@@ -866,6 +866,10 @@ test "physical coordinator preserves programmed primary color state across secon
     try std.testing.expectEqual(@as(?i32, 3), primary.width);
 
     fixture.second_desktop = true;
+    // Reconnecting hardware may have no encoder bound yet. The manager still
+    // has its pre-unplug snapshot, so it reports this returning output as both
+    // added and changed. Its retired management head must not be reused.
+    fixture.second_encoder_id = 0;
     const drains_before_reconnect = coordinator.stats.output_drains;
     const serial_before_reconnect = coordinator.output_management_adapter.lifecycle.serial;
     try fixture.signalHotplug();
@@ -905,8 +909,10 @@ test "physical coordinator preserves programmed primary color state across secon
     try std.testing.expectEqual(drains_before_reconnect, coordinator.stats.output_drains);
     try std.testing.expectEqual(disables_before_unplug + 1, fixture.disable_attempts);
     try std.testing.expectEqual(primary_scanout_id, primary_kms.outputId());
+    // The changed-topology path batches head creation and activation into
+    // one output-management update.
     try std.testing.expectEqual(
-        serial_before_reconnect + 2,
+        serial_before_reconnect + 1,
         coordinator.output_management_adapter.lifecycle.serial,
     );
 
@@ -5038,6 +5044,7 @@ pub const Fixture = struct {
     first_gamma_lut: ouro.drm_platform.BlobProperty = .{},
     mode_height: u16 = 2,
     second_desktop: bool = false,
+    second_encoder_id: u32 = 21,
     second_mode_width: u16 = 3,
     change_second_mode_after_read: bool = false,
     third_connector: bool = false,
@@ -5278,7 +5285,7 @@ pub const Fixture = struct {
         out.planes[0] = .{ .id = 40, .possible_crtcs = 1, .plane_type_value = 1, .format_start = 0, .format_count = 1, .properties = .{ .plane_type = 4, .fb_id = 5, .crtc_id = 6, .src_x = 7, .src_y = 8, .src_w = 9, .src_h = 10, .crtc_x = 11, .crtc_y = 12, .crtc_w = 13, .crtc_h = 14 } };
         if (self.capture_vulkan) out.planes[0].properties.in_fence_fd = 17;
         out.formats[0] = .{ .fourcc = ouro.gbm.format_xrgb8888, .modifier = ouro.gbm.modifier_linear };
-        out.connectors[1] = .{ .id = 11, .connector_type = 1, .connector_type_id = 2, .connected = true, .desktop = self.second_desktop, .width_mm = 2, .height_mm = 2, .encoder_id = 21, .mode_start = 1, .mode_count = 1, .encoder_start = 1, .encoder_count = 1, .properties = .{ .crtc_id = 1, .vrr_capable = self.vrr_supported } };
+        out.connectors[1] = .{ .id = 11, .connector_type = 1, .connector_type_id = 2, .connected = true, .desktop = self.second_desktop, .width_mm = 2, .height_mm = 2, .encoder_id = self.second_encoder_id, .mode_start = 1, .mode_count = 1, .encoder_start = 1, .encoder_count = 1, .properties = .{ .crtc_id = 1, .vrr_capable = self.vrr_supported } };
         out.modes[1] = out.modes[0];
         out.modes[1].hdisplay = self.second_mode_width;
         out.modes[1].hsync_start = self.second_mode_width;

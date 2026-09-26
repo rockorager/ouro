@@ -13910,6 +13910,10 @@ pub fn Coordinator(comptime protocol: type) type {
             var management_update = true;
             defer if (management_update) self.output_management_adapter.endUpdate();
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                // The probe compares against the pre-unplug snapshot, so a
+                // returning connector can also be reported as changed. Its
+                // old head is retired; activateAdditionalOutputs adds it anew.
+                if (!physical.connected) continue;
                 if (physical.kms_output != null) continue;
                 if (std.mem.indexOfScalar(
                     u32,
