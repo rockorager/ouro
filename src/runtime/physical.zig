@@ -3173,7 +3173,10 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn processHotplug(self: *Self) anyerror!void {
             const monitor = if (self.hotplug) |*value| value else return;
-            if (monitor.takeChanged()) self.hotplug_refresh_pending = true;
+            if (monitor.takeChanged()) {
+                self.manager.discardProbe();
+                self.hotplug_refresh_pending = true;
+            }
             if (!self.hotplug_refresh_pending) return;
             if (self.stopping) {
                 self.hotplug_refresh_pending = false;

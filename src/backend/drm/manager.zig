@@ -279,6 +279,7 @@ pub const Manager = struct {
     cards: []Card,
     stores: [2]Storage,
     active_store: u1 = 0,
+    probed_generation: ?u32 = null,
     device: ?session_api.DeviceHandle = null,
     card: Card = .{},
     generation: u32 = 0,
@@ -399,6 +400,7 @@ pub const Manager = struct {
     /// claim by exact connector, CRTC, plane, and mode identity. Replacement
     /// handles are written in input order only after the complete topology can
     /// be rebound atomically; otherwise the current generation stays valid.
+    /// Consumes the last successful connector probe when still valid.
     pub fn rescanPreservingClaims(
         self: *Manager,
         handles: []const ClaimHandle,
@@ -419,6 +421,7 @@ pub const Manager = struct {
     /// Rescans while preserving only the supplied active claims. Claims not
     /// supplied are invalidated atomically with the topology generation so a
     /// coordinator can rebuild changed outputs without draining unchanged ones.
+    /// Consumes the last successful connector probe when still valid.
     pub fn rescanReplacingClaims(
         self: *Manager,
         preserved: []const ClaimHandle,
@@ -446,6 +449,8 @@ pub const Manager = struct {
         var failed = false;
         defer diagnostics.logDisplayDuration(started, "drm-rescan-end generation={d} failed={}", .{ self.generation, failed });
         errdefer failed = true;
+        const reuse_probe = preserved_handles != null and self.probed_generation == self.generation;
+        self.discardProbe();
         if (self.hasActiveLease()) return error.LeasesActive;
         const preserved = preserved_handles orelse &.{};
         const rebound = try self.allocator.alloc(ScanoutCandidate, preserved.len);
@@ -480,7 +485,11 @@ pub const Manager = struct {
 
         const next_store: u1 = self.active_store ^ 1;
         const storage = &self.stores[next_store];
-        try self.platform.readTopology(fd, &storage.buffer);
+        diagnostics.logDisplay("drm-rescan-topology source={s}", .{
+            @as([]const u8, if (same_device and reuse_probe) "probe" else "fresh"),
+        });
+        if (!same_device or !reuse_probe)
+            try self.platform.readTopology(fd, &storage.buffer);
         try validateCounts(&storage.buffer);
         storage.candidate_count = try collectScanoutCandidates(&storage.buffer, storage.candidates);
         storage.lease_candidate_count = try collectLeaseCandidates(
@@ -562,6 +571,7 @@ pub const Manager = struct {
     /// once, and all handles for it become stale before Session releases the
     /// card node.
     pub fn remove(self: *Manager) !void {
+        self.discardProbe();
         if (!self.present and self.device == null) return;
         if (self.event_count == self.events_buffer.len) return error.EventQueueFull;
         if (self.generation == std.math.maxInt(u32)) return error.GenerationExhausted;
@@ -615,6 +625,7 @@ pub const Manager = struct {
     /// The result is connector identity only; ownership changes still require
     /// the coordinator to drain outputs before a generation-changing rescan.
     pub fn probeDesktopConnectorIds(self: *Manager, output: []u32) ![]const u32 {
+        self.discardProbe();
         if (!self.present) return error.StaleSnapshot;
         const fd = try self.session.deviceFd(self.device orelse return error.StaleSnapshot);
         const probe = &self.stores[self.active_store ^ 1];
@@ -630,8 +641,16 @@ pub const Manager = struct {
         return output[0..probe.candidate_count];
     }
 
+    /// A newer hotplug notification invalidates the staged topology even when
+    /// the coordinator must wait for an in-progress output drain to finish.
+    pub fn discardProbe(self: *Manager) void {
+        self.probed_generation = null;
+    }
+
     /// Reads desktop and lease connector identity from one kernel topology so
     /// hotplug classification cannot mix two different probe generations.
+    /// Retains that topology for one same-device claim-preserving/replacing
+    /// rescan. A full rescan always reads fresh kernel state.
     pub fn probeConnectorChanges(
         self: *Manager,
         handle: Handle,
@@ -643,6 +662,7 @@ pub const Manager = struct {
         var failed = false;
         defer diagnostics.logDisplayDuration(started, "drm-probe-end generation={d} failed={}", .{ handle.generation, failed });
         errdefer failed = true;
+        self.discardProbe();
         if (!self.present or handle.generation != self.generation)
             return error.StaleSnapshot;
         const fd = try self.session.deviceFd(self.device orelse return error.StaleSnapshot);
@@ -702,6 +722,7 @@ pub const Manager = struct {
                 break;
             }
         };
+        self.probed_generation = self.generation;
         return .{
             .desktop = desktop_output[0..probe.candidate_count],
             .desktop_updated = updated_output[0..desktop_updated_count],
@@ -894,6 +915,7 @@ pub const Manager = struct {
         }
 
         const master_fd = try self.session.deviceFd(device);
+        self.discardProbe();
         const result = try self.platform.createLease(
             master_fd,
             self.lease_objects[0..object_count],
@@ -1029,6 +1051,7 @@ pub const Manager = struct {
 
     fn releaseLease(self: *Manager, slot: u32) void {
         std.debug.assert(self.leases[slot].active and self.active_lease_count != 0);
+        self.discardProbe();
         for (self.claims) |*claim| if (claim.active and claim.lease_slot == slot) {
             claim.active = false;
             claim.lease_slot = no_claim;
@@ -1759,8 +1782,12 @@ test "drm: same-device rescan preserves exact claims while adding outputs" {
     const first = (try manager.rescan()).?;
     const primary = try manager.primaryClaim(first);
     platform.multiple_outputs = true;
+    var connector_ids: [2]u32 = undefined;
+    var updated_ids: [2]u32 = undefined;
+    _ = try manager.probeConnectorChanges(first, &connector_ids, &updated_ids);
     var refreshed: [1]ClaimHandle = undefined;
     const second = (try manager.rescanPreservingClaims(&.{primary}, &refreshed)).?;
+    try std.testing.expectEqual(@as(usize, 2), platform.topology_reads);
     try std.testing.expectError(error.StaleClaim, manager.claimSnapshot(primary));
     try std.testing.expectEqual(primary.slot, refreshed[0].slot);
     try std.testing.expectEqual(primary.generation, refreshed[0].generation);
@@ -1770,6 +1797,13 @@ test "drm: same-device rescan preserves exact claims while adding outputs" {
     try std.testing.expectEqual(@as(usize, 2), candidates.len);
     const added = try manager.claimScanout(second, candidates[1]);
     try std.testing.expectEqual(@as(u32, 21), (try manager.claimSnapshot(added)).selectedConnector().id);
+
+    // The staged topology is single-use, not a persistent rescan cache.
+    platform.alternate_mode = true;
+    var next_claims: [2]ClaimHandle = undefined;
+    const third = (try manager.rescanPreservingClaims(&.{ refreshed[0], added }, &next_claims)).?;
+    try std.testing.expectEqual(@as(usize, 3), platform.topology_reads);
+    try std.testing.expectEqual(@as(usize, 2), (try manager.snapshot(third)).selectedConnector().mode_count);
 }
 
 test "drm: same-device rescan replaces changed claims atomically" {
@@ -1784,8 +1818,12 @@ test "drm: same-device rescan replaces changed claims atomically" {
     const primary = try manager.primaryClaim(first);
     const secondary = try manager.claimScanout(first, (try manager.scanoutCandidates(first))[1]);
     platform.alternate_mode = true;
+    var connector_ids: [2]u32 = undefined;
+    var updated_ids: [2]u32 = undefined;
+    _ = try manager.probeConnectorChanges(first, &connector_ids, &updated_ids);
     var refreshed: [1]ClaimHandle = undefined;
     const second = (try manager.rescanReplacingClaims(&.{secondary}, &refreshed)).?;
+    try std.testing.expectEqual(@as(usize, 2), platform.topology_reads);
 
     try std.testing.expectError(error.StaleClaim, manager.claimSnapshot(primary));
     try std.testing.expectError(error.StaleClaim, manager.claimSnapshot(secondary));
@@ -1816,14 +1854,77 @@ test "drm: changed claim identity rejects refresh without mutation" {
         manager.rescanPreservingClaims(&.{primary}, &refreshed),
     );
     platform.second_desktop = false;
+    var connector_ids: [2]u32 = undefined;
+    var updated_ids: [2]u32 = undefined;
+    _ = try manager.probeConnectorChanges(handle, &connector_ids, &updated_ids);
     try std.testing.expectError(
         error.ClaimsChanged,
         manager.rescanPreservingClaims(&.{ primary, secondary }, &refreshed),
     );
+    try std.testing.expectEqual(@as(usize, 2), platform.topology_reads);
     try std.testing.expectEqual(handle, manager.currentHandle().?);
     try std.testing.expectEqual(@as(u32, 20), (try manager.claimSnapshot(primary)).selectedConnector().id);
     try std.testing.expectEqual(@as(u32, 21), (try manager.claimSnapshot(secondary)).selectedConnector().id);
     try std.testing.expectEqualSlices(Event, &.{.{ .snapshot = handle }}, manager.events());
+
+    // Failure consumes the probe too: retry against the newly restored output.
+    platform.second_desktop = true;
+    _ = try manager.rescanPreservingClaims(&.{ primary, secondary }, &refreshed);
+    try std.testing.expectEqual(@as(usize, 3), platform.topology_reads);
+    try std.testing.expectEqual(@as(u32, 21), (try manager.claimSnapshot(refreshed[1])).selectedConnector().id);
+}
+
+test "drm: invalidated and overwritten probes are not reused" {
+    const Invalidation = enum { notification, identity_probe, failed_probe };
+    for (std.enums.values(Invalidation)) |invalidation| {
+        var seat = FakeSeat{};
+        const session = try seat.createSession();
+        defer destroyTestSession(session);
+        var platform = FakeDrm{};
+        var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+        defer manager.deinit() catch unreachable;
+
+        const handle = (try manager.rescan()).?;
+        const primary = try manager.primaryClaim(handle);
+        var connector_ids: [2]u32 = undefined;
+        var updated_ids: [2]u32 = undefined;
+        _ = try manager.probeConnectorChanges(handle, &connector_ids, &updated_ids);
+        switch (invalidation) {
+            .notification => manager.discardProbe(),
+            .identity_probe => _ = try manager.probeDesktopConnectorIds(&connector_ids),
+            .failed_probe => {
+                platform.fail_topology = true;
+                try std.testing.expectError(error.FakeTopology, manager.probeConnectorChanges(handle, &connector_ids, &updated_ids));
+                platform.fail_topology = false;
+            },
+        }
+        platform.alternate_mode = true;
+        const reads_before = platform.topology_reads;
+        var refreshed: [1]ClaimHandle = undefined;
+        const next = (try manager.rescanPreservingClaims(&.{primary}, &refreshed)).?;
+        try std.testing.expectEqual(reads_before + 1, platform.topology_reads);
+        try std.testing.expectEqual(@as(usize, 2), (try manager.snapshot(next)).selectedConnector().mode_count);
+    }
+}
+
+test "drm: reused probe rebinds the current claim mode" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{ .alternate_mode = true };
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    defer manager.deinit() catch unreachable;
+
+    const handle = (try manager.rescan()).?;
+    const primary = try manager.primaryClaim(handle);
+    var connector_ids: [2]u32 = undefined;
+    var updated_ids: [2]u32 = undefined;
+    _ = try manager.probeConnectorChanges(handle, &connector_ids, &updated_ids);
+    try manager.commitClaimMode(primary, 1024, 768, 75000);
+    var refreshed: [1]ClaimHandle = undefined;
+    _ = try manager.rescanPreservingClaims(&.{primary}, &refreshed);
+    try std.testing.expectEqual(@as(usize, 2), platform.topology_reads);
+    try std.testing.expectEqual(@as(u16, 1024), (try manager.claimSnapshot(refreshed[0])).selectedMode().hdisplay);
 }
 
 test "drm: connector probe preserves active topology when no outputs remain" {
@@ -1916,8 +2017,13 @@ test "drm: failed rescan preserves claims and successful rescan invalidates them
     const first = (try manager.rescan()).?;
     const first_candidates = try manager.scanoutCandidates(first);
     const claim = try manager.claimScanout(first, first_candidates[1]);
+    var connector_ids: [2]u32 = undefined;
+    var updated_ids: [2]u32 = undefined;
+    _ = try manager.probeConnectorChanges(first, &connector_ids, &updated_ids);
+    // A full recovery rescan must read even with a successful staged probe.
     platform.fail_topology = true;
     try std.testing.expectError(error.FakeTopology, manager.rescan());
+    try std.testing.expectEqual(@as(usize, 3), platform.topology_reads);
     try std.testing.expectEqual(@as(u32, 21), (try manager.claimSnapshot(claim)).selectedConnector().id);
 
     platform.fail_topology = false;
@@ -2355,6 +2461,7 @@ const FakeDrm = struct {
     report_too_many_cards: bool = false,
     caps_enabled: bool = false,
     topology_after_caps: bool = false,
+    topology_reads: usize = 0,
     fail_topology: bool = false,
     alternate_mode: bool = false,
     multiple_outputs: bool = false,
@@ -2399,6 +2506,7 @@ const FakeDrm = struct {
 
     fn readTopology(context: *anyopaque, _: std.posix.fd_t, buffer: *api.TopologyBuffer) !void {
         const self: *FakeDrm = @ptrCast(@alignCast(context));
+        self.topology_reads += 1;
         self.topology_after_caps = self.caps_enabled;
         if (self.fail_topology) return error.FakeTopology;
         buffer.reset();

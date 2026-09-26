@@ -987,6 +987,7 @@ test "physical coordinator preserves programmed primary color state across secon
     try std.testing.expectEqual(ouro.scene_geometry.Point{ .x = 4, .y = 0 }, coordinator.interaction.pointerPosition());
     const disables_before_unplug = fixture.disable_attempts;
     const drains_before_unplug = coordinator.stats.output_drains;
+    const reads_before_unplug = fixture.topology_reads;
     // A new kernel probe sees our programmed values, not the inherited startup
     // values. These are the exact differences observed on the laptop.
     fixture.first_max_bpc.inherited = 8;
@@ -1002,6 +1003,7 @@ test "physical coordinator preserves programmed primary color state across secon
     }
     try std.testing.expectEqual(drains_before_unplug + 1, coordinator.stats.output_drains);
     try std.testing.expectEqual(disables_before_unplug + 1, fixture.disable_attempts);
+    try std.testing.expectEqual(reads_before_unplug + 1, fixture.topology_reads);
     try std.testing.expect(coordinator.physical_outputs[0].kms_output.? == primary_kms);
     try std.testing.expectEqual(primary_scanout_id, primary_kms.outputId());
     try std.testing.expect(primary_kms.accepting_frames);
@@ -1033,6 +1035,7 @@ test "physical coordinator preserves programmed primary color state across secon
     fixture.second_encoder_id = 0;
     const drains_before_reconnect = coordinator.stats.output_drains;
     const serial_before_reconnect = coordinator.output_management_adapter.lifecycle.serial;
+    const reads_before_reconnect = fixture.topology_reads;
     try fixture.signalHotplug();
     for (0..512) |_| {
         _ = try loop.turn(coordinator);
@@ -1069,6 +1072,7 @@ test "physical coordinator preserves programmed primary color state across secon
     ));
     try std.testing.expectEqual(drains_before_reconnect, coordinator.stats.output_drains);
     try std.testing.expectEqual(disables_before_unplug + 1, fixture.disable_attempts);
+    try std.testing.expectEqual(reads_before_reconnect + 1, fixture.topology_reads);
     try std.testing.expectEqual(primary_scanout_id, primary_kms.outputId());
     try std.testing.expectEqual(@as(i64, 384), coordinator.interaction.pointerPositionFixed().x);
     try std.testing.expectEqual(@as(i64, 256), coordinator.interaction.pointerPositionFixed().y);
@@ -1119,6 +1123,7 @@ test "physical coordinator rebuilds an output when its modes change" {
     const unchanged_management_head = coordinator.physical_outputs[1].management_head;
     const drains_before = coordinator.stats.output_drains;
     const serial_before = coordinator.output_management_adapter.lifecycle.serial;
+    const reads_before = fixture.topology_reads;
     // Keep a flip outstanding so the refresh must wait across several turns.
     fixture.held_crtc = 30;
     const changed_kms = coordinator.physical_outputs[0].kms_output.?;
@@ -1161,6 +1166,7 @@ test "physical coordinator rebuilds an output when its modes change" {
     try std.testing.expectEqual(@as(?i32, 4), snapshot.width);
     try std.testing.expectEqual(.none, coordinator.topology_refresh_wait);
     try std.testing.expect(coordinator.topology_refresh_wait_started == null);
+    try std.testing.expectEqual(reads_before + 1, fixture.topology_reads);
     try std.testing.expect(std.meta.eql(physical_id, coordinator.physical_outputs[0].id));
     try std.testing.expect(std.meta.eql(
         protocol_output,
@@ -1372,12 +1378,44 @@ test "physical coordinator falls back when topology changes during targeted refr
     const second_output = coordinator.physical_outputs[1].protocol_output;
     const second_head = coordinator.physical_outputs[1].management_head;
     const drains_before = coordinator.stats.output_drains;
+    const reads_before = fixture.topology_reads;
+    fixture.held_crtc = 30;
+    const first_kms = coordinator.physical_outputs[0].kms_output.?;
+    try first_kms.request(.damage, 1);
+    coordinator.physical_outputs[0].damage_requested +%= 1;
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (first_kms.in_flight_frame != null) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expect(first_kms.in_flight_frame != null);
     fixture.first_mode_width = 4;
-    fixture.change_second_mode_after_read = true;
     try fixture.signalHotplug();
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.topology_refresh_wait == .output_drain) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expectEqual(.output_drain, coordinator.topology_refresh_wait);
+    try std.testing.expectEqual(reads_before + 1, fixture.topology_reads);
+
+    // A second notification arrives while the first refresh is draining.
+    // The old probe must not be published: the preserved second claim no
+    // longer matches, so a fresh read must trigger the full-rescan fallback.
+    fixture.second_mode_width = 4;
+    try fixture.signalHotplug();
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.hotplug_refresh_pending) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expect(coordinator.hotplug_refresh_pending);
+    try std.testing.expectEqual(reads_before + 1, fixture.topology_reads);
+    try fixture.releaseHeldFlips();
     for (0..768) |_| {
         _ = try loop.turn(coordinator);
         if (!coordinator.topology_refresh_pending and
+            !coordinator.hotplug_refresh_pending and
             coordinator.physical_outputs[0].kms_output != null and
             coordinator.physical_outputs[1].kms_output != null)
         {
@@ -1397,6 +1435,9 @@ test "physical coordinator falls back when topology changes during targeted refr
     try std.testing.expect(std.meta.eql(second_output, coordinator.physical_outputs[1].protocol_output));
     try std.testing.expect(!std.meta.eql(second_head, coordinator.physical_outputs[1].management_head));
     try std.testing.expectEqual(drains_before + 2, coordinator.stats.output_drains);
+    // Initial classification, invalidated refresh, recovery, then the queued
+    // notification's classification (which now finds no additional changes).
+    try std.testing.expectEqual(reads_before + 4, fixture.topology_reads);
 
     try coordinator.requestStop();
     try drainServer(root, coordinator, &loop);
@@ -5225,6 +5266,7 @@ pub const Fixture = struct {
     unmaps: usize = 0,
     capture_vulkan: bool = false,
     discover_cards: bool = true,
+    topology_reads: usize = 0,
     first_desktop: bool = true,
     first_mode_width: u16 = 3,
     first_max_bpc: ouro.drm_platform.RangeProperty = .{},
@@ -5233,7 +5275,6 @@ pub const Fixture = struct {
     second_desktop: bool = false,
     second_encoder_id: u32 = 21,
     second_mode_width: u16 = 3,
-    change_second_mode_after_read: bool = false,
     third_connector: bool = false,
     third_desktop: bool = false,
     third_mode_width: u16 = 3,
@@ -5461,6 +5502,7 @@ pub const Fixture = struct {
     fn enableCaps(_: *anyopaque, _: linux.fd_t) !void {}
     fn topology(context: *anyopaque, _: linux.fd_t, out: *ouro.drm_platform.TopologyBuffer) !void {
         const self: *Fixture = @ptrCast(@alignCast(context));
+        self.topology_reads += 1;
         out.reset();
         out.connectors[0] = .{ .id = 10, .connector_type = 1, .connector_type_id = 1, .connected = true, .desktop = self.first_desktop, .width_mm = 1, .height_mm = 1, .encoder_id = 20, .mode_start = 0, .mode_count = 1, .encoder_start = 0, .encoder_count = 1, .properties = .{ .crtc_id = 1, .vrr_capable = self.vrr_supported } };
         out.modes[0] = .{ .clock = 1, .hdisplay = self.first_mode_width, .hsync_start = self.first_mode_width, .hsync_end = self.first_mode_width, .htotal = self.first_mode_width, .hskew = 0, .vdisplay = self.mode_height, .vsync_start = self.mode_height, .vsync_end = self.mode_height, .vtotal = self.mode_height, .vscan = 0, .vrefresh = 60, .flags = 0, .mode_type = 0 };
@@ -5504,10 +5546,6 @@ pub const Fixture = struct {
         out.crtc_count = topology_count;
         out.plane_count = topology_count;
         out.format_count = topology_count;
-        if (self.change_second_mode_after_read) {
-            self.second_mode_width = 4;
-            self.change_second_mode_after_read = false;
-        }
     }
 
     fn createGbm(context: *anyopaque, _: linux.fd_t) !ouro.gbm.Device {
