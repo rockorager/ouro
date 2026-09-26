@@ -829,6 +829,23 @@ test "physical coordinator preserves programmed primary color state across secon
     try std.testing.expect(physicalOutputsSettled(coordinator));
     try std.testing.expectEqual(.active, primary_kms.kms_output.state);
     try std.testing.expectEqual(.active, coordinator.physical_outputs[1].kms_output.?.kms_output.state);
+    const pointer_device: ouro.input_backend.DeviceId = .{
+        .slot = 0,
+        .generation = 1,
+        .seat_generation = 1,
+    };
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{
+        .device = pointer_device,
+        .info = .{ .capabilities = .{ .pointer = true } },
+    } }));
+    const motion = coordinator.interaction.motionToPoint(.{ .x = 4, .y = 0 });
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_motion = .{
+        .device = pointer_device,
+        .time_usec = 1,
+        .dx = motion.dx,
+        .dy = motion.dy,
+    } }));
+    try std.testing.expectEqual(ouro.scene_geometry.Point{ .x = 4, .y = 0 }, coordinator.interaction.pointerPosition());
     const disables_before_unplug = fixture.disable_attempts;
     const drains_before_unplug = coordinator.stats.output_drains;
     // A new kernel probe sees our programmed values, not the inherited startup
@@ -864,6 +881,11 @@ test "physical coordinator preserves programmed primary color state across secon
     );
     try std.testing.expectEqual(@as(i32, 0), primary.x);
     try std.testing.expectEqual(@as(?i32, 3), primary.width);
+    // The removed monitor held the pointer. Center it on the remaining 3x2
+    // output, including the half-pixel x coordinate, without another input.
+    try std.testing.expectEqual(@as(i64, 384), coordinator.interaction.pointerPositionFixed().x);
+    try std.testing.expectEqual(@as(i64, 256), coordinator.interaction.pointerPositionFixed().y);
+    try std.testing.expectEqual(ouro.scene_geometry.Point{ .x = 1, .y = 1 }, coordinator.interaction.cursor.position);
 
     fixture.second_desktop = true;
     // Reconnecting hardware may have no encoder bound yet. The manager still
@@ -909,6 +931,8 @@ test "physical coordinator preserves programmed primary color state across secon
     try std.testing.expectEqual(drains_before_reconnect, coordinator.stats.output_drains);
     try std.testing.expectEqual(disables_before_unplug + 1, fixture.disable_attempts);
     try std.testing.expectEqual(primary_scanout_id, primary_kms.outputId());
+    try std.testing.expectEqual(@as(i64, 384), coordinator.interaction.pointerPositionFixed().x);
+    try std.testing.expectEqual(@as(i64, 256), coordinator.interaction.pointerPositionFixed().y);
     // The changed-topology path batches head creation and activation into
     // one output-management update.
     try std.testing.expectEqual(
