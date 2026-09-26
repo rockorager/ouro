@@ -12,7 +12,7 @@ pub fn KeyConsumer() type {
         pub const Snapshot = struct {
             arena: std.heap.ArenaAllocator,
             bindings: []const Action,
-            experimental_hotkeys: bool = false,
+            experimental_hotkeys: bool = (user_config.General{}).experimental_hotkeys,
 
             pub fn deinit(snapshot: *Snapshot) void {
                 snapshot.arena.deinit();

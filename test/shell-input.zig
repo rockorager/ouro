@@ -19,7 +19,7 @@ const pixels = [_]u8{
     0xa0, 0xb0, 0xc0, 0xff, 0xd0, 0xe0, 0xf0, 0xff, 0x11, 0x22, 0x33, 0xff, 0, 0, 0, 0,
 };
 
-test "hotkey: generated client opt-in, consumed pairs and unfocused activation" {
+test "hotkey: generated client defaults, opt-out, consumed pairs and unfocused activation" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-hotkey-{d}.sock", .{linux.getpid()});
@@ -34,6 +34,8 @@ test "hotkey: generated client opt-in, consumed pairs and unfocused activation" 
     var config = physical_fixture.coordinatorConfig();
     config.router_capacity = 32;
     const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    // Startup installs the parsed configuration before accepting clients.
+    try installHotkeyConfig(coordinator, "{}");
     var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 32 });
     try coordinator.start(&loop);
     var reactor: wayring.io_uring.Reactor = undefined;
@@ -55,14 +57,13 @@ test "hotkey: generated client opt-in, consumed pairs and unfocused activation" 
         try waitForEither(&root.ring, reactor.ring);
     }
     try std.testing.expect(handler.app.mapped and handler.app.input_ready);
-    try std.testing.expect(handler.manager == null); // absent, not merely denied, by default
-    try installHotkeyConfig(coordinator, "{\"general\":{\"experimental_hotkeys\":true}}");
     for (0..512) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
         if (handler.bound == 1 and handler.denied == 2) break;
         try waitForEither(&root.ring, reactor.ring);
     }
+    try std.testing.expect(handler.manager != null);
     try std.testing.expectEqual(@as(usize, 1), handler.bound);
     try std.testing.expectEqual(@as(usize, 2), handler.denied);
     try std.testing.expectEqual(@as(u32, 0), handler.last_denied); // compositor Super+Q conflict
@@ -287,14 +288,6 @@ const HotkeyHandler = struct {
                 .global => |g| {
                     if (std.mem.eql(u8, g.interface, protocol.xx_hotkey_manager_v1.info.name)) {
                         self.global = g.name;
-                        self.manager = try ClientCore.bind(self.app.objects, self.queue, self.app.registry, g.name, &protocol.xx_hotkey_manager_v1.info, 1, null);
-                        try protocol.xx_hotkey_manager_v1.encodeRequest(self.queue, self.manager.?.id, .{ .set_app_id = .{ .app_id = "ouro.hotkey.test" } });
-                        self.hotkey = (try protocol.xx_hotkey_manager_v1.construct_create_hotkey(self.app.objects, self.queue, self.manager.?, .{})).id;
-                        try protocol.xx_hotkey_v1.encodeRequest(self.queue, self.hotkey.?.id, .{ .set_seat = .{ .seat = self.app.seat.?.id } });
-                        try self.describe(self.hotkey.?, 'p', 6);
-                        const denied = (try protocol.xx_hotkey_manager_v1.construct_create_hotkey(self.app.objects, self.queue, self.manager.?, .{})).id;
-                        try self.describe(denied, 'a', 0); // unsafe text
-                        try self.describe(denied, 'q', 8); // compositor conflict
                     }
                     if (std.mem.eql(u8, g.interface, protocol.xdg_activation_v1.info.name))
                         self.activation = try ClientCore.bind(self.app.objects, self.queue, self.app.registry, g.name, &protocol.xdg_activation_v1.info, 1, null);
@@ -309,6 +302,19 @@ const HotkeyHandler = struct {
                     self.global_removed = true;
                 },
             }
+            _ = try self.app.event(target, message, fds);
+            // Registry order is unspecified, so wait for both globals.
+            if (self.manager == null and self.global != 0 and self.app.seat != null) {
+                self.manager = try ClientCore.bind(self.app.objects, self.queue, self.app.registry, self.global, &protocol.xx_hotkey_manager_v1.info, 1, null);
+                try protocol.xx_hotkey_manager_v1.encodeRequest(self.queue, self.manager.?.id, .{ .set_app_id = .{ .app_id = "ouro.hotkey.test" } });
+                self.hotkey = (try protocol.xx_hotkey_manager_v1.construct_create_hotkey(self.app.objects, self.queue, self.manager.?, .{})).id;
+                try protocol.xx_hotkey_v1.encodeRequest(self.queue, self.hotkey.?.id, .{ .set_seat = .{ .seat = self.app.seat.?.id } });
+                try self.describe(self.hotkey.?, 'p', 6);
+                const denied = (try protocol.xx_hotkey_manager_v1.construct_create_hotkey(self.app.objects, self.queue, self.manager.?, .{})).id;
+                try self.describe(denied, 'a', 0); // unsafe text
+                try self.describe(denied, 'q', 8); // compositor conflict
+            }
+            return .continue_dispatch;
         } else if (target.object.interface == &protocol.zwp_keyboard_shortcuts_inhibitor_v1.info) {
             _ = try protocol.zwp_keyboard_shortcuts_inhibitor_v1.decodeEvent(message, fds);
             return .continue_dispatch;
@@ -1687,7 +1693,7 @@ test "shell-input: generated primary selection validates focus serial and transf
     try root.deinit();
 }
 
-test "shell-input: security context filters nested manager before registry discovery" {
+test "shell-input: hotkey: security context filters privileged globals and rejects guessed binds" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     var child_path_storage: [128]u8 = undefined;
@@ -1719,6 +1725,7 @@ test "shell-input: security context filters nested manager before registry disco
         .metadata_bytes = 64,
     };
     const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    try installHotkeyConfig(coordinator, "{}");
     var loop = try Loop.init(
         allocator,
         root,
@@ -1762,6 +1769,7 @@ test "shell-input: security context filters nested manager before registry disco
             parent_handler.input_method_global_seen and
             parent_handler.virtual_keyboard_global_seen and
             parent_handler.virtual_pointer_global_seen and
+            parent_handler.hotkey_global != null and
             parent_handler.transient_seat_global_seen and
             parent_handler.foreign_toplevel_global_seen and
             parent_handler.workspace_global_seen and
@@ -1778,6 +1786,7 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(parent_handler.input_method_global_seen);
     try std.testing.expect(parent_handler.virtual_keyboard_global_seen);
     try std.testing.expect(parent_handler.virtual_pointer_global_seen);
+    try std.testing.expect(parent_handler.hotkey_global != null);
     try std.testing.expect(parent_handler.transient_seat_global_seen);
     try std.testing.expect(parent_handler.foreign_toplevel_global_seen);
     try std.testing.expect(parent_handler.workspace_global_seen);
@@ -1881,6 +1890,7 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(!child_handler.input_method_global_seen);
     try std.testing.expect(!child_handler.virtual_keyboard_global_seen);
     try std.testing.expect(!child_handler.virtual_pointer_global_seen);
+    try std.testing.expect(child_handler.hotkey_global == null);
     try std.testing.expect(!child_handler.transient_seat_global_seen);
     try std.testing.expect(!child_handler.foreign_toplevel_global_seen);
     try std.testing.expect(!child_handler.workspace_global_seen);
@@ -1901,6 +1911,18 @@ test "shell-input: security context filters nested manager before registry disco
     const metadata = coordinator.security_context_adapter.metadata(sandbox_peer.?).?;
     try std.testing.expectEqualStrings("org.example.Sandbox", metadata.sandbox_engine.?);
     try std.testing.expectEqualStrings("org.example.Client", metadata.app_id.?);
+
+    // Discovery filtering alone is insufficient: a sandbox may learn the
+    // global name from another client. Exercise the registry's bind boundary.
+    try std.testing.expectError(error.UnknownGlobal, root.runtime.bindGlobal(sandbox_peer.?, .{ .bind = .{
+        .name = parent_handler.hotkey_global.?,
+        .id = .{
+            .interface = protocol.xx_hotkey_manager_v1.info.name,
+            .version = 1,
+            .id = 7,
+        },
+    } }));
+    try std.testing.expect((try root.runtime.clients.get(sandbox_peer.?)).namespace.lookupHandle(7) == null);
 
     _ = linux.close(close_signal);
     close_signal = -1;
@@ -10354,6 +10376,7 @@ const Handler = struct {
     input_method_global_seen: bool = false,
     virtual_keyboard_global_seen: bool = false,
     virtual_pointer_global_seen: bool = false,
+    hotkey_global: ?u32 = null,
     transient_seat_global_seen: bool = false,
     text_input_manager: ?wayring.objects.Handle = null,
     text_input: ?wayring.objects.Handle = null,
@@ -10959,6 +10982,8 @@ const Handler = struct {
                 self.virtual_keyboard_global_seen = true;
             if (std.mem.eql(u8, value.interface, protocol.zwlr_virtual_pointer_manager_v1.info.name))
                 self.virtual_pointer_global_seen = true;
+            if (std.mem.eql(u8, value.interface, protocol.xx_hotkey_manager_v1.info.name))
+                self.hotkey_global = value.name;
             if (std.mem.eql(u8, value.interface, protocol.ext_transient_seat_manager_v1.info.name))
                 self.transient_seat_global_seen = true;
             if (std.mem.eql(u8, value.interface, protocol.ext_foreign_toplevel_list_v1.info.name))

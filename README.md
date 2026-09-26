@@ -543,12 +543,16 @@ disable-while-typing/trackpointing, and rotation. Unsupported libinput settings
 are logged and leave that device unchanged rather than rejecting unrelated
 settings.
 
-`general.experimental_hotkeys` (default `false`) opts into the experimental
-`xx-hotkey-v1` Wayland protocol. Enabling it publishes the manager; disabling it
-withdraws the global and revokes existing bindings. It uses the same temporary,
-saved, and reload configuration paths as other general settings. This is not
-the GlobalShortcuts D-Bus portal. Application IDs are advisory, not permissions;
-opting in lets connected clients request bindings under the following policy:
+`general.experimental_hotkeys` (default `true`) enables the experimental
+`xx-hotkey-v1` Wayland protocol for ordinary desktop clients without a consent
+prompt. Security-context-restricted clients cannot discover or bind the manager,
+even if they know its global name. This restriction depends on the connection's
+security context, not a claimed application ID.
+
+Setting it to `false` withdraws the global and revokes existing bindings. It
+uses the same temporary, saved, and reload configuration paths as other general
+settings. This is not the GlobalShortcuts D-Bus portal. Application IDs are
+advisory, not permissions. Allowed clients request bindings under this policy:
 
 - Bindings are exclusive. Compositor bindings win, including after a config
   change; rejected reconfiguration preserves the client's previous binding.

@@ -87,7 +87,7 @@ pub fn Adapter(comptime protocol: type) type {
             self.managers.deinit();
         }
 
-        /// Only opt-in publishes the experimental factory. Existing objects
+        /// Enabled policy publishes the experimental factory. Existing objects
         /// become inert on opt-out; global withdrawal alone is not a boundary.
         pub fn syncGlobal(self: *Self, runtime: *Runtime) !void {
             self.runtime = runtime;
