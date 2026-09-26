@@ -81,6 +81,7 @@ pub const tablet_v2 = @import("protocol/tablet_v2.zig");
 pub const idle_inhibit = @import("protocol/idle_inhibit.zig");
 pub const idle_notify = @import("protocol/idle_notify.zig");
 pub const keyboard_shortcuts_inhibit = @import("protocol/keyboard_shortcuts_inhibit.zig");
+pub const hotkey = @import("protocol/hotkey.zig");
 pub const xdg_foreign = @import("protocol/xdg_foreign.zig");
 pub const cursor_shape = @import("protocol/cursor_shape.zig");
 pub const text_input = @import("protocol/text_input.zig");
@@ -194,6 +195,7 @@ test {
     _ = idle_inhibit;
     _ = idle_notify;
     _ = keyboard_shortcuts_inhibit;
+    _ = hotkey;
     _ = xdg_foreign;
     _ = cursor_shape;
     _ = text_input;

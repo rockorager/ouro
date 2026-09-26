@@ -76,6 +76,7 @@ pub fn build(b: *std.Build) void {
     generate_core_protocol.addFileArg(b.path("protocols/input-method-unstable-v2.xml"));
     generate_core_protocol.addFileArg(b.path("protocols/virtual-keyboard-unstable-v1.xml"));
     generate_core_protocol.addFileArg(b.path("protocols/gtk-shell.xml"));
+    generate_core_protocol.addFileArg(b.path("protocols/xx-hotkey-v1.xml"));
     const generated_core_protocol = generate_core_protocol.addOutputFileArg("wayland-core.zig");
     const core_protocol = b.createModule(.{
         .root_source_file = generated_core_protocol,
@@ -141,6 +142,7 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(b.path("protocols/input-method-unstable-v2.xml"));
     generate_xdg_protocol.addFileArg(b.path("protocols/virtual-keyboard-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(b.path("protocols/gtk-shell.xml"));
+    generate_xdg_protocol.addFileArg(b.path("protocols/xx-hotkey-v1.xml"));
     const generated_xdg_protocol = generate_xdg_protocol.addOutputFileArg("wayland-xdg-shell.zig");
     const xdg_protocol = b.createModule(.{
         .root_source_file = generated_xdg_protocol,
@@ -723,6 +725,12 @@ pub fn build(b: *std.Build) void {
         "Run generated-client physical XDG shell and normalized input vertical",
     );
     shell_input_test_step.dependOn(&run_shell_input_tests.step);
+
+    const hotkey_units = b.addTest(.{ .root_module = ouro, .filters = &.{ "hotkey:", "xdg-activation:" } });
+    const hotkey_clients = b.addTest(.{ .root_module = shell_input_tests.root_module, .filters = &.{"hotkey:"} });
+    const hotkey_step = b.step("test-hotkey", "Run experimental hotkey policy and generated-client activation tests");
+    hotkey_step.dependOn(&b.addRunArtifact(hotkey_units).step);
+    hotkey_step.dependOn(&b.addRunArtifact(hotkey_clients).step);
 
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_unit_tests.step);

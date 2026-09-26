@@ -19,6 +19,351 @@ const pixels = [_]u8{
     0xa0, 0xb0, 0xc0, 0xff, 0xd0, 0xe0, 0xf0, 0xff, 0x11, 0x22, 0x33, 0xff, 0, 0, 0, 0,
 };
 
+test "hotkey: generated client opt-in, consumed pairs and unfocused activation" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-hotkey-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 96;
+    root_config.runtime.object_quota = 64;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
+    var config = physical_fixture.coordinatorConfig();
+    config.router_capacity = 32;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 32 });
+    try coordinator.start(&loop);
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var client = try ClientConnection.attach(allocator, &reactor, try wayring.unix_socket.connect(path), .{ .received_fd_budget = 2, .transmit_byte_budget = 8192, .transmit_fd_budget = 2 }, .{ .max_objects = 64, .max_client_ids = 63 });
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: HotkeyHandler = .{ .queue = &actor.transmit, .app = .{ .objects = &client.objects, .queue = &actor.transmit, .registry = registry } };
+    try submitClient(&reactor, &driver, &handler);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    const device: ouro.input_backend.DeviceId = .{ .slot = 7, .generation = 1, .seat_generation = 1 };
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{ .device = device, .info = .{ .capabilities = .{ .keyboard = true, .pointer = true } } } }));
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.app.frame_done_order != 0 and handler.app.input_ready) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(handler.app.mapped and handler.app.input_ready);
+    try std.testing.expect(handler.manager == null); // absent, not merely denied, by default
+    try installHotkeyConfig(coordinator, "{\"general\":{\"experimental_hotkeys\":true}}");
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.bound == 1 and handler.denied == 2) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.bound);
+    try std.testing.expectEqual(@as(usize, 2), handler.denied);
+    try std.testing.expectEqual(@as(u32, 0), handler.last_denied); // compositor Super+Q conflict
+    // Manager destruction leaves its children valid, including recommits.
+    try wayring.client.sendRequest(protocol.xx_hotkey_manager_v1, &client.objects, &actor.transmit, handler.manager.?, .{ .destroy = .{} });
+    try protocol.xx_hotkey_v1.encodeRequest(&actor.transmit, handler.hotkey.?.id, .{ .commit = .{} });
+    try submitClient(&reactor, &driver, &handler);
+    for (0..64) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.bound == 2) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.bound);
+    const key_count = handler.app.keyboard_key;
+    // Ctrl+Alt+P, duplicate press, modifiers released first, then P release.
+    for ([_]struct { u32, bool }{ .{ 29, true }, .{ 56, true }, .{ 25, true }, .{ 25, true }, .{ 29, false }, .{ 56, false }, .{ 25, false } }, 0..) |key, i|
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .keyboard_key = .{ .device = device, .time_usec = (20 + i) * 1000, .key = key[0], .pressed = key[1] } }));
+    for (0..64) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.released == 1) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.triggered);
+    try std.testing.expectEqual(@as(usize, 1), handler.released);
+    try std.testing.expectEqual(@as(u32, 22), handler.trigger_time);
+    try std.testing.expectEqual(@as(u32, 26), handler.release_time);
+    try std.testing.expectEqual(key_count + 4, handler.app.keyboard_key);
+
+    // Hide the application and clear keyboard focus. Its hotkey serial, with
+    // no set_surface at all, must authorize activation from this unfocused peer.
+    try coordinator.switchWorkspace(2);
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.seat_adapter.keyboard_focus == null) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(coordinator.seat_adapter.keyboard_focus == null);
+    for ([_]struct { u32, bool }{ .{ 29, true }, .{ 56, true }, .{ 25, true }, .{ 29, false }, .{ 56, false }, .{ 25, false } }, 0..) |key, i|
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .keyboard_key = .{ .device = device, .time_usec = (40 + i) * 1000, .key = key[0], .pressed = key[1] } }));
+    for (0..64) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.released == 2) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.triggered);
+    try std.testing.expectEqual(@as(usize, 2), handler.released);
+    try std.testing.expectEqual(key_count + 4, handler.app.keyboard_key);
+    try std.testing.expect(coordinator.seat_adapter.keyboard_focus == null);
+    try handler.requestActivation(handler.trigger_serial);
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.activation_done == 1 and coordinator.seat_adapter.keyboard_focus != null) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.activation_done);
+    try std.testing.expect(coordinator.seat_adapter.keyboard_focus != null);
+    // Same serial cannot mint another effective token.
+    try coordinator.switchWorkspace(2);
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.seat_adapter.keyboard_focus == null) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(coordinator.seat_adapter.keyboard_focus == null);
+    try handler.requestActivation(handler.trigger_serial);
+    try submitClient(&reactor, &driver, &handler);
+    for (0..64) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.activation_done);
+    try std.testing.expect(coordinator.seat_adapter.keyboard_focus == null);
+
+    try coordinator.switchWorkspace(1);
+    try protocol.xx_hotkey_v1.encodeRequest(&actor.transmit, handler.hotkey.?.id, .{ .set_button_trigger = .{ .button = 275, .modifiers = .{ .value = 0 } } });
+    try protocol.xx_hotkey_v1.encodeRequest(&actor.transmit, handler.hotkey.?.id, .{ .commit = .{} });
+    try submitClient(&reactor, &driver, &handler);
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.bound == 3 and coordinator.seat_adapter.keyboard_focus != null) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 3), handler.bound);
+    const inhibitor = (try protocol.zwp_keyboard_shortcuts_inhibit_manager_v1.construct_inhibit_shortcuts(&client.objects, &actor.transmit, handler.shortcut_manager.?, .{ .seat = handler.app.seat.?.id, .surface = handler.app.surface.?.id })).id;
+    try submitClient(&reactor, &driver, &handler);
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.hotkey_adapter.blocked) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(coordinator.shortcuts_inhibit_adapter.shortcutsInhibited());
+    for ([_]bool{ true, false }) |pressed|
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{ .device = device, .time_usec = 60_000, .button = 275, .pressed = pressed } }));
+    try wayring.client.sendRequest(protocol.zwp_keyboard_shortcuts_inhibitor_v1, &client.objects, &actor.transmit, inhibitor, .{ .destroy = .{} });
+    try submitClient(&reactor, &driver, &handler);
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!coordinator.hotkey_adapter.blocked) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(!coordinator.hotkey_adapter.blocked);
+    try std.testing.expectEqual(@as(usize, 2), handler.triggered);
+    const method = (try protocol.zwp_input_method_manager_v2.construct_get_input_method(&client.objects, &actor.transmit, handler.method_manager.?, .{ .seat = handler.app.seat.?.id })).input_method;
+    const grab = (try protocol.zwp_input_method_v2.construct_grab_keyboard(&client.objects, &actor.transmit, method, .{})).keyboard;
+    try submitClient(&reactor, &driver, &handler);
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.hotkey_adapter.blocked) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(coordinator.input_method_adapter.activeGrab() != null);
+    for ([_]bool{ true, false }) |pressed|
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{ .device = device, .time_usec = 70_000, .button = 275, .pressed = pressed } }));
+    try wayring.client.sendRequest(protocol.zwp_input_method_keyboard_grab_v2, &client.objects, &actor.transmit, grab, .{ .release = .{} });
+    try wayring.client.sendRequest(protocol.zwp_input_method_v2, &client.objects, &actor.transmit, method, .{ .destroy = .{} });
+    try submitClient(&reactor, &driver, &handler);
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!coordinator.hotkey_adapter.blocked) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(!coordinator.hotkey_adapter.blocked);
+    try std.testing.expectEqual(@as(usize, 2), handler.triggered);
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{ .device = device, .time_usec = 80_000, .button = 275, .pressed = true } }));
+    _ = try protocol.ext_session_lock_manager_v1.construct_lock(&client.objects, &actor.transmit, handler.lock_manager.?, .{});
+    try submitClient(&reactor, &driver, &handler);
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.revoked == 1) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 3), handler.triggered);
+    try std.testing.expectEqual(@as(usize, 1), handler.revoked);
+    try std.testing.expect(coordinator.hotkey_adapter.blocked);
+    for ([_]bool{ false, true, false }) |pressed|
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{ .device = device, .time_usec = 90_000, .button = 275, .pressed = pressed } }));
+    try installHotkeyConfig(coordinator, "{\"general\":{\"experimental_hotkeys\":false}}");
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.revoked == 1 and handler.global_removed) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.revoked);
+    try std.testing.expectEqual(@as(usize, 3), handler.triggered);
+    try std.testing.expectEqual(@as(usize, 2), handler.released);
+    try std.testing.expect(handler.global_removed);
+    try std.testing.expectEqual(@as(usize, 0), handler.app.event_failures);
+    _ = try client.prepareClose();
+    try submitClient(&reactor, &driver, &handler);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..512) |_| {
+        const c = try drainClient(&reactor, &driver, &handler);
+        const p = try loop.turn(coordinator);
+        if (c.quiescent and p.wayring.shutdown_complete and coordinator.backendDrainComplete()) {
+            drained = true;
+            break;
+        }
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
+fn installHotkeyConfig(coordinator: *Coordinator, source: []const u8) !void {
+    var reference = try ouro.config.mergeSources(std.testing.allocator, &.{source});
+    defer reference.deinit();
+    var snapshot = try Coordinator.Bindings.snapshotFromReferenceConfig(std.testing.allocator, &reference);
+    errdefer snapshot.deinit();
+    try coordinator.installKeyConsumerSnapshot(&snapshot);
+}
+
+const HotkeyHandler = struct {
+    app: Handler,
+    queue: *wayring.tx.Queue,
+    manager: ?wayring.objects.Handle = null,
+    hotkey: ?wayring.objects.Handle = null,
+    activation: ?wayring.objects.Handle = null,
+    token: ?wayring.objects.Handle = null,
+    shortcut_manager: ?wayring.objects.Handle = null,
+    method_manager: ?wayring.objects.Handle = null,
+    lock_manager: ?wayring.objects.Handle = null,
+    global: u32 = 0,
+    global_removed: bool = false,
+    bound: usize = 0,
+    denied: usize = 0,
+    last_denied: u32 = 0,
+    triggered: usize = 0,
+    released: usize = 0,
+    revoked: usize = 0,
+    trigger_serial: u32 = 0,
+    trigger_time: u32 = 0,
+    release_time: u32 = 0,
+    activation_done: usize = 0,
+
+    pub fn eventError(self: *@This(), peer: wayring.io_uring.Peer, failure: ClientCore.EventFailure) void {
+        self.app.eventError(peer, failure);
+    }
+
+    pub fn event(self: *@This(), target: wayring.objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
+        if (target.object.interface == &protocol.wl_registry.info) {
+            switch (try protocol.wl_registry.decodeEvent(message, fds)) {
+                .global => |g| {
+                    if (std.mem.eql(u8, g.interface, protocol.xx_hotkey_manager_v1.info.name)) {
+                        self.global = g.name;
+                        self.manager = try ClientCore.bind(self.app.objects, self.queue, self.app.registry, g.name, &protocol.xx_hotkey_manager_v1.info, 1, null);
+                        try protocol.xx_hotkey_manager_v1.encodeRequest(self.queue, self.manager.?.id, .{ .set_app_id = .{ .app_id = "ouro.hotkey.test" } });
+                        self.hotkey = (try protocol.xx_hotkey_manager_v1.construct_create_hotkey(self.app.objects, self.queue, self.manager.?, .{})).id;
+                        try protocol.xx_hotkey_v1.encodeRequest(self.queue, self.hotkey.?.id, .{ .set_seat = .{ .seat = self.app.seat.?.id } });
+                        try self.describe(self.hotkey.?, 'p', 6);
+                        const denied = (try protocol.xx_hotkey_manager_v1.construct_create_hotkey(self.app.objects, self.queue, self.manager.?, .{})).id;
+                        try self.describe(denied, 'a', 0); // unsafe text
+                        try self.describe(denied, 'q', 8); // compositor conflict
+                    }
+                    if (std.mem.eql(u8, g.interface, protocol.xdg_activation_v1.info.name))
+                        self.activation = try ClientCore.bind(self.app.objects, self.queue, self.app.registry, g.name, &protocol.xdg_activation_v1.info, 1, null);
+                    if (std.mem.eql(u8, g.interface, protocol.zwp_keyboard_shortcuts_inhibit_manager_v1.info.name))
+                        self.shortcut_manager = try ClientCore.bind(self.app.objects, self.queue, self.app.registry, g.name, &protocol.zwp_keyboard_shortcuts_inhibit_manager_v1.info, 1, null);
+                    if (std.mem.eql(u8, g.interface, protocol.zwp_input_method_manager_v2.info.name))
+                        self.method_manager = try ClientCore.bind(self.app.objects, self.queue, self.app.registry, g.name, &protocol.zwp_input_method_manager_v2.info, 1, null);
+                    if (std.mem.eql(u8, g.interface, protocol.ext_session_lock_manager_v1.info.name))
+                        self.lock_manager = try ClientCore.bind(self.app.objects, self.queue, self.app.registry, g.name, &protocol.ext_session_lock_manager_v1.info, 1, null);
+                },
+                .global_remove => |g| if (g.name == self.global) {
+                    self.global_removed = true;
+                },
+            }
+        } else if (target.object.interface == &protocol.zwp_keyboard_shortcuts_inhibitor_v1.info) {
+            _ = try protocol.zwp_keyboard_shortcuts_inhibitor_v1.decodeEvent(message, fds);
+            return .continue_dispatch;
+        } else if (target.object.interface == &protocol.zwp_input_method_v2.info) {
+            _ = try protocol.zwp_input_method_v2.decodeEvent(message, fds);
+            return .continue_dispatch;
+        } else if (target.object.interface == &protocol.zwp_input_method_keyboard_grab_v2.info) {
+            const v = try protocol.zwp_input_method_keyboard_grab_v2.decodeEvent(message, fds);
+            if (v == .keymap) _ = linux.close(v.keymap.fd);
+            return .continue_dispatch;
+        } else if (target.object.interface == &protocol.ext_session_lock_v1.info) {
+            _ = try protocol.ext_session_lock_v1.decodeEvent(message, fds);
+            return .continue_dispatch;
+        } else if (target.object.interface == &protocol.xx_hotkey_v1.info) {
+            switch (try protocol.xx_hotkey_v1.decodeEvent(message, fds)) {
+                .bound => self.bound += 1,
+                .denied => |v| {
+                    self.denied += 1;
+                    self.last_denied = v.reason.value;
+                },
+                .revoked => self.revoked += 1,
+                .triggered => |v| {
+                    self.triggered += 1;
+                    self.trigger_serial = v.serial;
+                    self.trigger_time = v.time;
+                },
+                .released => |v| {
+                    self.released += 1;
+                    self.release_time = v.time;
+                },
+            }
+            return .continue_dispatch;
+        } else if (target.object.interface == &protocol.xdg_activation_token_v1.info) {
+            const v = try protocol.xdg_activation_token_v1.decodeEvent(message, fds);
+            try protocol.xdg_activation_v1.encodeRequest(self.queue, self.activation.?.id, .{ .activate = .{ .token = v.done.token, .surface = self.app.surface.?.id } });
+            try wayring.client.sendRequest(protocol.xdg_activation_token_v1, self.app.objects, self.queue, self.token.?, .{ .destroy = .{} });
+            self.token = null;
+            self.activation_done += 1;
+            return .continue_dispatch;
+        }
+        return self.app.event(target, message, fds);
+    }
+
+    fn describe(self: *@This(), hotkey: wayring.objects.Handle, keysym: u32, modifiers: u32) !void {
+        try protocol.xx_hotkey_v1.encodeRequest(self.queue, hotkey.id, .{ .set_key_trigger = .{ .keysym = keysym, .modifiers = .{ .value = modifiers } } });
+        try protocol.xx_hotkey_v1.encodeRequest(self.queue, hotkey.id, .{ .commit = .{} });
+    }
+
+    fn requestActivation(self: *@This(), serial: u32) !void {
+        self.token = (try protocol.xdg_activation_v1.construct_get_activation_token(self.app.objects, self.queue, self.activation.?, .{})).id;
+        try protocol.xdg_activation_token_v1.encodeRequest(self.queue, self.token.?.id, .{ .set_serial = .{ .seat = self.app.seat.?.id, .serial = serial } });
+        try protocol.xdg_activation_token_v1.encodeRequest(self.queue, self.token.?.id, .{ .commit = .{} });
+    }
+};
+
 test "shell-input: core compatibility extensions cross generated runtime" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;

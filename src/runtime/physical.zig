@@ -67,6 +67,7 @@ const protocol_pointer_gestures = @import("../protocol/pointer_gestures.zig");
 const protocol_idle_inhibit = @import("../protocol/idle_inhibit.zig");
 const protocol_idle_notify = @import("../protocol/idle_notify.zig");
 const protocol_shortcuts_inhibit = @import("../protocol/keyboard_shortcuts_inhibit.zig");
+const protocol_hotkey = @import("../protocol/hotkey.zig");
 const protocol_xdg_foreign = @import("../protocol/xdg_foreign.zig");
 const protocol_pointer_constraints = @import("../protocol/pointer_constraints.zig");
 const protocol_fractional_scale = @import("../protocol/fractional_scale.zig");
@@ -392,6 +393,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const IdleInhibitAdapter = protocol_idle_inhibit.Adapter(protocol, Adapter);
         const IdleNotifyAdapter = protocol_idle_notify.Adapter(protocol);
         const ShortcutsInhibitAdapter = protocol_shortcuts_inhibit.Adapter(protocol, Adapter);
+        const HotkeyAdapter = protocol_hotkey.Adapter(protocol);
         const ForeignAdapter = protocol_xdg_foreign.Adapter(protocol, Adapter, ShellAdapter);
         const PointerConstraintsAdapter = protocol_pointer_constraints.Adapter(protocol, Adapter, SeatAdapter);
         const FractionalScaleAdapter = protocol_fractional_scale.Adapter(protocol, Adapter);
@@ -727,6 +729,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const gamma_control: u64 = 1 << 35;
             const drm_lease: u64 = 1 << 36;
             const background_effect: u64 = 1 << 37;
+            const hotkey: u64 = 1 << 38;
             const all: u64 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
@@ -735,7 +738,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 idle_notify | tablet | ext_data_control | wlr_data_control | input_method |
                 screencopy | foreign_toplevel_list | image_copy_capture | xdg_toplevel_icon | gtk_shell |
                 workspace | xdg_session | output_management | output_power | gamma_control |
-                drm_lease | background_effect;
+                drm_lease | background_effect | hotkey;
         };
         const Client = struct {
             active: bool = false,
@@ -949,6 +952,7 @@ pub fn Coordinator(comptime protocol: type) type {
         input: ?*input_api.Backend = null,
         input_event_cursor: usize = 0,
         input_interaction_accepted: bool = false,
+        input_hotkey_accepted: bool = false,
         input_relative_accepted: bool = false,
         input_gesture_accepted: bool = false,
         input_idle_accepted: bool = false,
@@ -1037,6 +1041,7 @@ pub fn Coordinator(comptime protocol: type) type {
         idle_inhibit_adapter: IdleInhibitAdapter,
         idle_notify_adapter: IdleNotifyAdapter,
         shortcuts_inhibit_adapter: ShortcutsInhibitAdapter,
+        hotkey_adapter: HotkeyAdapter,
         foreign_adapter: ForeignAdapter,
         pointer_constraints_adapter: PointerConstraintsAdapter,
         fractional_scale_adapter: FractionalScaleAdapter,
@@ -1180,6 +1185,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input = null;
             self.input_event_cursor = 0;
             self.input_interaction_accepted = false;
+            self.input_hotkey_accepted = false;
             self.input_relative_accepted = false;
             self.input_idle_accepted = false;
             self.input_gesture_accepted = false;
@@ -1602,6 +1608,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.shortcuts_inhibit,
             );
             errdefer self.shortcuts_inhibit_adapter.deinit();
+            self.hotkey_adapter = try HotkeyAdapter.init(allocator, .{ .context = self, .validateFn = validateShortcutSeat });
+            errdefer self.hotkey_adapter.deinit();
+            self.hotkey_adapter.keymap = &self.interaction.keymap_state;
             self.foreign_adapter = try ForeignAdapter.init(
                 allocator,
                 &self.adapter,
@@ -1772,6 +1781,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .context = self,
                 .validate = validateActivation,
             });
+            self.activation_adapter.hotkey_validator = .{ .context = self, .validate = validateHotkeyActivation };
             self.shell_adapter.setGrabValidator(.{
                 .context = self,
                 .validate = validatePopupGrab,
@@ -2134,6 +2144,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         pub fn installKeyConsumerSnapshot(self: *Self, candidate: *KeyConsumerSnapshot) !void {
             try self.interaction.canInstallKeyConsumerSnapshot();
+            try self.hotkey_adapter.configure(candidate.experimental_hotkeys, candidate.bindings);
             try self.interaction.installKeyConsumerSnapshot(candidate);
             try self.syncConsumerTimer();
         }
@@ -2465,6 +2476,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.dialog_adapter.deinit();
             self.decoration_adapter.deinit();
             self.activation_adapter.deinit();
+            self.hotkey_adapter.deinit();
             self.dmabuf_adapter.deinit();
             self.virtual_pointer_adapter.deinit();
             self.virtual_keyboard_adapter.deinit();
@@ -2553,6 +2565,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.idle_notify_adapter.disconnected(peer);
             self.syncIdleNotifications() catch {};
             self.shortcuts_inhibit_adapter.disconnected(peer);
+            self.hotkey_adapter.disconnected(peer);
             self.foreign_adapter.disconnected(peer);
             self.shell_maintenance_pending = true;
             self.xdg_session_adapter.disconnected(peer);
@@ -2826,6 +2839,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.flushProtocol();
                     return control;
                 }
+            }
+            if (try self.hotkey_adapter.request(peer, target, message, fds)) |control| {
+                try self.flushProtocol();
+                return control;
             }
             if (try self.activation_adapter.request(peer, target, message, fds)) |control| {
                 try self.processActivationEvents();
@@ -3840,12 +3857,21 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.input_touch_delivery = self.touchDelivery(event);
                 self.input_delivery_prepared = true;
             }
-            if (!self.input_interaction_accepted) {
+            if (!self.input_hotkey_accepted) {
                 self.input_keyboard_consumed = false;
                 self.input_pointer_consumed = false;
+                try self.syncHotkeyPolicy();
+                if (self.input_delivery_event) |delivery_event| {
+                    const consumed = try self.hotkey_adapter.consume(delivery_event, &self.interaction.keymap_state, &self.seat_adapter, try monotonicNs());
+                    self.input_keyboard_consumed = consumed and delivery_event == .keyboard_key;
+                    self.input_pointer_consumed = consumed and delivery_event == .pointer_button;
+                }
+                self.input_hotkey_accepted = true;
+            }
+            if (!self.input_interaction_accepted) {
                 if (self.input_delivery_event) |delivery_event| {
                     const lock_keyboard = self.sessionLockActive() and delivery_event == .keyboard_key;
-                    if (!lock_keyboard) {
+                    if (!lock_keyboard and !self.input_keyboard_consumed and !self.input_pointer_consumed) {
                         var input_scene: InputScene = .{ .coordinator = self };
                         self.interaction.consumeWithShortcutPolicy(
                             &self.desktop,
@@ -3984,6 +4010,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn resetInputAdmission(self: *Self) void {
             self.input_interaction_accepted = false;
+            self.input_hotkey_accepted = false;
             self.input_relative_accepted = false;
             self.input_gesture_accepted = false;
             self.input_idle_accepted = false;
@@ -6438,6 +6465,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn sessionLockChanged(self: *Self) !void {
             const unlocked = self.session_lock_adapter.takeUnlocked();
+            try self.syncHotkeyPolicy();
             self.output_associations_dirty = true;
             self.markProtocolAll(ProtocolReady.seat | ProtocolReady.data_device |
                 ProtocolReady.primary_selection | ProtocolReady.text_input |
@@ -7027,6 +7055,17 @@ pub fn Coordinator(comptime protocol: type) type {
             return true;
         }
 
+        fn syncHotkeyPolicy(self: *Self) !void {
+            try self.hotkey_adapter.setBlocked(self.sessionLockActive() or
+                self.shortcuts_inhibit_adapter.shortcutsInhibited() or self.input_method_adapter.activeGrab() != null);
+        }
+
+        fn validateHotkeyActivation(context: *anyopaque, peer: wayring.io_uring.Peer, seat: u32, serial: u32) bool {
+            const self: *Self = @ptrCast(@alignCast(context));
+            self.syncHotkeyPolicy() catch return false;
+            return self.hotkey_adapter.authorizeActivation(peer, seat, serial, monotonicNs() catch return false);
+        }
+
         fn validateActivation(
             context: *anyopaque,
             peer: wayring.io_uring.Peer,
@@ -7282,6 +7321,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn flushProtocol(self: *Self) !void {
             try self.advancePhysicalOutputRemovals();
             try self.advanceOutputGlobals();
+            try self.advanceHotkeyGlobal();
             try self.advanceDrmLeaseGlobal();
             try self.ensureColorProtocols();
             while (try self.manager.pollRevokedLease()) |token| {
@@ -7301,6 +7341,9 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncWorkspace();
             self.input_method_adapter.advance();
             try self.reconcileInputMethod();
+            try self.syncHotkeyPolicy();
+            for (self.clients.items) |client| if (client.active and self.hotkey_adapter.pendingOutbound(client.peer))
+                self.markProtocol(client.peer, ProtocolReady.hotkey);
             if (self.image_copy_capture_adapter.refreshCursors(self)) |changed| {
                 if (changed != 0) self.markProtocolAll(ProtocolReady.image_copy_capture);
             } else |cause| switch (cause) {
@@ -7310,6 +7353,27 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.publishPresentedSessionLock();
             for (self.clients.items) |client| if (client.active and client.protocol_ready != 0)
                 try self.flushProtocolOn(client.peer);
+        }
+
+        fn advanceHotkeyGlobal(self: *Self) !void {
+            self.hotkey_adapter.syncGlobal(&self.root.runtime) catch |err| switch (err) {
+                error.GlobalUpdateActive => return,
+                else => return err,
+            };
+            if (!self.hotkey_adapter.publishing) return;
+            while (true) switch (try self.root.runtime.publishNext()) {
+                .sent => |peer| {
+                    if (self.loop) |loop| _ = try loop.driver.schedule(peer);
+                },
+                .blocked => |peer| {
+                    if (self.loop) |loop| _ = try loop.driver.schedule(peer);
+                    return;
+                },
+                .complete => {
+                    self.hotkey_adapter.publishing = false;
+                    return;
+                },
+            };
         }
 
         fn advanceOutputGlobals(self: *Self) !void {
@@ -7766,6 +7830,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.dmabuf_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.activation != 0)
                 flushed += try self.activation_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.hotkey != 0)
+                flushed += try self.hotkey_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.relative_pointer != 0)
                 flushed += try self.relative_pointer_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.pointer_gestures != 0)
@@ -8181,6 +8247,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.activation != 0 and
                 !self.activation_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.activation;
+            if (ready & ProtocolReady.hotkey != 0 and
+                !self.hotkey_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.hotkey;
             if (ready & ProtocolReady.relative_pointer != 0 and
                 !self.relative_pointer_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.relative_pointer;
@@ -14274,6 +14343,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.dmabuf_adapter.resourceRemoved(handle, object);
             if (self.syncobj_adapter) |*adapter| _ = adapter.resourceRemoved(handle, object);
             _ = self.activation_adapter.resourceRemoved(handle, object);
+            _ = self.hotkey_adapter.resourceRemoved(handle, object);
             _ = self.decoration_adapter.resourceRemoved(handle, object);
             _ = self.dialog_adapter.resourceRemoved(handle, object);
             _ = self.toplevel_tag_adapter.resourceRemoved(handle, object);
