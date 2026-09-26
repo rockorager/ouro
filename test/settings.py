@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Isolated real-ourosettings interoperability, migration, and startup checks.
+"""Isolated JSON configuration, headless startup, and live reload checks.
 
-Usage: python3 test/settings.py --daemon /path/to/ourosettings
-Requires a built Ouro, Zig 0.16, and an MCP-only ourosettings daemon.
-No user services, display, settings, or live sockets are touched.
+Run after `zig build`: python3 test/settings.py
+Uses private files and sockets, no settings daemon or user-systemd session.
 """
 import argparse
 import json
 import os
 from pathlib import Path
-import select
+import signal
 import socket
 import subprocess
 import tempfile
@@ -20,192 +19,157 @@ ROOT = Path(__file__).resolve().parent.parent
 META = {
     "io.modelcontextprotocol/protocolVersion": "2026-07-28",
     "io.modelcontextprotocol/clientCapabilities": {},
-    "io.modelcontextprotocol/clientInfo": {"name": "ouro-interop", "version": "0.0.0"},
+    "io.modelcontextprotocol/clientInfo": {"name": "ouro-config-test", "version": "0.0.0"},
 }
 
 
-def stop(process):
-    if process is not None and process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-            raise
+def wait_for(check):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if check():
+            return
+        time.sleep(0.01)
+    raise AssertionError("timed out waiting for configuration result")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--daemon", required=True, type=Path)
     parser.add_argument("--ouro", type=Path, default=ROOT / "zig-out/bin/ouro")
     args = parser.parse_args()
-    with tempfile.TemporaryDirectory(prefix="ouro-settings-interop-") as directory:
+    with tempfile.TemporaryDirectory(prefix="ouro-config-") as directory:
         base = Path(directory)
-        runtime = base / "runtime"
-        config = base / "config"
-        system = base / "system"
-        for path in (runtime / "ouro", config / "ouro", system / "ouro"):
+        runtime, config, system, lower, explicit = (
+            base / name for name in ("runtime", "config", "system", "lower", "explicit")
+        )
+        for path in (runtime, config / "ouro", system / "ouro", lower / "ouro", explicit):
             path.mkdir(parents=True, mode=0o700)
+        commands = base / "bin"
+        commands.mkdir()
+        for name in ("systemctl", "dbus-update-activation-environment"):
+            stub = commands / name
+            stub.write_text('#!/bin/sh\nprintf "%s\\n" "$0 $*" >> "$XDG_RUNTIME_DIR/session-calls"\nexit 91\n')
+            stub.chmod(0o700)
         env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime),
-                   XDG_CONFIG_HOME=str(config), XDG_CONFIG_DIRS=str(system))
-        address = runtime / "ouro/settings.mcp.sock"
-        state = config / "ouro/settings.json"
-        probe_path = base / "probe"
-        subprocess.run([
-            "zig", "build-exe", "-lc", "-OReleaseSafe", "--dep", "settings_client",
-            f"-Mroot={ROOT / 'test/settings-client.zig'}",
-            f"-Msettings_client={ROOT / 'src/settings_client.zig'}",
-            f"-femit-bin={probe_path}",
-        ], cwd=ROOT, check=True)
-        daemon = probe = None
-        daemon_log = (base / "daemon.log").open("wb")
-        probe_log = (base / "probe.log").open("wb")
+                   XDG_CONFIG_HOME=str(config), XDG_CONFIG_DIRS=f"{system}:{lower}",
+                   PATH=f"{commands}:{os.environ.get('PATH', '/usr/bin:/bin')}")
 
-        def call(method, parameters=None):
+        def ouro(*arguments):
+            return subprocess.run([str(args.ouro.resolve()), *arguments], env=env,
+                                  capture_output=True, text=True, timeout=5)
+
+        def export(*arguments):
+            result = ouro(*arguments, "--export-config")
+            assert result.returncode == 0, result.stderr
+            return json.loads(result.stdout)
+
+        def call(name):
             with socket.socket(socket.AF_UNIX) as connection:
                 connection.settimeout(3)
-                connection.connect(str(address))
+                connection.connect(str(runtime / "ouro.mcp.sock"))
                 connection.sendall(json.dumps({
-                    "jsonrpc": "2.0", "id": 1, "method": method,
-                    "params": {**(parameters or {}), "_meta": META},
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": name, "arguments": {}, "_meta": META},
                 }).encode() + b"\n")
-                reply = bytearray()
-                while b"\n" not in reply:
-                    part = connection.recv(65536)
-                    assert part, "EOF before final reply"
-                    reply.extend(part)
-                    assert len(reply) <= 4 * 1024 * 1024, "oversized MCP record"
-                result = json.loads(reply.split(b"\n")[0])
-                assert result["jsonrpc"] == "2.0" and result["id"] == 1, result
-                assert "error" not in result, result
-                result = result["result"]
-                assert result["resultType"] == "complete", result
+                with connection.makefile("rb") as stream:
+                    reply = json.loads(stream.readline(4 * 1024 * 1024))
+                assert reply["id"] == 1 and "error" not in reply, reply
+                result = reply["result"]
                 assert not result.get("isError", False), result
-                return result
+                return result["structuredContent"]
 
-        def read_root():
-            result = call("resources/read", {"uri": "ouro://settings"})
-            contents = [entry for entry in result["contents"] if entry["uri"] == "ouro://settings"]
-            assert len(contents) == 1 and contents[0]["mimeType"] == "application/json", result
-            selection = json.loads(contents[0]["text"])
-            assert selection["exists"] is True, selection
-            return {"revision": selection["revision"], "settings": selection["value"]}
+        def scale_config(scale):
+            return json.dumps({"output_rules": {
+                "all": {"match": {}, "settings": {"scale": scale}},
+            }})
 
-        def start_daemon():
-            nonlocal daemon
-            daemon = subprocess.Popen([
-                str(args.daemon.resolve()), "--socket", str(address),
-                "--state", str(state), "--idle-ms", "300000",
-            ], env=env, stdout=daemon_log, stderr=daemon_log)
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                assert daemon.poll() is None, "daemon startup failed"
+        def live(path, *arguments):
+            log_path = base / "ouro.log"
+            with log_path.open("w") as log:
+                process = subprocess.Popen([
+                    str(args.ouro.resolve()), "--headless", "--headless-output=900x600",
+                    f"--socket={runtime / 'wayland'}", *arguments,
+                ], env=env, stdout=log, stderr=log)
                 try:
-                    return read_root()
-                except (FileNotFoundError, ConnectionRefusedError):
-                    time.sleep(0.01)
-            raise AssertionError("daemon readiness timeout")
+                    def logged(message, after=0):
+                        assert process.poll() is None, log_path.read_text()
+                        return message in log_path.read_text()[after:]
 
-        def publication(expected):
-            assert select.select([probe.stdout], [], [], 5)[0], "MCP subscription timeout"
-            line = probe.stdout.readline()
-            assert line, "probe exited"
-            value = json.loads(line)
-            assert value["exists"] is True
-            assert value["revision"] == expected["revision"]
-            assert json.loads(value["value_json"]) == expected["settings"]["compositor"]
+                    wait_for(lambda: logged("Ouro listening"))
+                    # No file: built-in defaults. A failed settings connection
+                    # or a file-only startup shortcut cannot satisfy this.
+                    def geometry():
+                        outputs = call("get-state")["outputs"]
+                        assert len(outputs) == 1, outputs
+                        return outputs[0]["geometry"]
 
-        def replace(section, value):
-            current = read_root()
-            result = call("tools/call", {
-                "name": "settings.set_section",
-                "arguments": dict(expected_revision=current["revision"], section=section, value=value),
-            })
-            return result["structuredContent"]
+                    assert geometry() == {"x": 0, "y": 0, "width": 900, "height": 600}
 
-        def ouro(*arguments, timeout=5):
-            return subprocess.run([str(args.ouro.resolve()), *arguments], env=env,
-                                  capture_output=True, text=True, timeout=timeout)
+                    def reload(source, use_signal, expected, valid=True):
+                        path.write_text(source)
+                        offset = len(log_path.read_text())
+                        if use_signal:
+                            process.send_signal(signal.SIGHUP)
+                        else:
+                            assert call("reload-config") == {"accepted": True}
+                        message = "configuration accepted" if valid else "configuration reload failed"
+                        wait_for(lambda: logged(message, offset))
+                        wait_for(lambda: geometry() == expected)
+                        assert path.read_text() == source, "reload must not rewrite configuration"
 
-        try:
-            initial = start_daemon()
-            probe = subprocess.Popen([str(probe_path), str(address)],
-                                     stdout=subprocess.PIPE, stderr=probe_log, bufsize=0)
-            publication(initial)
-            changed = replace("compositor", {
-                "general": {"inner_gap": 31, "outer_gap": 7},
-                "bindings": {"super+q": None, "super+return": ["run", "foot", "two words"]},
-                "output_rules": {"panel": {"match": {"name": "DP-1"}, "settings": {"scale": 1.5}}},
-            })
-            publication(changed)
-            # No-op writes do not cause another compositor read/publication.
-            replace("compositor", changed["settings"]["compositor"])
-            assert not select.select([probe.stdout], [], [], 0.15)[0], "no-op publication"
-            replace("appearance", {"color_scheme": "dark"})
-            assert not select.select([probe.stdout], [], [], 0.15)[0], "unrelated publication"
-            changed = replace("compositor", {})
-            publication(changed)
-            stop(daemon)
-            restarted = start_daemon()
-            publication(restarted)
-            print("PASS real MCP initial/change/filter/no-op/reset/restart")
+                    scaled = {"x": 0, "y": 0, "width": 600, "height": 400}
+                    reload(scale_config(1.5), True, scaled)
+                    # Parsing failure must not reset a previously changed output.
+                    reload('{"general":{"inner_gap":1.0}}', False, scaled, valid=False)
+                    reload(scale_config(2), False,
+                           {"x": 0, "y": 0, "width": 450, "height": 300})
+                    # Removing the rule restores defaults, not the last scale.
+                    reload("{}", True, {"x": 0, "y": 0, "width": 900, "height": 600})
+                finally:
+                    if process.poll() is None:
+                        process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                        raise
+                assert process.returncode == 0, log_path.read_text()
 
-            # Export the old XDG layers without touching the daemon's state.
-            (system / "ouro/config.json").write_text(json.dumps({
-                "general": {"inner_gap": 2, "outer_gap": 5},
-            }))
-            (config / "ouro/config.json").write_text(json.dumps({
-                "general": {"inner_gap": 27}, "bindings": {"super+q": None},
-            }))
-            fragments = config / "ouro/config.d"
-            fragments.mkdir()
-            (fragments / "20-last.json").write_text('{"general":{"outer_gap":11}}')
-            (fragments / "10-first.json").write_text('{"general":{"outer_gap":9}}')
-            before = state.read_bytes()
-            result = ouro("--export-config")
-            assert result.returncode == 0, result.stderr
-            exported = json.loads(result.stdout)
-            assert exported["general"] == {"inner_gap": 27, "outer_gap": 11}
-            assert exported["bindings"]["super+q"] is None
-            assert state.read_bytes() == before
-            changed = replace("compositor", exported)
-            publication(changed)
-            print("PASS XDG export, binding tombstone, settings.set_section migration")
+        user_file = config / "ouro/config.json"
+        live(user_file)
+        print("PASS default startup without daemon; SIGHUP/MCP reload; invalid reload retention; reset")
 
-            # The daemon stores desired JSON; Ouro remains its semantic validator.
-            # In particular, the MCP text adapter must not turn 1.0 into 1.
-            for invalid_gap in ("bad", 1.0):
-                changed = replace("compositor", {"general": {"inner_gap": invalid_gap}})
-                publication(changed)
-                result = ouro("--renderer=pixman")
-                assert result.returncode != 0
-                assert "invalid ourosettings /compositor at startup" in result.stderr, result.stderr
-            invalid = base / "invalid.json"
-            invalid.write_text('{"bindings":{"super+q":["not-an-action"]}}')
-            result = ouro(f"--config={invalid}")
+        (lower / "ouro/config.json").write_text('{"general":{"inner_gap":1,"outer_gap":3}}')
+        (system / "ouro/config.json").write_text('{"general":{"inner_gap":2,"outer_gap":5}}')
+        user_file.write_text('{"general":{"inner_gap":27},"bindings":{"super+q":null}}')
+        fragments = config / "ouro/config.d"
+        fragments.mkdir()
+        (fragments / "20-last.json").write_text('{"general":{"outer_gap":11}}')
+        (fragments / "10-first.json").write_text('{"general":{"outer_gap":9}}')
+        exported = export()
+        assert exported["general"] == {"inner_gap": 27, "outer_gap": 11}, exported
+        assert exported["bindings"]["super+q"] is None
+        user_file.unlink()
+        for fragment in fragments.iterdir():
+            fragment.unlink()
+        assert export()["general"] == {"inner_gap": 2, "outer_gap": 5}
+        print("PASS XDG system/user precedence, sorted fragments, binding tombstone export")
+
+        # Invalid default configuration must fail before startup, including in
+        # managed mode, without attempting to start or stop any user services.
+        user_file.write_text('{"bindings":{"super+q":["not-an-action"]}}')
+        for arguments in ((), ("--managed-session",), ("--export-config",)):
+            result = ouro(*arguments)
             assert result.returncode != 0 and "UnknownAction" in result.stderr, result.stderr
-            assert "ourosettings" not in result.stderr, "file override contacted settings"
-            result = ouro(f"--config={invalid}", "--export-config")
-            assert result.returncode != 0 and not result.stdout
-            print("PASS semantic rejection (including float in integer field) and file-only override")
+            assert not result.stdout
+        assert not (runtime / "session-calls").exists(), "invalid config touched session services"
+        print("PASS invalid XDG configuration rejected at startup and export")
 
-            stop(probe)
-            stop(daemon)
-            started = time.monotonic()
-            result = ouro("--renderer=pixman", timeout=14)
-            elapsed = time.monotonic() - started
-            assert result.returncode != 0 and "StartupTimeout" in result.stderr, result.stderr
-            assert 9 <= elapsed < 14, elapsed
-            assert not address.exists()
-            print("PASS bounded startup without settings (no file fallback)")
-        finally:
-            stop(probe)
-            stop(daemon)
-            daemon_log.close()
-            probe_log.close()
-            if probe is not None:
-                probe.stdout.close()
+        # Explicit selection bypasses even invalid XDG files and reloads that
+        # same selection. Its missing initial file still gives defaults.
+        selected = explicit / "chosen.json"
+        live(selected, f"--config={selected}")
+        print("PASS explicit JSON selection and live reload ignore XDG configuration")
 
 
 if __name__ == "__main__":

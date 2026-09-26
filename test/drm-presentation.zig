@@ -65,18 +65,12 @@ test "configuration installs before physical startup claims an output" {
     try root.deinit();
 }
 
-test "settings resource JSON prepares coordinator policy rules and bindings" {
+test "configuration JSON prepares coordinator policy rules and bindings" {
     const allocator = std.testing.allocator;
     const json =
         \\{"general":{"focus_follows_mouse":true,"inner_gap":37,"outer_gap":9},"bindings":{"super+q":null},"input_rules":{"trackpad":{"match":{"type":"touchpad"},"settings":{"natural_scroll":true}}},"output_rules":{"panel":{"match":{"connector_id":10},"settings":{"scale":1.5}}}}
     ;
-    var update: ouro.settings_client.Update = .{
-        .revision = try allocator.dupe(u8, "fixture-revision"),
-        .exists = true,
-        .json = try allocator.dupe(u8, json),
-    };
-    defer update.deinit(allocator);
-    var snapshot = try ouro.configuration.parseSettings(allocator, update);
+    var snapshot = try ouro.config.mergeSources(allocator, &.{json});
     defer snapshot.deinit();
     var prepared = try ouro.configuration.Prepared(Coordinator).init(allocator, &snapshot);
     var owned = true;
@@ -112,7 +106,7 @@ test "settings resource JSON prepares coordinator policy rules and bindings" {
     try root.deinit();
 }
 
-test "io_uring loop dispatches settings readiness and drains its final poll" {
+test "configuration pending wakes the idle loop and clears on shutdown" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
     defer fixture.deinit();
@@ -123,31 +117,14 @@ test "io_uring loop dispatches settings readiness and drains its final poll" {
     const root = try Compositor.create(allocator, try wayring.unix_socket.listen(display_path, 1), compositorConfig());
     const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
     var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
-    var settings_path_storage: [128]u8 = undefined;
-    const settings_path = try std.fmt.bufPrint(&settings_path_storage, "/tmp/ouro-settings-loop-missing-{d}.sock", .{linux.getpid()});
-    var client = try ouro.settings_client.Client.init(allocator, settings_path);
-    defer client.deinit();
-    try loop.installSettings(&client);
-
-    _ = try loop.turn(coordinator);
-    try waitReady(&root.ring);
-    const progress = try loop.turn(coordinator);
-    try std.testing.expect(progress.settings_changed);
-    try std.testing.expect(!loop.settingsDrained());
 
     // A validated replacement must return control to main once transactions
-    // settle, even with no new publication or input event to wake the loop.
+    // settle, even with no input event to wake the loop.
     try std.testing.expect(coordinator.configInstallReady());
     loop.configuration_pending = true;
     const pending = try loop.turnAndWait(coordinator);
     try std.testing.expect(pending.needs_more_work);
     loop.configuration_pending = false;
-
-    try client.stop();
-    try waitReady(&root.ring);
-    const final = try loop.turn(coordinator);
-    try std.testing.expect(!final.settings_changed);
-    try std.testing.expect(loop.settingsDrained());
 
     try coordinator.requestStop();
     loop.configuration_pending = true;
@@ -190,8 +167,7 @@ test "MCP readiness sends a filesystem socket call and drains its final poll" {
     defer _ = linux.close(peer);
     _ = try loop.turn(coordinator);
     try waitReady(&root.ring);
-    const progress = try loop.turn(coordinator);
-    try std.testing.expect(!progress.settings_changed);
+    _ = try loop.turn(coordinator);
     try std.testing.expect(!loop.mcpDrained());
     var bytes: [512]u8 = undefined;
     const n = linux.read(peer, &bytes, bytes.len);
@@ -1530,7 +1506,9 @@ test "primary scale reconfiguration preserves a single shared DRM reader" {
     wayring.unix_socket.unlink(path) catch {};
     defer wayring.unix_socket.unlink(path) catch {};
     const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
-    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+    var config = coordinatorConfig();
+    config.protocol_output.scale = 2;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
     var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
     try coordinator.start(&loop);
     _ = try loop.turn(coordinator);
@@ -1547,15 +1525,16 @@ test "primary scale reconfiguration preserves a single shared DRM reader" {
     var reference = try ouro.config.defaultSnapshot(allocator);
     defer reference.deinit();
     // Recreate only the primary, as startup does when applying laptop scale.
-    // Repeat while the secondary keeps ownership of the shared event read.
-    for ([_]u32{ 180, 120 }) |scale| {
+    // Removing its rule restores the configured backend default, not a hard-coded
+    // 1x scale, while the secondary keeps ownership of the shared event read.
+    for ([_]?u32{ 180, null }) |scale| {
         const primary_id = coordinator.physical_outputs[0].kms_output.?.outputId();
         const rules = [_]ouro.config.OutputRule{.{
             .name = "primary",
             .match = .{ .connector_id = 10 },
             .settings = .{ .scale_120 = scale },
         }};
-        var engine = try Coordinator.EngineSettings.init(allocator, &.{}, &rules);
+        var engine = try Coordinator.EngineSettings.init(allocator, &.{}, if (scale != null) &rules else &.{});
         var bindings = try Coordinator.Bindings.snapshotFromReferenceConfig(allocator, &reference);
         var policy: Coordinator.PolicySnapshot = .{ .inner_gap = 0, .outer_gap = 0 };
         try coordinator.installConfig(&engine, &bindings, &policy);
@@ -1574,6 +1553,8 @@ test "primary scale reconfiguration preserves a single shared DRM reader" {
         try std.testing.expect(coordinator.output_reconfigure == null);
         try std.testing.expect(coordinator.configInstallReady());
         try std.testing.expect(physicalOutputsSettled(coordinator));
+        const state = try coordinator.output_management_adapter.lifecycle.currentHead(coordinator.physical_outputs[0].management_head);
+        try std.testing.expectEqual(scale orelse 240, state.scale_120);
         const primary = coordinator.physical_outputs[0].kms_output.?;
         try std.testing.expect(!std.meta.eql(primary_id, primary.outputId()));
         try std.testing.expectEqual(secondary, coordinator.physical_outputs[1].kms_output.?);

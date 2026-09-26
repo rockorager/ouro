@@ -128,39 +128,22 @@ pub fn main(init: std.process.Init) !void {
         .environ_map = init.environ_map,
         .explicit_path = options.config,
     };
-    var settings: ?ouro.settings_client.Client = null;
-    defer if (settings) |*client| client.deinit();
-    var initial_config = if (options.config != null) try config_store.load() else from_settings: {
-        try systemd_session.startSettingsSocket();
-        const runtime_dir = init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory;
-        const path = try std.fmt.allocPrint(allocator, "{s}/ouro/settings.mcp.sock", .{runtime_dir});
-        defer allocator.free(path);
-        settings = try ouro.settings_client.Client.init(allocator, path);
-        var update = settings.?.waitInitial(shutdown_signals.descriptor(), 10_000) catch |err| {
-            std.log.err("cannot load ourosettings at {s}: {t}; start ourosettings.socket or use --config=PATH", .{ path, err });
-            return err;
-        };
-        defer update.deinit(allocator);
-        break :from_settings ouro.configuration.parseSettings(allocator, update) catch |err| {
-            std.log.err("invalid ourosettings /compositor at startup: {t}", .{err});
-            return err;
-        };
+    var initial_config = config_store.load() catch |err| {
+        std.log.err("configuration load failed: {t}", .{err});
+        return err;
     };
     defer initial_config.deinit();
     var initial = try PreparedConfig.init(allocator, &initial_config);
     var initial_owned = true;
     defer if (initial_owned) initial.deinit();
-    // Do not tear down a managed graphical session before startup settings
-    // have been received and validated.
+    // Do not tear down a managed graphical session before its configuration
+    // has been loaded and validated.
     try systemd_session.prepare();
     defer systemd_session.shutdown() catch |err| {
         std.log.warn("could not shut down the managed graphical session: {t}", .{err});
     };
-    const launcher: ouro.launcher.Systemd = .{
-        .allocator = allocator,
-        .io = init.io,
-        .environ_map = init.environ_map,
-    };
+    var launcher = try ouro.launcher.Systemd.init(allocator, init.io, init.environ_map);
+    defer launcher.deinit();
     var mcp = try ouro.mcp_client.Client.init(allocator);
     defer mcp.deinit();
     const control_path = if (options.mcp_socket) |path| try allocator.dupe(u8, path) else try std.fmt.allocPrint(allocator, "{s}/ouro.mcp.sock", .{init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory});
@@ -209,7 +192,7 @@ pub fn main(init: std.process.Init) !void {
         .hotplug = if (options.headless) null else ouro.drm_hotplug.real,
     };
     const coordinator = Runtime.create(allocator, root, platforms, .{
-        .router_capacity = 20,
+        .router_capacity = 26,
         .timer_capacity = 6,
         .device_capacity = 36,
         .input = .{
@@ -362,13 +345,13 @@ pub fn main(init: std.process.Init) !void {
     if (run_error == null) runner.installShutdown(&shutdown_signals) catch |err| {
         run_error = err;
     };
-    if (run_error == null) if (settings) |*client| runner.loop.installSettings(client) catch |err| {
-        run_error = err;
-    };
     if (run_error == null) runner.loop.installMcp(&mcp) catch |err| {
         run_error = err;
     };
     if (run_error == null) runner.loop.installControl(&control) catch |err| {
+        run_error = err;
+    };
+    if (run_error == null) runner.loop.installLauncher(&launcher) catch |err| {
         run_error = err;
     };
     if (run_error != null) exit_deadline.arm(fatal_shutdown_grace_ns);
@@ -383,7 +366,7 @@ pub fn main(init: std.process.Init) !void {
     var signal_stop_started = false;
     var pending_config: ?PreparedConfig = null;
     defer if (pending_config) |*candidate| candidate.deinit();
-    while (!wayring_drained or !coordinator.backendDrainComplete() or !runner.loop.settingsDrained() or !runner.loop.mcpDrained() or !runner.loop.controlDrained()) {
+    while (!wayring_drained or !coordinator.backendDrainComplete() or !runner.loop.mcpDrained() or !runner.loop.controlDrained() or !runner.loop.launcherDrained()) {
         if (coordinator.terminalFailure()) |terminal_error| {
             exit_deadline.arm(fatal_shutdown_grace_ns);
             std.log.err("backend cannot safely drain: {t}; exiting with scanout pinned for kernel teardown", .{terminal_error});
@@ -452,7 +435,7 @@ pub fn main(init: std.process.Init) !void {
                 else
                     &small_response;
                 var response = std.Io.Writer.fixed(response_storage);
-                const stopped = executeControl(arena.allocator(), command, coordinator, &systemd_session, &launcher, &mcp, &performance, settings == null, &control_reload, &response) catch |err| failed: {
+                const stopped = executeControl(arena.allocator(), command, coordinator, &systemd_session, &launcher, &mcp, &performance, &control_reload, &response) catch |err| failed: {
                     response = std.Io.Writer.fixed(response_storage);
                     try response.print("{{\"resultType\":\"complete\",\"content\":[{{\"type\":\"text\",\"text\":{f}}}],\"isError\":true}}", .{std.json.fmt(@errorName(err), .{})});
                     break :failed false;
@@ -476,15 +459,8 @@ pub fn main(init: std.process.Init) !void {
             };
             signal_stop_started = true;
         }
-        if (!signal_stop_started and (progress.settings_changed or ((progress.reload_requested or control_reload) and settings == null))) update_config: {
-            var candidate = if (settings) |*client| from_settings: {
-                var update = client.take() orelse break :update_config;
-                defer update.deinit(allocator);
-                break :from_settings ouro.configuration.parseSettings(allocator, update) catch |err| {
-                    std.log.err("invalid ourosettings /compositor; keeping active configuration: {t}", .{err});
-                    break :update_config;
-                };
-            } else config_store.load() catch |err| {
+        if (!signal_stop_started and (progress.reload_requested or control_reload)) update_config: {
+            var candidate = config_store.load() catch |err| {
                 std.log.err("configuration reload failed; keeping active configuration: {t}", .{err});
                 break :update_config;
             };
@@ -533,7 +509,7 @@ fn beginShutdown(systemd_session: *SystemdSession, coordinator: *Runtime) !void 
 fn applyAction(
     coordinator: *Runtime,
     systemd_session: *SystemdSession,
-    launcher: *const ouro.launcher.Systemd,
+    launcher: *ouro.launcher.Systemd,
     mcp: *ouro.mcp_client.Client,
     action: ouro.config.Action,
 ) !bool {
@@ -554,10 +530,9 @@ fn executeControl(
     command: ouro.control.Command,
     coordinator: *Runtime,
     systemd_session: *SystemdSession,
-    launcher: *const ouro.launcher.Systemd,
+    launcher: *ouro.launcher.Systemd,
     mcp: *ouro.mcp_client.Client,
     performance: *ouro.diagnostics.Recorder,
-    file_config: bool,
     reload: *bool,
     writer: *std.Io.Writer,
 ) !bool {
@@ -592,7 +567,6 @@ fn executeControl(
             return false;
         },
         .reload_config => {
-            if (!file_config) return error.SettingsUpdateAutomatically;
             try writer.writeAll(ouro.control.accepted);
             reload.* = true;
             return false;
@@ -680,9 +654,8 @@ fn usage() void {
         \\  --trace-pacing  diagnostic: log per-frame monotonic timing; adds measurement overhead
         \\  --software-cursor  disable hardware cursor updates for comparison/troubleshooting
         \\  --drm-device  require this DRM card instead of automatic selection
-        \\  --config      file-only override (base JSON and adjacent config.d); no ourosettings
-        \\                otherwise subscribe to ourosettings /compositor (10s startup deadline)
-        \\  --export-config  print merged legacy file configuration and exit (no settings writes)
+        \\  --config      override XDG configuration with base JSON and adjacent config.d
+        \\  --export-config  print merged file configuration and exit (no writes)
         \\  --export-mcp-descriptor  print installed discovery JSON and exit (no display/settings needed)
         \\  --mcp-socket   override $XDG_RUNTIME_DIR/ouro.mcp.sock; parent must be private
         \\  --managed-session  publish and bind the systemd graphical session lifecycle
@@ -692,7 +665,7 @@ fn usage() void {
         \\  --headless-frame-dump=PATH  write each presented frame of the first virtual output as PPM
         \\  --headless-input=PATH  bind a Unix datagram socket; each datagram is one device event:
         \\                 "motion DX DY", "button CODE 0|1", "key CODE 0|1", "scroll V H"
-        \\  SIGHUP        reload --config sources; ourosettings updates arrive automatically
+        \\  SIGHUP        reload XDG configuration or the selected --config sources
         \\
     , .{});
 }

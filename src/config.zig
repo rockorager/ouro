@@ -553,8 +553,8 @@ pub const Store = struct {
         return snapshotFromValue(&arena, root);
     }
 
-    /// Export the effective legacy file configuration as a standalone patch
-    /// over built-in defaults. Does not contact or modify ourosettings.
+    /// Export the effective file configuration as a standalone patch over
+    /// built-in defaults. Does not write configuration files.
     pub fn exportSource(self: *const Store) ![]u8 {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();

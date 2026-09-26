@@ -225,34 +225,31 @@ buttons rather than delivering them to applications.
 
 ## Configuration
 
-By default Ouro subscribes to `ouro://settings/compositor` through MCP
-`subscriptions/listen` at `$XDG_RUNTIME_DIR/ouro/settings.mcp.sock`. Install
-[ourosettings](https://github.com/rockorager/ourosettings) with MCP support
-and its user socket/service units. Each publication is a complete compositor
-configuration applied over built-in defaults, **not** over the previous
-publication or local config files. Other desktop preferences do not trigger
-compositor reloads.
+Ouro loads its own strict JSON configuration; no settings daemon is required.
+It applies built-in defaults, system locations from `XDG_CONFIG_DIRS` (default
+`/etc/xdg`, with earlier entries taking precedence), then
+`$XDG_CONFIG_HOME/ouro/config.json` (or `$HOME/.config/ouro/config.json`). Each
+location's base file is followed by lexically sorted `config.d/*.json` fragments.
+`--config=PATH` instead selects one base file and a `config.d` directory beside
+it, bypassing the XDG locations. Missing files retain lower-precedence values
+and built-in defaults.
 
-Startup waits up to ten seconds for the initial reply and rejects missing or
-invalid compositor settings before opening the display. Runtime invalid
-updates preserve the active configuration. Disconnects also preserve it and
-retry with backoff from 250 ms to five seconds; reconnecting obtains a fresh
-snapshot. The live subscription keeps the socket-activated daemon running.
-A validated replacement waits for pending input/output transactions; newer
-valid updates replace that waiting candidate. Settings persistence is not an
-acknowledgement of hardware application: output changes complete asynchronously
-and can roll back. MCP records are bounded to 4 MiB including the newline.
-Ouro waits for the subscription acknowledgment before `resources/read`, keeps
-one read outstanding, and rereads if a change arrived during that read. Resource
-contents are `application/json` text containing `{revision, exists, value}`;
-revisions remain opaque strings. The `ourosettings.socket` unit name is unchanged.
-
-`--config=PATH` is a **file-only override**: it loads that base JSON and then
-lexically sorted `config.d/*.json` fragments beside it, without connecting to
-ourosettings. Missing files retain built-in defaults. `SIGHUP` reloads these
-same sources; it is unnecessary in settings mode. In either mode, malformed
+`SIGHUP` or the MCP `reload-config` tool rereads the same sources. Malformed
 JSON, duplicate object keys, unknown fields, invalid keysyms, and invalid
-actions reject the complete candidate rather than partially applying it.
+actions reject the complete candidate and preserve the active configuration.
+A validated replacement waits for pending input/output transactions; a newer
+valid reload replaces that waiting candidate. Output changes complete
+asynchronously and can roll back if hardware activation fails.
+
+Removing a configuration-owned scale restores that output's original scale.
+An output with no old or new scale rule retains changes made by external
+display tools. Mode, position, and enablement currently retain their active
+values when omitted; fully resetting those properties on reload remains work
+toward the vision.
+
+Runtime settings edits and saving through MCP are not implemented yet. Edit
+the JSON files and reload; Ouro does not rewrite those files. The intended
+temporary-versus-saved model is described in [vision.md](vision.md).
 
 Every source after the built-in defaults is an
 [RFC 7396 JSON Merge Patch](https://www.rfc-editor.org/rfc/rfc7396). Objects
@@ -280,8 +277,23 @@ number from 1 through 10, `move-focused-to-workspace` followed by the same,
 `close`, `toggle-fullscreen`,
 `toggle-maximized`, `toggle-floating`, `swap-center`, `exit`, `run` followed by an argv,
 or `call` followed by a Unix address, MCP tool name, and arguments object.
-`run` never invokes a shell and delegates process ownership to
-`systemd-run --user`; Ouro does not supervise applications.
+`run` never invokes a shell. Ouro calls the user systemd manager's
+`StartTransientUnit` over D-Bus, without spawning a helper or reaper thread.
+Connection establishment, socket sends and receives, and deadlines use native
+operations on Ouro's shared io_uring, without an epoll or timerfd adapter.
+Applications run in `app.slice`, require `graphical-session.target`, stop with
+that session, and have their units collected after exit, including failure.
+Bare executable names use Ouro's `PATH`; application environment and supervision
+belong to the user manager. The session bus comes from `DBUS_SESSION_BUS_ADDRESS`,
+or `$XDG_RUNTIME_DIR/bus` when unset. Launch acknowledgments mean queued; systemd
+acceptance and errors are logged asynchronously. Timed-out or disconnected
+requests are not retried, because the application may already have started.
+
+`zig build test-launcher` checks the D-Bus codec, io_uring transport, and launch
+encoding. After building Ouro, `uv run test/launcher.py` exercises keybindings and
+MCP against a private `dbus-daemon` and fake systemd endpoint. It checks launch
+properties, replies, timeouts, and shutdown without starting real applications
+or changing the user's systemd session.
 
 `call` invokes an MCP tool directly, without launching a helper or discovering
 tools first. For example, if your shell exposes this tool (replace its address and name
@@ -317,12 +329,11 @@ dropped. Config reloads preserve in-flight calls; compositor shutdown closes
 them without waiting for replies. The separate control server below exposes
 compositor commands to other MCP clients.
 
-Both clients send MCP 2026-07-28 newline-delimited JSON-RPC 2.0 with per-request
-protocol version, empty client capabilities, and client identity in `params._meta`.
-There is no `initialize` handshake. The `call` configuration shape is unchanged,
-but **existing Varlink targets must migrate to MCP**; this is not wire-compatible.
-ourosettings exposes only MCP at `settings.mcp.sock`; there is no Varlink
-compatibility endpoint.
+The call client sends MCP 2026-07-28 newline-delimited JSON-RPC 2.0 with
+per-request protocol version, empty client capabilities, and client identity in
+`params._meta`. There is no `initialize` handshake. The `call` configuration
+shape is unchanged, but **existing Varlink targets must migrate to MCP**; this
+is not wire-compatible.
 
 ### MCP compositor control
 
@@ -361,8 +372,8 @@ to see what the kernel attributes to Ouro beyond the compositor's own
 allocations. `set-performance-recorder` enables or disables the bounded
 performance flight recorder described under Diagnostics; it is off by default
 and disabling it keeps any pending incident report. `reload-config` requests an
-asynchronous file reload; it returns a tool error in settings mode, where
-updates already arrive automatically.
+asynchronous reload of the XDG configuration or selected `--config` files;
+acceptance is not confirmation that validation or hardware application succeeded.
 Structured tool results also include the identical serialized JSON in a text
 content block, so content-only MCP hosts can read state and acknowledgments.
 Invalid names/arguments return JSON-RPC errors; execution failures return MCP
@@ -411,55 +422,29 @@ installed descriptors and runtime sockets. An installed catalog is an initial
 snapshot, not evidence that a compositor instance is running; refresh from the
 live endpoint and apply its TTL and invalidation notifications.
 
-### Moving existing configuration into ourosettings
+### Configuration export and existing settings
 
-Ouro does not automatically migrate or delete configuration files.
-`ouro --export-config` prints a validated standalone compositor object and
-exits without contacting settings, Wayland, systemd, or DRM. It reads the old
-layering: system `XDG_CONFIG_DIRS` at lower precedence, then
-`$XDG_CONFIG_HOME/ouro/config.json` (or `$HOME/.config/ouro/config.json`) and
-lexically sorted `config.d/*.json`. Use `--config=PATH --export-config` to
-export a specific base and its adjacent fragments instead. Removed default
-bindings retain null tombstones in the export.
+`ouro --export-config` prints the validated, merged file configuration and
+exits without opening a display or contacting systemd. Use
+`--config=PATH --export-config` to inspect a specific base and its adjacent
+fragments. Removed default bindings retain null tombstones in the export.
+This is an inspection/export operation, not a minimal patch for saving runtime
+changes. Do not redirect it onto a configuration file it is reading.
 
-After installing the binaries and ourosettings units, export and inspect the
-old configuration:
+Existing JSON configuration files work without conversion. If preferences were
+moved into ourosettings, manually copy the compositor object into Ouro's JSON
+configuration after backing up and reviewing existing files and fragments.
+Do not copy the whole desktop settings object. Ouro neither reads nor migrates
+the daemon's state, and does not uninstall or stop its services; other software
+may still use them.
 
-```sh
-umask 077
-backup=$(mktemp -d "$HOME/ouro-settings-migration.XXXXXX")
-ouro --export-config > "$backup/compositor.json"
-systemctl --user enable --now ourosettings.socket
-```
-
-Using an MCP client that supports the Unix transport described above, read
-`ouro://settings` with `resources/read` and save its JSON `text` selection as
-`$backup/before.json`. Inspect both JSON files before replacing the compositor
-section. Send `tools/call` with tool name `settings.set_section` and arguments:
-
-```json
-{
-  "expected_revision": "the revision from before.json",
-  "section": "compositor",
-  "value": { "the": "complete object from compositor.json" }
-}
-```
-
-The example values are placeholders, not a literal migration request.
-`settings.set_section` replaces the whole section, not a merge patch. A successful
-result's `structuredContent` contains `{revision, settings}`. A revision conflict
-is a tool error and leaves settings unchanged; refetch and review before retrying.
-Do not replay a mutation after a timeout or lost response: read back its state
-first. Existing config files remain available for `--config=PATH` recovery.
-Use a new login to start the new compositor; do not restart a working desktop
-just to migrate preferences.
-
-`zig build test-settings` exercises configuration parsing/export, bounded Unix
-transport, and the deterministic runtime handoff/drain. After building Ouro,
-`python3 test/settings.py --daemon /path/to/ourosettings` additionally checks
-the real daemon's initial/change/filter/reconnect contract, migration, semantic
-rejection, file-only override, and startup timeout in private directories.
-These checks do not require or validate a real display or user-systemd session.
+`zig build test-settings` exercises configuration parsing/export, MCP transport,
+and deterministic runtime handoff/rollback. After building Ouro,
+`python3 test/settings.py` checks XDG precedence, startup without a daemon,
+explicit file selection, and live SIGHUP/MCP reloads in a private headless
+instance. Invalid reloads must preserve the active output scale, while removing
+its scale rule must restore the original scale. These checks do not validate a real
+display or user-systemd session.
 
 ## Display-manager session
 
@@ -472,13 +457,16 @@ starts `ouro-session.target` bound to `graphical-session.target`, and clears
 that environment and stops both targets when Ouro exits. Direct launches stay
 standalone and do not alter the user's graphical-session targets.
 
-In settings mode, managed startup first starts `ourosettings.socket`, then
-connects to activate the daemon, before preparing the graphical session.
-The settings units must not depend on `graphical-session.target`; that would
-create a startup cycle. Standalone launches expect the socket already running
-(for example `systemctl --user enable --now ourosettings.socket`). No
-`Requires=ourosettings.service` or compositor restart on daemon restart is
-needed. `--config=PATH` skips this dependency entirely.
+Configuration is loaded and validated before managed-session preparation.
+No settings service is started. D-Bus activation and graphical-session
+integration remain separate from compositor configuration.
+
+Desktop portals are external services selected by the user. Ouro currently
+ships no portal backend or `ouro-portals.conf`; users must configure suitable
+backends for file dialogs, desktop appearance preferences, and screen sharing.
+The [Settings portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Settings.html)
+provides standardized desktop preferences, not Ouro's window-management settings.
+See [portal backend selection](https://flatpak.github.io/xdg-desktop-portal/docs/portals.conf.html).
 
 A binding may use an object when compositor-side repetition is desired:
 

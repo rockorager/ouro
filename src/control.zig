@@ -97,7 +97,7 @@ fn writeTools(writer: *std.Io.Writer) !void {
     try writer.writeAll(enabled_schema);
     try writer.print(",\"outputSchema\":{s}}},", .{accepted_schema});
     try writer.writeAll(
-        \\{"name":"reload-config","description":"Request a reload of --config files. In ourosettings mode settings update automatically and this tool returns an error.","inputSchema":
+        \\{"name":"reload-config","description":"Request a reload of XDG configuration or the selected --config files. Invalid configuration preserves the active settings. Acceptance does not mean output changes have completed.","inputSchema":
     );
     try writer.writeAll(empty_schema);
     try writer.print(",\"outputSchema\":{s}}}]", .{accepted_schema});

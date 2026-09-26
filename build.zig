@@ -664,15 +664,27 @@ pub fn build(b: *std.Build) void {
 
     const settings_tests = b.addTest(.{
         .root_module = ouro,
-        .filters = &.{ "settings", "config.", "MCP", "invalid paths and stop readiness" },
+        .filters = &.{ "settings", "config.", "MCP" },
     });
     const settings_runtime_tests = b.addTest(.{
         .root_module = drm_presentation_tests.root_module,
-        .filters = &.{ "settings resource", "settings readiness", "settings HDR", "MCP readiness", "primary scale reconfiguration" },
+        .filters = &.{ "configuration", "settings HDR", "MCP readiness", "primary scale reconfiguration" },
     });
     const settings_test_step = b.step("test-settings", "Run configuration, MCP transport and runtime handoff tests");
     settings_test_step.dependOn(&b.addRunArtifact(settings_tests).step);
     settings_test_step.dependOn(&b.addRunArtifact(settings_runtime_tests).step);
+
+    const launcher_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/launcher.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "wayring", .module = wayring }},
+        }),
+    });
+    const launcher_test_step = b.step("test-launcher", "Run D-Bus codec, transport and systemd launch tests");
+    launcher_test_step.dependOn(&b.addRunArtifact(launcher_tests).step);
 
     const shell_input_tests = b.addTest(.{
         .root_module = b.createModule(.{

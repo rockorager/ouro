@@ -537,6 +537,8 @@ pub fn Coordinator(comptime protocol: type) type {
             claim: ?drm.ClaimHandle = null,
             protocol_output: OutputAdapter.OutputId,
             management_head: protocol_output_management.HeadId,
+            // Unconfigured scale captured before any output rule is applied.
+            default_scale_120: u32,
             kms_output: ?*output_api.Output = null,
             output_profile: ?*engine_settings.OutputProfile = null,
             // Effective preference used at activation, not the negotiated transfer.
@@ -1836,6 +1838,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .id = .{ .index = 0, .generation = 1 },
                 .protocol_output = self.output_adapter.primaryOutput(),
                 .management_head = self.output_management_adapter.lifecycle.primary,
+                .default_scale_120 = self.output_management_adapter.lifecycle.current.scale_120,
             };
             self.physical_output_count = 1;
             try self.updateWorkspaceInventory();
@@ -5225,7 +5228,13 @@ pub fn Coordinator(comptime protocol: type) type {
                     state.x = position.x;
                     state.y = position.y;
                 }
-                if (settings.scale_120) |scale| state.scale_120 = scale;
+                if (settings.scale_120) |scale| {
+                    state.scale_120 = scale;
+                } else if (take_ownership and (try configuredOutputSettings(&self.settings, snapshot)).scale_120 != null) {
+                    // Removing a configuration-owned scale restores its default.
+                    // With no old or new rule, leave external display tools alone.
+                    state.scale_120 = physical.default_scale_120;
+                }
                 if (settings.mode) |requested| {
                     const mode_end = try std.math.add(usize, connector.mode_start, connector.mode_count);
                     if (mode_end > snapshot.modes.len) return error.InvalidModeInventory;
@@ -8497,6 +8506,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .claim = claim,
                 .protocol_output = protocol_output_id,
                 .management_head = management_head,
+                .default_scale_120 = scale_120,
                 .capture_bytes = capture_bytes,
             };
             if (appending) self.physical_output_count += 1;
