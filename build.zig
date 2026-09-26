@@ -570,6 +570,13 @@ pub fn build(b: *std.Build) void {
     const vulkan_test_step = b.step("test-render-vulkan", "Run deterministic Vulkan renderer contract tests");
     vulkan_test_step.dependOn(&run_vulkan_tests.step);
 
+    const capture_tests = b.addTest(.{
+        .root_module = ouro,
+        .filters = &.{ "capture", "acquire fence" },
+    });
+    const capture_test_step = b.step("test-capture", "Run capture color, publication, and fence lifetime tests");
+    capture_test_step.dependOn(&b.addRunArtifact(capture_tests).step);
+
     const kms_tests = b.addTest(.{
         .root_module = ouro,
         .filters = &.{"kms:"},
@@ -641,6 +648,12 @@ pub fn build(b: *std.Build) void {
         "Run the deterministic physical presentation integration test",
     );
     drm_presentation_test_step.dependOn(&run_drm_presentation_tests.step);
+
+    const capture_runtime_tests = b.addTest(.{
+        .root_module = drm_presentation_tests.root_module,
+        .filters = &.{"isolated capture"},
+    });
+    capture_test_step.dependOn(&b.addRunArtifact(capture_runtime_tests).step);
 
     const shm_tests = b.addTest(.{
         .root_module = ouro,

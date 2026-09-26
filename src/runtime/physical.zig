@@ -1101,6 +1101,17 @@ pub fn Coordinator(comptime protocol: type) type {
         capture_samples: []render.PlannedSample,
         capture_imports: []?output_api.ImportedSource,
         capture_renderer: render_pixman.Renderer,
+        capture_waits: @import("acquire_fence.zig").Waits,
+        pending_toplevel_capture: ?struct {
+            capture: ImageCopyCaptureAdapter.Capture,
+            output: output_scheduler.OutputId,
+            destination: ImageCopyDestination,
+            renderer: output_api.IsolatedCapture,
+            wait: *drm_syncobj.AcquireWait,
+            denied: bool = false,
+            copied: bool = false,
+            success: bool = false,
+        },
         frame_bindings: []output_api.SampleBinding,
         frame_changes: []damage.Change,
         frame_change_layers: []?*Layer,
@@ -1299,6 +1310,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 .max_source_height = config.output.max_source_height,
             });
             errdefer self.capture_renderer.deinit();
+            self.capture_waits = .{ .kind = .capture_fence };
+            self.pending_toplevel_capture = null;
             self.frame_bindings = try allocator.alloc(output_api.SampleBinding, config.output.max_samples);
             errdefer allocator.free(self.frame_bindings);
             self.frame_changes = try allocator.alloc(
@@ -2153,7 +2166,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         pub fn submissionWorkPending(self: *const Self) bool {
-            return self.adapter.acquire_waits.submission_pending or self.commit_timer_retry == .submission;
+            return self.adapter.acquire_waits.submission_pending or self.capture_waits.submission_pending or self.commit_timer_retry == .submission;
         }
 
         pub fn focusedToplevel(self: *const Self) ?ToplevelId {
@@ -2353,6 +2366,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.icc_poll_canceling = true;
             };
             try self.adapter.prepareAcquireWaits(true);
+            if (self.pending_toplevel_capture != null) try self.finishToplevelCapture(false);
+            self.capture_waits.stopping = true;
+            try self.capture_waits.prepare(self.allocator, &self.router, &self.root.ring);
             try self.syncDesktopTimer();
             try self.syncIdleTimer();
             try self.syncCommitTimer();
@@ -2372,6 +2388,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 (self.hotplug == null or self.hotplug.?.drainComplete()) and
                 self.session.drainComplete() and self.timers.idle() and
                 self.adapter.acquire_waits.drained() and
+                self.pending_toplevel_capture == null and self.capture_waits.drained() and
                 self.icc_poll == null and !self.icc_poll_canceling and
                 self.security_context_adapter.drainComplete();
         }
@@ -2425,6 +2442,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.allocator.free(self.removed_layer_outputs);
             self.allocator.free(self.removed_layers);
             self.allocator.free(self.frame_bindings);
+            self.capture_waits.deinit(self.allocator);
             self.capture_renderer.deinit();
             self.allocator.free(self.capture_imports);
             self.allocator.free(self.capture_samples);
@@ -3044,6 +3062,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.adapter.completeAcquireWait(outcome);
                     acquire_completed = true;
                 },
+                .capture_fence => try self.capture_waits.complete(&self.router, outcome.token, outcome.cqe.res),
                 .copy => {
                     try self.adapter.completeShmCopy(outcome);
                     try self.applyReady();
@@ -3380,6 +3399,15 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncForeignToplevelOutputChanges();
             try self.syncRepaintVisibility();
             if (self.desktop.pendingCommands() != 0) try self.advanceShell();
+            if (self.pending_toplevel_capture) |pending| {
+                if (pending.wait.signaled) self.finishToplevelCapture(true) catch |cause| switch (cause) {
+                    // Keep the completed target and publication state until
+                    // its terminal event fits; never repeat the storage write.
+                    error.Exhausted => self.markProtocolAll(ProtocolReady.image_copy_capture),
+                    else => return cause,
+                };
+            }
+            if (!self.stopping) try self.processImageCopyCaptures();
             try self.flushProtocol();
             if (self.foreign_toplevel_outputs_dirty) {
                 try self.syncForeignToplevelOutputChanges();
@@ -3393,6 +3421,7 @@ pub fn Coordinator(comptime protocol: type) type {
             // owner. Queue cancellation before the loop can sleep again.
             if (self.commit_timer_retry != .none) try self.syncCommitTimer();
             try self.adapter.prepareAcquireWaits(self.stopping);
+            try self.capture_waits.prepare(self.allocator, &self.router, &self.root.ring);
         }
 
         fn validateSurfaceCommit(context: *anyopaque, id: Adapter.SurfaceId) !void {
@@ -6441,6 +6470,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 ProtocolReady.primary_selection | ProtocolReady.text_input |
                 ProtocolReady.tablet);
             if (self.sessionLockActive()) {
+                // Remember revocation even if unlocking precedes the GPU CQE.
+                if (self.pending_toplevel_capture) |*pending| pending.denied = true;
                 // A down retained before seat acceptance has no contact for
                 // touchCancel to retire. Drop its cached background delivery,
                 // preserving the admission stages that already completed.
@@ -7294,6 +7325,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncWorkspace();
             self.input_method_adapter.advance();
             try self.reconcileInputMethod();
+            _ = try self.refreshImageCopySources();
             if (self.image_copy_capture_adapter.refreshCursors(self)) |changed| {
                 if (changed != 0) self.markProtocolAll(ProtocolReady.image_copy_capture);
             } else |cause| switch (cause) {
@@ -11075,7 +11107,22 @@ pub fn Coordinator(comptime protocol: type) type {
             return null;
         }
 
+        /// Flush and retry a full constraint batch before admitting or
+        /// publishing pixels; an exhausted update leaves old frames valid.
+        fn refreshImageCopySources(self: *Self) !bool {
+            const changed = self.image_copy_capture_adapter.refreshSources(self) catch |cause| switch (cause) {
+                error.Exhausted => {
+                    self.markProtocolAll(ProtocolReady.image_copy_capture);
+                    return false;
+                },
+                else => return cause,
+            };
+            if (changed != 0) self.markProtocolAll(ProtocolReady.image_copy_capture);
+            return true;
+        }
+
         fn processImageCopyCaptures(self: *Self) !void {
+            if (!try self.refreshImageCopySources()) return;
             const capture = self.nextReadyImageCopyCapture() orelse return;
             try self.image_copy_capture_adapter.acceptCapture(capture.frame);
             if (capture.target == .source) switch (capture.target.source) {
@@ -11246,6 +11293,8 @@ pub fn Coordinator(comptime protocol: type) type {
             while (self.image_copy_capture_adapter.nextCapture(after)) |candidate| {
                 after = candidate.sequence;
                 const capture = candidate.capture;
+                if (capture.target == .source and capture.target.source == .toplevel and
+                    self.pending_toplevel_capture != null) continue;
                 const output = switch (capture.target) {
                     .source => |source| switch (source) {
                         .toplevel => |id| if (self.captureToplevelBounds(id)) |bounds|
@@ -11343,12 +11392,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 imported.* = null;
             };
             for (self.frame_samples[0..sample_count], 0..) |*sample, index| {
-                // Isolated toplevel capture currently uses the electrical
-                // Pixman path. Do not silently reinterpret managed/video
-                // content as desktop gamma22; full-output Vulkan capture is
-                // available for those sources until offscreen capture moves.
-                if (!std.meta.eql(sample.color_description, render.color.Description.desktop) or
-                    !std.meta.eql(sample.color_representation, render.color.Representation{}) or sample.source.format.isVideo())
+                // Pixman is electrical-only. Vulkan retains the original
+                // description/representation and imports video planes itself.
+                if (output.rendererKind() == .pixman and
+                    (!std.meta.eql(sample.color_description, render.color.Description.desktop) or
+                        !std.meta.eql(sample.color_representation, render.color.Representation{}) or sample.source.format.isVideo()))
                 {
                     try self.failImageCopy(capture);
                     return;
@@ -11369,7 +11417,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.failImageCopy(capture);
                     return;
                 };
-                if (sample.source.external != null) {
+                if (output.rendererKind() == .pixman and sample.source.external != null) {
                     const imported = output.mapExternalSource(sample.source) catch {
                         try self.failImageCopy(capture);
                         return;
@@ -11435,6 +11483,20 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.failImageCopy(capture);
                 return;
             };
+            if (output.rendererKind() == .vulkan) {
+                self.startToplevelCapture(output, capture, object, .{
+                    .output = output_size,
+                    .output_format = .argb8888_premultiplied,
+                    .clear = .{ .a = 0, .r = 0, .g = 0, .b = 0 },
+                    .samples = self.frame_samples[0..sample_count],
+                }, plan) catch |cause| {
+                    if (cause == error.CaptureBufferConstraints) {
+                        try self.image_copy_capture_adapter.fail(capture.frame, .buffer_constraints);
+                        self.markProtocol(capture.peer, ProtocolReady.image_copy_capture);
+                    } else try self.failImageCopy(capture);
+                };
+                return;
+            }
             var rendered = false;
             if (self.shm.bufferToken(object)) |token| {
                 const info = self.shm.store.bufferInfo(token) catch {
@@ -11550,6 +11612,98 @@ pub fn Coordinator(comptime protocol: type) type {
             self.markProtocol(capture.peer, ProtocolReady.image_copy_capture);
         }
 
+        fn startToplevelCapture(
+            self: *Self,
+            output: *output_api.Output,
+            capture: ImageCopyCaptureAdapter.Capture,
+            object: anytype,
+            list: render.List,
+            plan: render.DamagePlan,
+        ) !void {
+            const destination: ImageCopyDestination = if (self.shm.bufferToken(object)) |token| shm: {
+                const info = try self.shm.store.bufferInfo(token);
+                if (info.width != capture.width or info.height != capture.height or
+                    info.stride != try std.math.mul(u32, capture.width, 4) or
+                    (info.format.value != protocol.wl_shm.format.argb8888.value and
+                        info.format.value != protocol.wl_shm.format.xrgb8888.value))
+                    return error.CaptureBufferConstraints;
+                break :shm .{ .shm = try self.shm.store.pin(token) };
+            } else if (self.dmabuf_adapter.bufferFromObject(object)) |handle| dmabuf: {
+                const lease = try self.dmabuf_adapter.retainBuffer(handle);
+                errdefer self.dmabuf_adapter.releaseLease(lease) catch unreachable;
+                const buffer = try self.dmabuf_adapter.leasedBuffer(lease);
+                const import = dmabufCaptureImport(buffer) catch return error.CaptureBufferConstraints;
+                if (import.width != capture.width or import.height != capture.height or
+                    (import.format != gbm.format_argb8888 and import.format != gbm.format_xrgb8888))
+                    return error.CaptureBufferConstraints;
+                break :dmabuf .{ .dmabuf = lease };
+            } else return error.CaptureBufferConstraints;
+            errdefer self.releaseImageCopyDestination(destination) catch unreachable;
+            var renderer = try output.createIsolatedCapture(list.output);
+            errdefer renderer.deinit();
+            const fd = try renderer.submit(list, plan);
+            errdefer _ = std.os.linux.close(fd);
+            const wait = try self.capture_waits.watch(self.allocator, &self.router, &self.root.ring, fd);
+            self.pending_toplevel_capture = .{
+                .capture = capture,
+                .output = output.outputId(),
+                .destination = destination,
+                .renderer = renderer,
+                .wait = wait,
+            };
+        }
+
+        fn copyToplevelCapture(self: *Self) !void {
+            const pending = &self.pending_toplevel_capture.?;
+            const capture = pending.capture;
+            const readback = try pending.renderer.readback();
+            const size: render.Size = .{ .width = capture.width, .height = capture.height };
+            const region: geometry.Rect = .{ .x = 0, .y = 0, .width = @intCast(size.width), .height = @intCast(size.height) };
+            switch (pending.destination) {
+                .shm => |pin| {
+                    var access = try self.shm.store.writeAccess(pin);
+                    var open = true;
+                    defer if (open) access.end() catch {};
+                    try copyCaptureRegion(access.bytes, try std.math.mul(u32, size.width, 4), size.width, size.height, region, readback, size);
+                    try access.end();
+                    open = false;
+                },
+                .dmabuf => |lease| {
+                    const output = (self.physicalOutputForKmsId(pending.output) orelse return error.NoOutput).kms_output orelse return error.NoOutput;
+                    const buffer = try self.dmabuf_adapter.leasedBuffer(lease);
+                    var destination = try output.mapCaptureDestination(try dmabufCaptureImport(buffer));
+                    defer destination.deinit();
+                    try copyCaptureRegion(destination.bytes, destination.stride, size.width, size.height, region, readback, size);
+                },
+            }
+        }
+
+        fn finishToplevelCapture(self: *Self, completed: bool) !void {
+            const pending = &self.pending_toplevel_capture.?;
+            if (!pending.copied) {
+                if (completed and !try self.refreshImageCopySources()) return;
+                pending.success = completed and !pending.denied and !self.sessionLockActive() and
+                    self.image_copy_capture_adapter.canCopy(pending.capture.frame, self.captureConstraints(pending.capture.target));
+                if (pending.success) self.copyToplevelCapture() catch {
+                    pending.success = false;
+                };
+                try self.releaseImageCopyDestination(pending.destination);
+                pending.copied = true;
+            }
+            const result = if (pending.success)
+                self.image_copy_capture_adapter.complete(pending.capture.frame, try monotonicNs())
+            else
+                self.failImageCopy(pending.capture);
+            result catch |cause| switch (cause) {
+                error.StaleFrame, error.InvalidCompletion => {},
+                else => return cause,
+            };
+            self.markProtocol(pending.capture.peer, ProtocolReady.image_copy_capture);
+            pending.renderer.deinit();
+            pending.wait.owned = false;
+            self.pending_toplevel_capture = null;
+        }
+
         fn dmabufCaptureImport(buffer: *const protocol_linux_dmabuf.Buffer) !gbm.Import {
             const import = try dmabufImport(buffer);
             if (import.modifier != gbm.modifier_linear or import.plane_count != 1 or
@@ -11655,6 +11809,9 @@ pub fn Coordinator(comptime protocol: type) type {
             self: *Self,
             output: output_scheduler.OutputId,
         ) !void {
+            if (self.pending_toplevel_capture) |pending| {
+                if (std.meta.eql(pending.output, output)) try self.finishToplevelCapture(false);
+            }
             if (self.physicalOutputForKmsIdMutable(output)) |physical| {
                 if (physical.pending_screencopy != null) {
                     try self.finishScreencopy(physical, false, 0, null);

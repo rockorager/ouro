@@ -625,6 +625,20 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
             }
             return changed;
         }
+        pub fn refreshSources(self: *Self, resolver: anytype) !usize {
+            var changed: usize = 0;
+            for (self.sessions.entries.items, 0..) |session, index| {
+                if (!session.active or session.stopped or session.target == null or
+                    session.target.? != .source) continue;
+                const before = self.outbound_count;
+                try self.updateConstraints(
+                    .{ .index = @intCast(index), .generation = session.generation },
+                    resolver.captureConstraints(session.target.?),
+                );
+                if (self.outbound_count != before) changed += 1;
+            }
+            return changed;
+        }
         fn constraintUpdateNeeded(self: *Self, id: SessionId, constraints: ?Constraints) !usize {
             const session = try self.resolveSession(id);
             if (session.stopped or (constraints != null and session.constraints != null and
@@ -633,6 +647,17 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
             const pending = frame != null and (frame.?.phase == .queued or frame.?.phase == .started);
             return (if (constraints) |value| value.eventCount() else @as(usize, 1)) + @as(usize, @intFromBool(pending));
         }
+        /// Recheck immediately before publishing asynchronous renderer bytes.
+        /// Frames outlive sessions, so also check the live source when a
+        /// backpressured invalidation or constraint refresh has not reached it.
+        pub fn canCopy(self: *Self, id: FrameId, current: ?Constraints) bool {
+            const f = self.mutableFrame(id) catch return false;
+            const frozen = f.constraints orelse return false;
+            const live = current orelse return false;
+            return f.phase == .started and !f.target_invalid and !f.constraints_changed and
+                frozen.width == live.width and frozen.height == live.height;
+        }
+
         pub fn complete(self: *Self, id: FrameId, timestamp_ns: u64) !void {
             const f = try self.mutableFrame(id);
             if (f.phase != .started) return error.InvalidCompletion;
@@ -1593,13 +1618,66 @@ test "image copy capture: frame survives session and stale completion cannot ali
     try adapter.attachBuffer(frame, .{ .id = 12, .generation = 1 });
     try adapter.capture(frame);
     _ = adapter.takeCapture().?;
+    try std.testing.expect(adapter.canCopy(frame, .{ .width = 4, .height = 3 }));
     try adapter.complete(frame, 1);
+    try std.testing.expect(!adapter.canCopy(frame, .{ .width = 4, .height = 3 }));
     adapter.releaseFrame(frame.index);
+    try std.testing.expect(!adapter.canCopy(frame, .{ .width = 4, .height = 3 }));
     try std.testing.expectError(error.StaleFrame, adapter.complete(frame, 2));
     const replacement_session = try adapter.admitSession(test_peer, .{ .id = 13, .generation = 1 }, test_snapshot, .{ .width = 4, .height = 3 }, false);
     adapter.clearOutbound();
     const replacement = try adapter.createFrame(replacement_session, .{ .id = 14, .generation = 1 });
     try std.testing.expect(replacement.generation != frame.generation);
+}
+
+test "image copy capture: asynchronous publication rejects resize invalidation and cancellation" {
+    for (0..3) |scenario| {
+        var adapter = try TestAdapter.init(std.testing.allocator, .{ .outbound_capacity = 16 });
+        defer adapter.deinit();
+        const session = try adapter.admitSession(test_peer, .{ .id = 10, .generation = 1 }, test_snapshot, .{ .width = 7, .height = 3 }, false);
+        adapter.clearOutbound();
+        const frame = try adapter.createFrame(session, .{ .id = 11, .generation = 1 });
+        try adapter.attachBuffer(frame, .{ .id = 12, .generation = 1 });
+        try adapter.capture(frame);
+        try std.testing.expect(!adapter.canCopy(frame, .{ .width = 7, .height = 3 }));
+        _ = adapter.takeCapture().?;
+        try std.testing.expect(adapter.canCopy(frame, .{ .width = 7, .height = 3 }));
+        switch (scenario) {
+            0 => try adapter.updateConstraints(session, .{ .width = 8, .height = 3 }),
+            1 => _ = try adapter.invalidate(test_target),
+            2 => adapter.releaseFrame(frame.index),
+            else => unreachable,
+        }
+        try std.testing.expect(!adapter.canCopy(frame, .{ .width = 7, .height = 3 }));
+    }
+}
+
+test "image copy capture: orphan publication rechecks source under invalidation backpressure" {
+    var adapter = try TestAdapter.init(std.testing.allocator, .{ .outbound_capacity = 8 });
+    defer adapter.deinit();
+    const dimensions: TestAdapter.Constraints = .{ .width = 7, .height = 3 };
+    const session = try adapter.admitSession(test_peer, .{ .id = 10, .generation = 1 }, test_snapshot, dimensions, false);
+    const frame = try adapter.createFrame(session, .{ .id = 11, .generation = 1 });
+    try adapter.attachBuffer(frame, .{ .id = 12, .generation = 1 });
+    try adapter.capture(frame);
+    _ = adapter.takeCapture().?;
+    adapter.releaseSession(session.index);
+    // Terminal events from unrelated sessions can occupy every outbound slot.
+    for (0..8) |index| _ = try adapter.admitSession(test_peer, .{ .id = @intCast(20 + index), .generation = 1 }, .{
+        .id = test_snapshot.id,
+        .target = null,
+    }, null, false);
+    try std.testing.expectError(error.Exhausted, adapter.invalidate(test_target));
+    try std.testing.expect(!(try adapter.mutableFrame(frame)).target_invalid);
+    // A session's destruction alone must not cancel its independent frame.
+    try std.testing.expect(adapter.canCopy(frame, dimensions));
+    try std.testing.expect(!adapter.canCopy(frame, null));
+    try std.testing.expect(!adapter.canCopy(frame, .{ .width = 8, .height = 3 }));
+    try std.testing.expect(!adapter.canCopy(frame, .{ .width = 7, .height = 2 }));
+    try std.testing.expectEqualDeep(dimensions, (try adapter.mutableFrame(frame)).constraints.?);
+    adapter.clearOutbound();
+    _ = try adapter.invalidate(test_target);
+    try std.testing.expect(!adapter.canCopy(frame, dimensions));
 }
 
 test "image copy capture: invalidation is terminal and constraint changes reject old frames" {
@@ -1674,4 +1752,71 @@ test "image copy capture: updates atomically retire queued captures" {
     adapter.clearOutbound();
     try adapter.updateConstraints(session, null);
     try std.testing.expectError(error.Stopped, adapter.updateConstraints(session, .{ .width = 4, .height = 4 }));
+}
+
+test "image copy capture: source refresh freezes old frames and retries atomic resize batches" {
+    const Resolver = struct {
+        constraints: ?TestAdapter.Constraints,
+        pub fn captureConstraints(self: @This(), target: TestAdapter.Target) ?TestAdapter.Constraints {
+            std.debug.assert(target == .source);
+            return self.constraints;
+        }
+    };
+    for ([_]TestAdapter.Phase{ .fresh, .queued, .started }) |phase| {
+        var adapter = try TestAdapter.init(std.testing.allocator, .{
+            .session_capacity = 1,
+            .frame_capacity = 1,
+            .capture_capacity = 1,
+            .outbound_capacity = 8,
+        });
+        defer adapter.deinit();
+        const old: TestAdapter.Constraints = .{ .width = 320, .height = 360 };
+        const resized: TestAdapter.Constraints = .{ .width = 329, .height = 360, .dmabuf_device = 7 };
+        var resolver: Resolver = .{ .constraints = old };
+        const session = try adapter.admitSession(test_peer, .{ .id = 10, .generation = 1 }, test_snapshot, old, false);
+        const frame = try adapter.createFrame(session, .{ .id = 11, .generation = 1 });
+        try adapter.attachBuffer(frame, .{ .id = 12, .generation = 1 });
+        if (phase != .fresh) try adapter.capture(frame);
+        if (phase == .started) _ = adapter.takeCapture().?;
+        try std.testing.expectEqual(@as(usize, 0), try adapter.refreshSources(resolver));
+
+        // Initial constraints still occupy four slots. A seven-event resize
+        // plus a pending-frame failure must reserve its entire batch first.
+        resolver.constraints = resized;
+        try std.testing.expectError(error.Exhausted, adapter.refreshSources(resolver));
+        try std.testing.expectEqual(@as(usize, 4), adapter.outbound_count);
+        try std.testing.expectEqualDeep(old, (try adapter.resolveSession(session)).constraints.?);
+        try std.testing.expectEqualDeep(old, (try adapter.mutableFrame(frame)).constraints.?);
+        try std.testing.expectEqual(phase, (try adapter.mutableFrame(frame)).phase);
+        try std.testing.expect(!(try adapter.mutableFrame(frame)).constraints_changed);
+
+        adapter.clearOutbound();
+        try std.testing.expectEqual(@as(usize, 1), try adapter.refreshSources(resolver));
+        try std.testing.expectEqualDeep(resized, (try adapter.resolveSession(session)).constraints.?);
+        try std.testing.expectEqualDeep(old, (try adapter.mutableFrame(frame)).constraints.?);
+        try std.testing.expect(!adapter.canCopy(frame, resized));
+        try std.testing.expect(adapter.takeCapture() == null);
+        try std.testing.expectEqual(@as(usize, 0), try adapter.refreshSources(resolver));
+        if (phase == .fresh) try adapter.capture(frame);
+        const expected = [_]std.meta.Tag(TestAdapter.Event){ .buffer_size, .shm_argb, .shm_xrgb, .dmabuf_device, .dmabuf_argb, .dmabuf_xrgb, .done, .failed };
+        for (expected) |tag| {
+            const event = adapter.oldestOutbound(test_peer).?;
+            try std.testing.expectEqual(tag, std.meta.activeTag(event.event));
+            if (tag == .buffer_size) try std.testing.expectEqualDeep(resized, event.event.buffer_size);
+            if (tag == .failed) try std.testing.expectEqual(TestAdapter.Failure.buffer_constraints, event.event.failed);
+            adapter.discardOutbound(event);
+        }
+        adapter.releaseFrame(frame.index);
+        const next = try adapter.createFrame(session, .{ .id = 13, .generation = 1 });
+        try adapter.attachBuffer(next, .{ .id = 14, .generation = 1 });
+        try adapter.capture(next);
+        const capture = adapter.takeCapture().?;
+        try std.testing.expectEqual(@as(u32, 329), capture.width);
+        try std.testing.expectEqual(@as(u32, 360), capture.height);
+        try std.testing.expect(adapter.canCopy(next, resized));
+        resolver.constraints = null;
+        try std.testing.expectEqual(@as(usize, 1), try adapter.refreshSources(resolver));
+        try std.testing.expect(!adapter.canCopy(next, null));
+        try std.testing.expectEqual(@as(usize, 0), try adapter.refreshSources(resolver));
+    }
 }

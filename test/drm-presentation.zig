@@ -18,6 +18,145 @@ const pixels = [_]u8{
 };
 const shm_formats = ouro.core_surface.shm_formats;
 
+test "isolated capture checks lock revocation cancellation constraints and shutdown before readback" {
+    const vk = ouro.vulkan_platform;
+    const Probe = struct {
+        reads: usize = 0,
+        targets: usize = 0,
+        bos: usize = 0,
+        fn read(context: *anyopaque, _: vk.Renderer, _: vk.Target, _: vk.CapturePhase) !vk.Readback {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.reads += 1;
+            return error.ReadbackProbe;
+        }
+        fn destroyTarget(context: *anyopaque, _: vk.Renderer, _: vk.Target) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.targets += 1;
+        }
+        fn destroyBo(context: *anyopaque, _: ouro.gbm.Bo) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.bos += 1;
+        }
+    };
+    for (0..9) |scenario| {
+        const allocator = std.testing.allocator;
+        var fixture = try Fixture.init();
+        defer fixture.deinit();
+        var path_storage: [128]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-isolated-{d}.sock", .{linux.getpid()});
+        wayring.unix_socket.unlink(path) catch {};
+        defer wayring.unix_socket.unlink(path) catch {};
+        const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+        var config = coordinatorConfig();
+        config.image_copy_capture.outbound_capacity = 8;
+        const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+        coordinator.session_lock_adapter.fail_closed = scenario == 1;
+        const session = try coordinator.image_copy_capture_adapter.admitSession(.{ .slot = 0, .generation = 1 }, .{ .id = 10, .generation = 1 }, .{
+            .id = .{ .index = 0, .generation = 1 },
+            .target = .{ .toplevel = .{ .index = 0, .generation = 1 } },
+        }, .{ .width = 2, .height = 1 }, false);
+        const frame = try coordinator.image_copy_capture_adapter.createFrame(session, .{ .id = 11, .generation = 1 });
+        try coordinator.image_copy_capture_adapter.attachBuffer(frame, .{ .id = 12, .generation = 1 });
+        try coordinator.image_copy_capture_adapter.capture(frame);
+        const capture = coordinator.image_copy_capture_adapter.takeCapture().?;
+        if (scenario == 2) try coordinator.image_copy_capture_adapter.fail(frame, .stopped);
+        const adapter = &coordinator.image_copy_capture_adapter;
+        if (scenario < 5 or scenario >= 7) {
+            // Frames outlive their session. The vanished source must still
+            // block readback even when no session remains to refresh it.
+            const slot = adapter.sessions.entries.items[session.index];
+            try std.testing.expect(adapter.resourceRemoved(slot.resource, .{
+                .interface = &protocol.ext_image_copy_capture_session_v1.info,
+                .version = 1,
+                .context = slot,
+            }));
+        }
+        const pressure = if (scenario == 6) try adapter.admitSession(.{ .slot = 0, .generation = 1 }, .{ .id = 20, .generation = 1 }, .{
+            .id = .{ .index = 0, .generation = 1 },
+            .target = .{ .toplevel = .{ .index = 0, .generation = 1 } },
+        }, .{ .width = 2, .height = 1 }, false) else null;
+        var terminal_pressure: [8]@TypeOf(session) = undefined;
+        if (scenario >= 7) for (&terminal_pressure, 0..) |*id, index| {
+            id.* = try adapter.admitSession(.{ .slot = 0, .generation = 1 }, .{ .id = @intCast(20 + index), .generation = 1 }, .{
+                .id = .{ .index = 0, .generation = 1 },
+                .target = null,
+            }, null, false);
+        };
+        var probe: Probe = .{};
+        var vtable = vk.real.vtable.*;
+        vtable.readback = Probe.read;
+        vtable.destroy_target = Probe.destroyTarget;
+        var renderer: ouro.vulkan_renderer.Renderer = undefined;
+        renderer.allocator = allocator;
+        renderer.platform = .{ .context = &probe, .vtable = &vtable };
+        renderer.implementation = &probe;
+        renderer.target_capacity = 1;
+        renderer.attached_target_capacity = 0;
+        var targets = try renderer.createTargets(1);
+        targets.records[0].imported = &probe;
+        targets.records[0].generation = 1;
+        var gbm_vtable = ouro.gbm.real.vtable.*;
+        gbm_vtable.destroy_bo = Probe.destroyBo;
+        var wait: ouro.drm_syncobj.AcquireWait = .{ .signaled = scenario != 3 };
+        coordinator.pending_toplevel_capture = .{
+            .capture = capture,
+            .output = .{ .index = 0, .generation = 1 },
+            // Any readback is counted before a writer could touch storage.
+            .destination = .{ .dmabuf = .{ .index = 0, .generation = 1 } },
+            .renderer = .{ .renderer = &renderer, .targets = targets, .platform = .{ .context = &probe, .vtable = &gbm_vtable }, .bo = &probe, .metadata = undefined },
+            .wait = &wait,
+            .denied = scenario == 0, // revoked while locked, now unlocked
+            .copied = scenario >= 7, // terminal event deferred after storage handling
+            .success = scenario == 7,
+        };
+        if (scenario != 3) try coordinator.prepare();
+        if (pressure) |id| {
+            // Refresh cannot enqueue stopped + failed until outbound space is
+            // available. No client storage may be touched during that retry.
+            try std.testing.expect(coordinator.pending_toplevel_capture != null);
+            try std.testing.expectEqual(@as(usize, 0), probe.reads);
+            try std.testing.expectEqual(@as(usize, 0), probe.targets);
+            const slot = adapter.sessions.entries.items[id.index];
+            try std.testing.expect(adapter.resourceRemoved(slot.resource, .{
+                .interface = &protocol.ext_image_copy_capture_session_v1.info,
+                .version = 1,
+                .context = slot,
+            }));
+            try coordinator.prepare();
+            try std.testing.expect(coordinator.pending_toplevel_capture == null);
+        }
+        if (scenario >= 7) {
+            try std.testing.expect(coordinator.pending_toplevel_capture.?.copied);
+            try std.testing.expectEqual(@as(usize, 0), probe.targets);
+            const needed: usize = if (scenario == 7) 4 else 1;
+            for (terminal_pressure[0..needed], 0..) |id, index| {
+                const slot = adapter.sessions.entries.items[id.index];
+                try std.testing.expect(adapter.resourceRemoved(slot.resource, .{
+                    .interface = &protocol.ext_image_copy_capture_session_v1.info,
+                    .version = 1,
+                    .context = slot,
+                }));
+                if (index + 1 == needed - 1) {
+                    try coordinator.prepare();
+                    try std.testing.expect(coordinator.pending_toplevel_capture != null);
+                    try std.testing.expectEqual(@as(usize, 0), probe.targets);
+                }
+            }
+            try coordinator.prepare();
+            try std.testing.expect(coordinator.pending_toplevel_capture == null);
+            try std.testing.expectEqual(.finished, adapter.frames.entries.items[frame.index].phase);
+        }
+        try coordinator.requestStop();
+        try std.testing.expectEqual(@as(usize, 0), probe.reads);
+        try std.testing.expectEqual(@as(usize, 1), probe.targets);
+        try std.testing.expectEqual(@as(usize, 1), probe.bos);
+        try std.testing.expect(!wait.owned);
+        try std.testing.expect(coordinator.pending_toplevel_capture == null);
+        try coordinator.destroy();
+        try root.deinit();
+    }
+}
+
 test "configuration installs before physical startup claims an output" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();

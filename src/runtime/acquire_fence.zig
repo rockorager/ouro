@@ -18,6 +18,21 @@ pub const Waits = struct {
     head: ?*Entry = null,
     stopping: bool = false,
     submission_pending: bool = false,
+    kind: completion.Kind = .renderer_fence,
+
+    /// Takes FD ownership on success. The owner releases the returned state
+    /// by clearing `owned`; prepare then drains/cancels before closing the FD.
+    /// Unlike commit waits, these have no retry timer: admission must arm now.
+    pub fn watch(self: *Waits, allocator: std.mem.Allocator, router: *completion.Router, ring: *linux.IoUring, fd: linux.fd_t) !*syncobj.AcquireWait {
+        if (self.stopping) return error.Exhausted;
+        const entry = try self.arm(allocator, router, ring, fd);
+        if (entry.poll == null) {
+            self.head = entry.next;
+            allocator.destroy(entry);
+            return error.Exhausted;
+        }
+        return &entry.state;
+    }
 
     pub fn ready(self: *Waits, allocator: std.mem.Allocator, router: *completion.Router, ring: *linux.IoUring, commit: *syncobj.Commit) !bool {
         if (commit.acquire_wait) |wait| return wait.signaled;
@@ -48,9 +63,9 @@ pub const Waits = struct {
         // Reserve cancellation before arming an unsignaled poll. Leave two
         // additional slots for the shared commit timer and its cancellation.
         if (router.available() < 4) return;
-        const token = try router.acquire(.renderer_fence);
+        const token = try router.acquire(self.kind);
         errdefer router.retire(token) catch unreachable;
-        const cancel = try router.acquire(.renderer_fence);
+        const cancel = try router.acquire(self.kind);
         errdefer router.retire(cancel) catch unreachable;
         _ = ring.poll_add(token.encode(), entry.fd, linux.POLL.IN) catch {
             try router.retire(cancel);
@@ -148,6 +163,54 @@ pub const Waits = struct {
         }
     }
 };
+
+test "capture fence publication waits for its own completion and drains the descriptor" {
+    const allocator = std.testing.allocator;
+    var ring = try linux.IoUring.init(8, 0);
+    defer ring.deinit();
+    var router = try completion.Router.init(allocator, 4);
+    defer router.deinit(allocator);
+    var waits: Waits = .{ .kind = .capture_fence };
+    defer waits.deinit(allocator);
+    const fd = try testEventFd(0);
+    const state = try waits.watch(allocator, &router, &ring, fd);
+    _ = try ring.submit();
+    try std.testing.expect(!state.signaled);
+    const one: u64 = 1;
+    try std.testing.expectEqual(@as(usize, 8), linux.write(fd, std.mem.asBytes(&one), 8));
+    _ = try ring.submit_and_wait(1);
+    const cqe = try ring.copy_cqe();
+    const token = router.route(cqe.user_data).?;
+    try std.testing.expectEqual(completion.Kind.capture_fence, token.kind);
+    try waits.complete(&router, token, cqe.res);
+    try std.testing.expect(state.signaled);
+    state.owned = false;
+    try waits.prepare(allocator, &router, &ring);
+    try std.testing.expect(waits.head == null);
+    try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
+}
+
+test "capture fence admission failure preserves caller ownership without an unarmed wait" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |full_ring| {
+        var ring = try linux.IoUring.init(2, 0);
+        defer ring.deinit();
+        var router = try completion.Router.init(allocator, if (full_ring) 4 else 3);
+        defer router.deinit(allocator);
+        var waits: Waits = .{ .kind = .capture_fence };
+        defer waits.deinit(allocator);
+        if (full_ring) {
+            _ = try ring.nop(0);
+            _ = try ring.nop(0);
+        }
+        const fd = try testEventFd(0);
+        defer _ = linux.close(fd);
+        try std.testing.expectError(error.Exhausted, waits.watch(allocator, &router, &ring, fd));
+        try std.testing.expect(waits.head == null);
+        try std.testing.expectEqual(@as(usize, 0), router.active_count);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
+    }
+}
 
 test "acquire fence early readiness is cached and stale completions cannot signal replacement" {
     const allocator = std.testing.allocator;

@@ -27,6 +27,7 @@ pub const Kind = enum(u8) {
     mcp = 0x8c,
     control = 0x8d,
     launcher = 0x8e,
+    capture_fence = 0x8f,
 };
 
 pub const DecodeError = error{

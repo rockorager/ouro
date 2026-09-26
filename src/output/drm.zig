@@ -124,6 +124,54 @@ pub const CaptureReadback = struct {
     rgba16: []const u8 = &.{},
 };
 
+/// A window-sized target on the display's render device, never registered with
+/// KMS. The caller owns the returned fence and must retain this value until it
+/// signals. Terminal destruction also drains failed submissions before the BO
+/// or any submitted source leases can be released.
+pub const IsolatedCapture = struct {
+    renderer: *vulkan.Renderer,
+    targets: vulkan.Targets,
+    platform: gbm.Platform,
+    bo: gbm.Bo,
+    metadata: gbm.Metadata,
+
+    const handle: framebuffer.Handle = .{ .slot = 0, .generation = 1 };
+
+    fn image(context: *anyopaque, _: framebuffer.Handle) !framebuffer.Image {
+        const self: *IsolatedCapture = @ptrCast(@alignCast(context));
+        return .{ .metadata = self.metadata, .framebuffer_id = 0, .state = .acquired };
+    }
+
+    fn exportFd(context: *anyopaque, _: framebuffer.Handle, plane: u8) !std.posix.fd_t {
+        const self: *IsolatedCapture = @ptrCast(@alignCast(context));
+        return self.platform.exportPlaneFd(self.bo, plane);
+    }
+
+    pub fn submit(self: *IsolatedCapture, list: render.List, plan: render.DamagePlan) !std.posix.fd_t {
+        return self.renderer.renderCapture(
+            &self.targets,
+            .{ .context = self, .image_fn = image, .export_fd_fn = exportFd },
+            handle,
+            list,
+            plan,
+            list.samples.len,
+            .{ .after_cursor = true },
+        );
+    }
+
+    pub fn readback(self: *IsolatedCapture) !CaptureReadback {
+        const source = try self.renderer.readback(&self.targets, handle, .after_cursor);
+        std.debug.assert(source.encoding == .desktop_gamma22);
+        return .{ .bytes = source.bytes, .stride = source.stride };
+    }
+
+    pub fn deinit(self: *IsolatedCapture) void {
+        self.renderer.destroyTargets(&self.targets);
+        self.platform.destroyBo(self.bo);
+        self.* = undefined;
+    }
+};
+
 /// The protocol/runtime implementation must transactionally activate and queue
 /// frame callbacks, then queue each sampled presentation's release callbacks
 /// and finish its lease. Returning an error retains the completed outcome for
@@ -1293,6 +1341,35 @@ pub const Output = struct {
         };
     }
 
+    pub fn createIsolatedCapture(self: *Output, size: render.Size) !IsolatedCapture {
+        const renderer = &(self.render_device.renderer orelse return error.RendererUnavailable);
+        const value = switch (renderer.*) {
+            .vulkan => |*value| value,
+            .pixman => return error.RendererMismatch,
+        };
+        // Prefer linear storage, independently of the monitor's format/HDR
+        // encoding. Drivers unable to render this target fail explicitly.
+        const allocation: gbm.Allocation = .{
+            .width = size.width,
+            .height = size.height,
+            .format = gbm.format_argb8888,
+            .modifier = gbm.modifier_linear,
+            .explicit_modifier = true,
+        };
+        if (!value.supportsTarget(allocation)) return error.UnsupportedCaptureTarget;
+        const platform = self.pool.gbm_platform;
+        const bo = try platform.createBo(self.pool.device, allocation);
+        errdefer platform.destroyBo(bo);
+        var metadata = try platform.getMetadata(bo);
+        // As in framebuffer.Pool, GBM's LINEAR allocation can report INVALID
+        // for its implicit modifier. This target is linear by construction.
+        if (metadata.modifier == gbm.modifier_invalid)
+            metadata.modifier = gbm.modifier_linear;
+        var targets = try value.createTargets(1);
+        errdefer value.destroyTargets(&targets);
+        return .{ .renderer = value, .targets = targets, .platform = platform, .bo = bo, .metadata = metadata };
+    }
+
     fn importCacheDestination(self: *Output) *CachedImport {
         const destination: *CachedImport = for (self.import_cache) |*entry| {
             if (!entry.occupied) break entry;
@@ -2088,15 +2165,18 @@ fn initVulkan(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.
         return error.HdrUnsupported;
     const content_version_capacity = try contentVersionCapacity(config);
     const content_store_bytes = try contentByteCapacity(config);
+    // The runtime serializes isolated captures; reserve one target in addition
+    // to all output swapchains, including its source upload/lease capacity.
+    const target_count = std.math.add(usize, config.max_render_targets, 1) catch return error.InvalidConfig;
     const retained_upload_bytes = std.math.mul(
         usize,
         config.max_source_bytes,
-        config.max_render_targets,
+        target_count,
     ) catch return error.InvalidConfig;
     const renderer = try vulkan.Renderer.init(allocator, platforms.vulkan, fd, .{
         .max_samples = config.max_samples,
         .max_source_bytes = config.max_source_bytes,
-        .max_targets = config.max_render_targets,
+        .max_targets = target_count,
         .max_color_luts = config.max_color_luts,
         .require_color_management = config.enable_color_management,
         .max_damage_rects = config.max_render_damage,
@@ -2110,7 +2190,7 @@ fn initVulkan(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.
             content_version_capacity,
             std.math.mul(
                 usize,
-                config.max_render_targets,
+                target_count,
                 config.max_samples,
             ) catch return error.InvalidConfig,
         ) catch return error.InvalidConfig,
@@ -3337,6 +3417,125 @@ test "drm-sim: physical Pixman owner starts and drains in strict order" {
     try std.testing.expectEqual(@as(usize, 2), fixture.bos_destroyed);
     try std.testing.expectEqual(@as(usize, 2), fixture.framebuffers_removed);
     try std.testing.expect(fixture.pool_removal_started_before_bo);
+}
+
+test "drm-sim: isolated capture packs managed RGB and video on independent resized targets" {
+    const Probe = struct {
+        expected: render.SurfaceSample = undefined,
+        size: render.Size = undefined,
+        destroyed: usize = 0,
+        fail: bool = false,
+
+        fn create(context: *anyopaque, _: std.posix.fd_t, _: vulkan_platform.Config) !vulkan_platform.Renderer {
+            return context;
+        }
+        fn destroy(_: *anyopaque, _: vulkan_platform.Renderer) void {}
+        fn packs(_: *anyopaque, _: vulkan_platform.Renderer) bool {
+            return false;
+        }
+        fn supports(_: *anyopaque, _: vulkan_platform.Renderer, allocation: gbm.Allocation) bool {
+            return allocation.format == gbm.format_argb8888 and allocation.modifier == gbm.modifier_linear;
+        }
+        fn implicitMetadata(context: *anyopaque, bo: gbm.Bo) !gbm.Metadata {
+            var result = try SimFixture.metadata(context, bo);
+            // Exercise both explicit LINEAR and Mesa's implicit modifier for
+            // a BO allocated with LINEAR usage.
+            if (result.width % 2 != 0) result.modifier = gbm.modifier_invalid;
+            return result;
+        }
+        fn import(context: *anyopaque, _: vulkan_platform.Renderer, metadata: gbm.Metadata, fd: std.posix.fd_t) !vulkan_platform.Target {
+            defer _ = linux.close(fd);
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try std.testing.expectEqual(self.size.width, metadata.width);
+            try std.testing.expectEqual(self.size.height, metadata.height);
+            try std.testing.expectEqual(gbm.modifier_linear, metadata.modifier);
+            return context;
+        }
+        fn destroyTarget(context: *anyopaque, _: vulkan_platform.Renderer, _: vulkan_platform.Target) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.destroyed += 1;
+        }
+        fn alive(_: *anyopaque, _: u64) bool {
+            return true;
+        }
+        fn draw(context: *anyopaque, _: vulkan_platform.Renderer, _: vulkan_platform.Target, frame: vulkan_platform.Frame) !std.posix.fd_t {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try std.testing.expectEqual(self.size, frame.output);
+            try std.testing.expectEqualDeep(render.color.Description.desktop, frame.output_color_description);
+            try std.testing.expectEqual(vulkan_platform.CaptureEncoding.desktop_gamma22, frame.capture_encoding);
+            try std.testing.expectEqual(@as(u8, 0), frame.clear.a);
+            try std.testing.expectEqual(@as(usize, 1), frame.sources.len);
+            try std.testing.expectEqualDeep(self.expected, frame.sources[0]);
+            try std.testing.expectEqual(@as(u32, @intFromEnum(self.expected.color_description.transfer)), frame.samples[0].attributes[3]);
+            try std.testing.expectEqual(self.expected.color_representation.pack(), @as(u32, @bitCast(frame.samples[0].color_matrix_1[3])));
+            try std.testing.expect(frame.captures.after_cursor and !frame.captures.before_cursor);
+            try std.testing.expectEqual(@as(usize, 1), frame.render_damage.len);
+            try std.testing.expectEqual(self.size.width, frame.render_damage[0].width);
+            if (self.fail) return error.CompletionExportFailedAfterSubmit;
+            const fd = linux.eventfd(1, linux.EFD.CLOEXEC);
+            if (linux.errno(fd) != .SUCCESS) return error.EventFdFailed;
+            return @intCast(fd);
+        }
+    };
+    var fixture: SimFixture = .{ .allow_export = true };
+    var probe: Probe = .{};
+    var vtable = vulkan_platform.real.vtable.*;
+    vtable.create = Probe.create;
+    vtable.destroy = Probe.destroy;
+    vtable.packs_sources = Probe.packs;
+    vtable.supports_target = Probe.supports;
+    vtable.import_target = Probe.import;
+    vtable.destroy_target = Probe.destroyTarget;
+    vtable.draw = Probe.draw;
+    // Only the device and GBM fields used by offscreen capture are needed;
+    // touching any display planner/scheduler/KMS state is a test failure.
+    var device: RenderDevice = undefined;
+    device.renderer = .{ .vulkan = try vulkan.Renderer.init(std.testing.allocator, .{ .context = &probe, .vtable = &vtable }, -1, .{
+        .max_samples = 1,
+        .max_source_bytes = 64,
+        .max_targets = 1,
+    }) };
+    defer device.renderer.?.deinit();
+    var output: Output = undefined;
+    output.render_device = &device;
+    var gbm_vtable = SimFixture.gbm_vtable;
+    gbm_vtable.metadata = Probe.implicitMetadata;
+    output.pool.gbm_platform = .{ .context = &fixture, .vtable = &gbm_vtable };
+    output.pool.device = &fixture;
+    for (0..4) |index| {
+        probe.size = .{ .width = @intCast(7 - index), .height = 3 };
+        var sample: render.SurfaceSample = .{
+            .sample = .{ .surface = 3, .commit_sequence = 9 },
+            .presentation = .{ .slot = 2, .generation = 1 },
+            .source = .{ .size = .{ .width = 2, .height = 2 }, .stride = 8, .format = .argb8888_premultiplied, .bytes = &([_]u8{ 7, 23, 61, 255 } ** 4) },
+            .crop = render.SourceRect.pixels(0, 0, 2, 2),
+            .destination = .{ .x = 1, .y = 0, .width = 2, .height = 2 },
+            .clip = .{ .x = 1, .y = 0, .width = 2, .height = 2 },
+        };
+        if (index == 1) sample.color_description = .srgb;
+        if (index >= 2) {
+            sample.source.format = .nv12;
+            sample.source.stride = 2;
+            sample.source.bytes = &.{};
+            sample.source.external = .{ .context = &probe, .token = 8, .alive_fn = Probe.alive, .drm_format = 0x3231564e, .modifier = 0, .plane_count = 2, .fds = .{ 17, 17, -1, -1 }, .strides = .{ 2, 2, 0, 0 }, .offsets = .{ 0, 4, 0, 0 } };
+            sample.color_description.transfer = .linear;
+            sample.color_representation = .{ .coefficients = .bt709, .range = .limited, .chroma_location = 2 };
+        }
+        probe.expected = sample;
+        probe.fail = index == 3;
+        var capture = try output.createIsolatedCapture(probe.size);
+        const list: render.List = .{ .output = probe.size, .output_format = .argb8888_premultiplied, .clear = .{ .a = 0, .r = 0, .g = 0, .b = 0 }, .samples = &.{sample} };
+        const planned = [_]render.PlannedSample{.{ .source_index = 0, .sample = sample.sample, .presentation = sample.presentation, .crop = sample.crop, .destination = .{ .x = 1, .y = 0, .width = 2, .height = 2 }, .clip = .{ .x = 1, .y = 0, .width = 2, .height = 2 }, .transform = .normal, .global_alpha = 255 }};
+        const plan: render.DamagePlan = .{ .output = probe.size, .samples = &planned, .client_damage = &.{}, .scene_damage = &.{}, .repair_damage = &.{}, .render_damage = &.{}, .client_full = true, .scene_full = false, .repair_full = false, .render_full = true };
+        if (probe.fail) {
+            try std.testing.expectError(error.CompletionExportFailedAfterSubmit, capture.submit(list, plan));
+        } else _ = linux.close(try capture.submit(list, plan));
+        capture.deinit();
+        try std.testing.expectEqual(index + 1, probe.destroyed);
+        try std.testing.expectEqual(index + 1, fixture.bos_destroyed);
+        try std.testing.expectEqual(@as(usize, 0), device.renderer.?.vulkan.attached_target_capacity);
+        try std.testing.expectEqual(@as(usize, 0), fixture.framebuffers_removed);
+    }
 }
 
 const SimFixture = struct {

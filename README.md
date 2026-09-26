@@ -1056,8 +1056,30 @@ not HDR: both exports use the same raw gamma22 contract. The shader quantizes
 directly from linear composition to each export depth. The larger readback is
 allocated only for a 16-bit request; ordinary captures retain their existing
 memory requirement. Higher-precision DMA-BUF capture is not implemented.
-Isolated toplevel capture still uses Pixman; managed/video content fails that
-path rather than being silently reinterpreted. Use full-output capture for it.
+Isolated toplevel capture uses a separate, window-sized Vulkan target when
+the selected render device uses Vulkan. It renders only the selected surface
+tree and the requested cursor, not a crop of the displayed output. Managed RGB
+and supported video DMA-BUF sources use the same color/representation conversion
+as output capture, exporting 8-bit SDR desktop gamma22 independently of monitor
+HDR/ICC settings. Pixman still rejects managed/video sources explicitly.
+
+Isolated captures are serialized and wait asynchronously for their render fence.
+Targets and submitted source leases survive completion or terminal teardown;
+client storage is written only after rechecking frame validity, live source
+dimensions, and session-lock privacy, even when the frame outlives its session.
+Existing sessions advertise new constraints when the surface tree's
+bounds change; old frames fail with `buffer_constraints`, and a retry uses the
+new dimensions. Constraint-event backpressure defers capture publication.
+Terminal-event backpressure retries without repeating the storage write.
+A lock revokes an in-flight capture even if unlocking precedes its
+completion. SHM ARGB/XRGB and existing linear, CPU-mappable ARGB/XRGB DMA-BUF
+destinations remain supported; isolated 16-bit export is not advertised. The
+driver must support the source format/modifier and a linear ARGB render target;
+unsupported imports, targets, or mappings fail rather than reinterpret bytes.
+`zig build test-capture` exercises the capture contracts and fence lifetimes.
+The offscreen shader fixture's `--capture-isolated isolated.png` checks actual
+sRGB-to-gamma22 and video conversion pixels (including lavapipe), but does not
+replace a real-device Wayland/DMA-BUF capture test.
 
 Declared PQ/HLG or above-reference
 source luminance enables a simple SDR shoulder: maximum linear RGB `p` stays

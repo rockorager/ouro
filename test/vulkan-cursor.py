@@ -649,6 +649,64 @@ def test_capture_roundtrip(renderer, capture_path):
     print(f"Capture round trip: {renderer.draw_count - start} draws passed (exact raw low-light identity, explicit sRGB, rejected interpretation)")
 
 
+def test_isolated_capture(renderer, capture_path):
+    """Window-sized, transparent offscreen exports using the raw contract.
+
+    This exercises shader pixels, not the Wayland selection/lifetime adapter.
+    Dark asymmetric channels make sRGB reinterpretation visibly wrong.
+    """
+    start = renderer.draw_count
+    pixels = bytes((7, 23, 61, 255, 31, 79, 137, 255))
+    def decode(n):
+        e = n / 255
+        return e / 12.92 if e <= .04045 else ((e + .055) / 1.055) ** 2.4
+    expected = bytes(255 if i % 4 == 3 else round(255 * decode(n) ** (1 / 2.2))
+                     for i, n in enumerate(pixels))
+    for mode in ("buffer", "texture", "texture-buffer"):
+        _, managed, _ = renderer.render(pixels, (2, 1), (2, 1), mode,
+            source_transfer=0, output_transfer=2, capture_transfer=2,
+            background_alpha=0, capture_phases=3)
+        assert max(abs(a - b) for a, b in zip(managed, expected)) <= 1, (mode, managed, expected)
+        assert managed != pixels, "managed sRGB must not be reinterpreted as desktop gamma22"
+        _, desktop, _ = renderer.render(pixels, (2, 1), (2, 1), mode,
+            source_transfer=2, output_transfer=2, capture_transfer=2,
+            background_alpha=0, capture_phases=3)
+        assert desktop == pixels
+
+    # NV12 BT.709 limited-range with neutral and strongly asymmetric chroma.
+    # Decode the representation, then gamma22-export *linear* source content.
+    video = []
+    for y, cb, cr in ((16, 128, 128), (101, 87, 169), (235, 128, 128)):
+        planes = [(bytes([y]) * 4, (2, 2), v.VK_FORMAT_R8_UNORM, 2, 1),
+                  (bytes([cb, cr]), (1, 1), v.VK_FORMAT_R8G8_UNORM, 2, 2)]
+        _, captured, _ = renderer.render(planes[0][0], (2, 2), (2, 2), "texture",
+            source_format=13, source_stride=2, video_planes=planes,
+            representation=2 | (2 << 4), source_transfer=1,
+            output_transfer=2, capture_transfer=2, background_alpha=0, capture_phases=3)
+        luma, u, v_chroma = (y - 16) / 219, (cb - 128) / 224, (cr - 128) / 224
+        rgb = (luma + 1.5748 * v_chroma,
+               luma - .18732427293 * u - .46812427293 * v_chroma,
+               luma + 1.8556 * u)
+        want = bytes([round(255 * max(0, min(1, n)) ** (1 / 2.2)) for n in reversed(rgb)] + [255])
+        assert max(abs(a - b) for a, b in zip(captured, want * 4)) <= 1, (captured, want)
+        video.append(captured[:4])
+    if capture_path:
+        sheet = Image.new("RGB", (720, 300), "#202020")
+        draw = ImageDraw.Draw(sheet)
+        for row, (label, data) in enumerate((("Desktop gamma22: exact raw bytes", desktop),
+                ("Managed sRGB -> raw gamma22: converted, not reinterpreted", managed),
+                ("NV12 limited 709 -> raw gamma22: black / asymmetric color / white", b"".join(video)))):
+            draw.text((12, row * 100 + 10), label, fill="white")
+            # The review PNG itself is sRGB, not an untagged raw capture.
+            def preview(n):
+                linear = (n / 255) ** 2.2
+                return round(255 * (12.92 * linear if linear <= .0031308 else 1.055 * linear ** (1 / 2.4) - .055))
+            display = bytes(255 if i % 4 == 3 else preview(n) for i, n in enumerate(data))
+            sheet.paste(Image.frombytes("RGBA", (len(data) // 4, 1), display, "raw", "BGRA").resize((696, 60), Image.Resampling.NEAREST), (12, row * 100 + 30))
+        sheet.save(capture_path)
+    print(f"Isolated capture shaders: {renderer.draw_count - start} draws passed (sRGB conversion, desktop identity, NV12 gamma22)")
+
+
 def test_capture16(renderer):
     start = renderer.draw_count
     values = ((1, 7, 31, 65535), (31, 67, 127, 129), (129, 503, 9001, 32769), (12345, 23456, 34567, 65535))
@@ -1407,6 +1465,7 @@ if __name__ == "__main__":
     parser.add_argument("--capture-shm", type=Path)
     parser.add_argument("--capture-video", type=Path)
     parser.add_argument("--capture-roundtrip", type=Path)
+    parser.add_argument("--capture-isolated", type=Path)
     parser.add_argument("--capture-blur", type=Path)
     parser.add_argument("--capture-surface", type=Path, nargs=2, metavar=("SOURCE_2X", "OUTPUT"))
     parser.add_argument("--compare-shader-dir", type=Path)
@@ -1429,6 +1488,7 @@ if __name__ == "__main__":
         test_modern_rgb(renderer, args.capture_shm)
         test_desktop_color(renderer, args.capture_shm)
         test_capture_roundtrip(renderer, args.capture_roundtrip)
+        test_isolated_capture(renderer, args.capture_isolated)
         test_capture_shoulder(renderer, args.capture_roundtrip)
         test_capture16(renderer)
         test_blur_precision(renderer)
