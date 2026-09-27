@@ -2919,6 +2919,9 @@ const TestWorkspaceWriter = struct {
     groups: usize = 0,
     outputs: usize = 0,
     workspaces: usize = 0,
+    ids: [80]workspace.WorkspaceId = undefined,
+    identifiers: [80][32]u8 = undefined,
+    identifier_lengths: [80]usize = undefined,
     active: usize = 0,
     second_workspace: ?workspace.WorkspaceId = null,
     second_active: bool = false,
@@ -2931,13 +2934,20 @@ const TestWorkspaceWriter = struct {
         writer.outputs += 1;
     }
     pub fn addWorkspace(writer: *@This(), value: workspace.Workspace) !void {
+        writer.ids[writer.workspaces] = value.id;
+        @memcpy(writer.identifiers[writer.workspaces][0..value.identifier.len], value.identifier);
+        writer.identifier_lengths[writer.workspaces] = value.identifier.len;
         writer.workspaces += 1;
         if (value.state.active) writer.active += 1;
-        if (std.mem.eql(u8, value.identifier, "ouro-1") and writer.second_workspace == null)
+        if (std.mem.eql(u8, value.name, "2") and writer.second_workspace == null)
             writer.second_workspace = value.id;
         if (writer.second_workspace) |id| {
             if (std.meta.eql(id, value.id)) writer.second_active = value.state.active;
         }
+    }
+
+    fn identifier(writer: *const @This(), index: usize) []const u8 {
+        return writer.identifiers[index][0..writer.identifier_lengths[index]];
     }
 };
 
@@ -3856,6 +3866,60 @@ test "desktop: workspace inventory publishes active and occupied workspaces" {
     try desktop.writeWorkspaceInventory(&destroyed);
     try std.testing.expectEqual(@as(usize, 2), destroyed.workspaces);
     try std.testing.expect(destroyed.second_workspace == null);
+}
+
+test "desktop: workspace identifiers survive output reorder removal and workspace switches" {
+    var desktop = try initTestDesktop(4);
+    defer desktop.deinit();
+    const bounds: geometry.Rect = .{ .x = 0, .y = 0, .width = 300, .height = 60 };
+    const topology = [_]TestDesktop.OutputArea{
+        .{ .id = .{ .value = 10 }, .geometry = .{ .x = 0, .y = 0, .width = 100, .height = 60 } },
+        .{ .id = .{ .value = 20 }, .geometry = .{ .x = 100, .y = 0, .width = 100, .height = 60 } },
+        .{ .id = .{ .value = 30 }, .geometry = .{ .x = 200, .y = 0, .width = 100, .height = 60 } },
+    };
+    desktop.applyTopology(bounds, &topology);
+    var initial: TestWorkspaceWriter = .{};
+    try desktop.writeWorkspaceInventory(&initial);
+    try std.testing.expectEqual(@as(usize, 3), initial.workspaces);
+    for (0..initial.workspaces) |i| {
+        try std.testing.expect(initial.identifier(i).len != 0);
+        for (0..i) |j|
+            try std.testing.expect(!std.mem.eql(u8, initial.identifier(i), initial.identifier(j)));
+    }
+
+    const reordered = [_]TestDesktop.OutputArea{ topology[2], topology[0], topology[1] };
+    desktop.applyTopology(bounds, &reordered);
+    var reordered_inventory: TestWorkspaceWriter = .{};
+    try desktop.writeWorkspaceInventory(&reordered_inventory);
+    for (0..initial.workspaces) |i| {
+        try std.testing.expectEqual(initial.ids[i], reordered_inventory.ids[i]);
+        try std.testing.expectEqualStrings(initial.identifier(i), reordered_inventory.identifier(i));
+    }
+
+    // Removing the first output compacts the policy's records, moving the last
+    // output into its slot. Neither that move nor another output's activation
+    // may change a surviving workspace's identifier.
+    desktop.applyTopology(bounds, &.{ topology[1], topology[2] });
+    try desktop.switchWorkspace(topology[1].id, 2);
+    var changed: TestWorkspaceWriter = .{};
+    try desktop.writeWorkspaceInventory(&changed);
+    try std.testing.expectEqual(@as(usize, 2), changed.workspaces);
+    try std.testing.expectEqual(initial.ids[2], changed.ids[0]);
+    try std.testing.expectEqualStrings(initial.identifier(2), changed.identifier(0));
+    for (0..initial.workspaces) |i|
+        try std.testing.expect(!std.mem.eql(u8, initial.identifier(i), changed.identifier(1)));
+
+    try desktop.switchWorkspace(topology[1].id, 1);
+    desktop.applyTopology(bounds, &topology);
+    var restored: TestWorkspaceWriter = .{};
+    try desktop.writeWorkspaceInventory(&restored);
+    try std.testing.expectEqual(@as(usize, 3), restored.workspaces);
+    try std.testing.expectEqualStrings(initial.identifier(2), restored.identifier(0));
+    try std.testing.expectEqualStrings(initial.identifier(1), restored.identifier(1));
+    // Reconnecting an output creates new workspace identities, not aliases of
+    // the removed output's handles.
+    for (0..initial.workspaces) |i|
+        try std.testing.expect(!std.mem.eql(u8, initial.identifier(i), restored.identifier(2)));
 }
 
 test "desktop: windows follow the largest output when primary changes" {

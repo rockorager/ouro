@@ -741,6 +741,12 @@ pub fn build(b: *std.Build) void {
     );
     shell_input_test_step.dependOn(&run_shell_input_tests.step);
 
+    const workspace_units = b.addTest(.{ .root_module = ouro, .filters = &.{"workspace"} });
+    const workspace_clients = b.addTest(.{ .root_module = shell_input_tests.root_module, .filters = &.{"workspace"} });
+    const workspace_step = b.step("test-workspace", "Run workspace policy, protocol and generated-client tests");
+    workspace_step.dependOn(&b.addRunArtifact(workspace_units).step);
+    workspace_step.dependOn(&b.addRunArtifact(workspace_clients).step);
+
     const hotkey_units = b.addTest(.{ .root_module = ouro, .filters = &.{ "hotkey:", "xdg-activation:" } });
     const hotkey_clients = b.addTest(.{ .root_module = shell_input_tests.root_module, .filters = &.{"hotkey:"} });
     const hotkey_step = b.step("test-hotkey", "Run experimental hotkey policy and generated-client activation tests");

@@ -12,10 +12,6 @@ const render = @import("../render/types.zig");
 const workspace = @import("workspace.zig");
 
 const workspace_count = 10;
-const workspace_names = [workspace_count][]const u8{
-    "ouro-0", "ouro-1", "ouro-2", "ouro-3", "ouro-4",
-    "ouro-5", "ouro-6", "ouro-7", "ouro-8", "ouro-9",
-};
 const workspace_display_names = [workspace_count][]const u8{
     "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
 };
@@ -68,6 +64,8 @@ pub fn Policy(
             active: u8 = 1,
             group: workspace.GroupId,
             ids: [workspace_count]workspace.WorkspaceId,
+            // Inventory writers may retain slices until they publish the batch.
+            identifiers: [workspace_count][21]u8 = undefined,
         };
         const Eligibility = struct {
             policy: *const Self,
@@ -265,7 +263,7 @@ pub fn Policy(
         pub fn writeWorkspaceInventory(policy: *Self, view: anytype, writer: anytype) !void {
             try policy.synchronizeOutputWorkspaces(view);
             try writer.begin(policy.workspace_revision);
-            for (policy.output_workspaces[0..policy.output_workspace_len]) |record| {
+            for (policy.output_workspaces[0..policy.output_workspace_len]) |*record| {
                 try writer.addGroup(.{ .id = record.group });
                 try writer.addOutput(record.group, record.output);
                 for (record.ids, 0..) |id, index| {
@@ -275,7 +273,9 @@ pub fn Policy(
                     try writer.addWorkspace(.{
                         .id = id,
                         .group = record.group,
-                        .identifier = workspace_names[index],
+                        // Semantic IDs survive output reordering and workspace
+                        // activation; the per-output display number is not unique.
+                        .identifier = std.fmt.bufPrint(&record.identifiers[index], "ouro-{x}", .{id.value}) catch unreachable,
                         .name = workspace_display_names[index],
                         .state = .{ .active = record.active == number },
                         .capabilities = .{ .activate = true },

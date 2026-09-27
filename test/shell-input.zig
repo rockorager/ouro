@@ -967,8 +967,9 @@ fn workspaceClient(late_bind: bool) !void {
         _ = linux.sched_yield();
     }
     try std.testing.expect(handler.manager != null);
-    try std.testing.expect(handler.group_count >= 1);
-    try std.testing.expect(handler.workspace_count >= 1);
+    // Startup may also have advertised the fallback output before DRM enabled.
+    try std.testing.expect(handler.group_count >= 2);
+    try std.testing.expect(handler.workspace_count >= 2);
     try std.testing.expectEqual(handler.workspace_count, handler.workspace_ids);
     try std.testing.expect(handler.active_states >= 1);
     try std.testing.expectEqual(handler.workspace_count, handler.workspace_enter);
@@ -1116,6 +1117,8 @@ const WorkspaceHandler = struct {
     group_count: usize = 0,
     workspace_count: usize = 0,
     workspace_ids: usize = 0,
+    identifiers: [80][32]u8 = undefined,
+    identifier_lengths: [80]usize = @splat(0),
     active_states: usize = 0,
     workspace_enter: usize = 0,
     initial_done: usize = 0,
@@ -1195,6 +1198,18 @@ const WorkspaceHandler = struct {
             switch (try protocol.ext_workspace_handle_v1.decodeEvent(message, fds)) {
                 .id => |value| {
                     try std.testing.expect(std.mem.startsWith(u8, value.id, "ouro-"));
+                    for (self.workspaces[0..self.workspace_count], 0..) |handle, i| {
+                        try std.testing.expect(!std.mem.eql(u8, value.id, self.identifiers[i][0..self.identifier_lengths[i]]));
+                        if (handle.id == message.header.object_id) {
+                            // The protocol permits at most one id event per handle.
+                            try std.testing.expectEqual(@as(usize, 0), self.identifier_lengths[i]);
+                        }
+                    }
+                    for (self.workspaces[0..self.workspace_count], 0..) |handle, i| {
+                        if (handle.id != message.header.object_id) continue;
+                        @memcpy(self.identifiers[i][0..value.id.len], value.id);
+                        self.identifier_lengths[i] = value.id.len;
+                    }
                     self.workspace_ids += 1;
                 },
                 .name => |value| try std.testing.expect(value.name.len >= 1 and value.name.len <= 2),

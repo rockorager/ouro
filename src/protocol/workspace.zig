@@ -1038,17 +1038,23 @@ test "workspace semantic inventory projects multiple exact children and one done
     const retained = adapter.workspaceForId(0, 101, 0).?;
     for (adapter.outbound) |*out| out.active = false;
     adapter.outbound_count = 0;
-    const renamed = [_]TestAdapter.Workspace{
-        .{ .id = .{ .value = 101 }, .group = .{ .value = 10 }, .identifier = "one", .name = "First" },
+    // Reordering, renaming, changing state, and moving between groups retain
+    // the handle and must not emit another id event.
+    const updated = [_]TestAdapter.Workspace{
         workspaces[1],
+        .{ .id = .{ .value = 101 }, .group = .{ .value = 20 }, .identifier = "one", .name = "First", .state = TestAdapter.ProtoWorkspace.state.active },
     };
-    try adapter.inventory(3, &groups, &renamed);
+    try adapter.inventory(3, &groups, &updated);
     const current = adapter.workspaceForId(0, 101, 0).?;
     try std.testing.expect(retained == current);
     try adapter.stage(current, .activate);
     try std.testing.expectEqual(@as(usize, 1), adapter.managers[0].staged_count);
     done = 0;
-    for (adapter.outbound) |out| done += @intFromBool(out.active and out.kind == .done);
+    for (adapter.outbound) |out| if (out.active) {
+        try std.testing.expect(out.kind != .id and out.kind != .workspace_new);
+        done += @intFromBool(out.kind == .done);
+    };
+    try std.testing.expectEqualStrings("one", adapter.inventory_workspaces[1].identifier);
     try std.testing.expectEqual(@as(usize, 1), done);
 }
 
