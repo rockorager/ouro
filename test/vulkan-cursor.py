@@ -76,7 +76,8 @@ class Renderer:
                timings=None, scene=None, damage=None, timing_repeats=1,
                source_format=0, source_stride=None, raw_output=False, output_reference=80,
                video_planes=None, representation=0, capture_transfer=0, capture_shoulder=False, rgb_output=False,
-               capture16=False, blur=False, blur_scale=1, blur_steps=None, legacy_blur=False):
+               capture16=False, blur=False, blur_scale=1, blur_steps=None, legacy_blur=False,
+               luts=None, source_lut=0, output_lut=0, tone_map_peak=0):
         d = self.device
         sw, sh = source_size
         w, h = size
@@ -152,14 +153,14 @@ class Renderer:
             flags = {"nearest": 0, "reconstruction": 1, "bilinear": 2, "area": 3}[filtering] << 28
             flags |= 0x40000000 if mode == "texture-buffer" else 0
             # Include the opaque fast path: it must not bypass filtering.
-            if xrgb and alpha == 255 and output_transfer == source_transfer:
+            if xrgb and alpha == 255 and output_transfer == source_transfer and not (source_lut or output_lut or tone_map_peak):
                 flags |= 0x80000000
             sample = struct.pack("<4I12i4I8i12f", 0, sw, sh, source_stride,
                 int(sx * 65536), int(sy * 65536), int(cw * 65536), int(ch * 65536),
                 0, 0, w, h, 0, 0, w, h, source_format or int(xrgb), flags, alpha, source_transfer,
-                xx, xy, x0, yx, yy, y0, alpha_mode, 0,
+                xx, xy, x0, yx, yy, y0, alpha_mode, source_lut,
                 *color_matrix[:3], luminance_scale, *color_matrix[3:6],
-                struct.unpack("<f", struct.pack("<I", representation))[0], *color_matrix[6:], 0)
+                struct.unpack("<f", struct.pack("<I", representation))[0], *color_matrix[6:], tone_map_peak)
             # Explicit scenes retain the recorded affine/crop instead of
             # deriving a new mapping from rounded destination dimensions.
             layers = scene if scene is not None else [(sample, pixels, source_size)]
@@ -179,7 +180,7 @@ class Renderer:
             storage = v.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
             samples = buffer(b"".join(packed_samples), storage)
             source = buffer(b"".join(source_pixels), storage | v.VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
-            lut = buffer(bytes(16), storage)
+            lut = buffer(luts or bytes(16), storage)
             readback = buffer(bytes(w * h * 4), v.VK_BUFFER_USAGE_TRANSFER_DST_BIT)
             captures = [buffer(bytes([37]) * (w * h * (12 if capture16 else 4)), storage | v.VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
                         for _ in range(2)]
@@ -350,7 +351,7 @@ class Renderer:
                 for rect in damage if rectangles is None else rectangles:
                     push = struct.pack("<16I12f", background_alpha, *background, w, h,
                         int(background_alpha == 255) | (int(rgb_output) << 31), count, *rect, output_transfer,
-                        struct.unpack("<I", struct.pack("<f", output_reference))[0], 0, first,
+                        struct.unpack("<I", struct.pack("<f", output_reference))[0], output_lut, first,
                         *capture_matrix[:3], phases or 0,
                         *capture_matrix[3:6], capture_transfer, *capture_matrix[6:], int(capture_shoulder) | (int(capture16) << 1))
                     v.vkCmdPushConstants(cmd, pl, v.VK_SHADER_STAGE_COMPUTE_BIT, 0, 112, v.ffi.from_buffer(push))
@@ -1458,10 +1459,94 @@ def benchmark_stall(renderer):
     print("GPU spans still include preemption. The running desktop shares this GPU.")
 
 
+def test_icc_hdr(renderer, capture=None):
+    """Exercise both LUT directions and per-surface mapping on the real shaders."""
+    # Affine extended-range source LUT, followed by a distinct identity output
+    # LUT in shaped coordinates. The Zig tests check actual LCMS compilation.
+    source_grid, output_grid = bytearray(), bytearray()
+    for b in range(33):
+        for g in range(33):
+            for r in range(33):
+                source_grid.extend(struct.pack("<4f", r / 32 * 1.2, g / 32 + 0.1, b / 32 - 0.6, 1))
+                output_grid.extend(struct.pack("<4f", r / 32, g / 32, b / 32, 1))
+    luts = source_grid + output_grid
+    rows = []
+    for mode in ("buffer", "texture", "texture-buffer"):
+        for ten_bit in (False, True):
+            # Source RGB (1,.25,.5) decodes to (1.2,.35,-.1); a matrix moves
+            # those extended values to (.6,.35,.5). Neither direction may clip
+            # early, confuse slots, or apply the output shaper to the source.
+            pixel = struct.pack("<4f", 1, 0.25, 0.5, 1)
+            actual = renderer.render(pixel, (1, 1), (1, 1), mode, source_format=12,
+                source_transfer=1, output_transfer=1, source_lut=1, output_lut=2,
+                luts=luts, color_matrix=(0.5, 0, 0, 0, 1, 0, 0.5, 0, 1), ten_bit=ten_bit,
+                background=(0, 0, 0))
+            expected = [round(x ** (1 / 2.2) * 255) for x in (0.5, 0.35, 0.6)] + [255]
+            assert all(abs(a - b) <= 1 for a, b in zip(actual, expected)), (mode, "LUT", actual, expected)
+
+            # Independent rational values for the shoulder at a 1000-nit
+            # source peak / 80-nit SDR white. Includes the knee and both sides.
+            levels = (0, 0.125, 0.49, 0.5, 1, 2, 4, 8, 12.5)
+            mapped = (0, 0.125, 0.49, 0.5, 71 / 94, 55 / 62, 353 / 370, 81 / 82, 1)
+            pixels = b"".join(struct.pack("<4f", x, x, x, 1) for x in levels)
+            options = dict(source_format=12, source_transfer=1, output_transfer=2,
+                           background=(0, 0, 0), ten_bit=ten_bit)
+            actual = renderer.render(pixels, (len(levels), 1), (len(levels), 1), mode,
+                                     tone_map_peak=12.5, **options)
+            for i, value in enumerate(mapped):
+                expected = round(value ** (1 / 2.2) * 255)
+                assert abs(actual[i * 4] - expected) <= 1, (mode, levels[i], actual[i * 4], expected)
+            assert actual[4 * 4] < actual[5 * 4] < actual[6 * 4] < actual[7 * 4] < actual[8 * 4]
+
+            # Straight, electrical-premultiplied and optical-premultiplied
+            # alpha must give identical nonlinear tone mapping and blending.
+            alpha_results = []
+            for alpha_mode in (0, 1, 2):
+                values = (1, 0.25, 0.125) if alpha_mode != 2 else (2, 0.5, 0.25)
+                alpha_results.append(renderer.render(struct.pack("<4f", *values, 0.5),
+                    (1, 1), (1, 1), mode, tone_map_peak=12.5, alpha_mode=alpha_mode, **options))
+            assert alpha_results[0] == alpha_results[1] == alpha_results[2], (mode, alpha_results)
+            # Negative wide-gamut channel: neutral-axis compression, not
+            # independent clamping of (-.1,.2,.5) -> (0,.2,.5).
+            gamut = renderer.render(struct.pack("<4f", -0.1, 0.2, 0.5, 1),
+                (1, 1), (1, 1), mode, tone_map_peak=12.5, **options)
+            expected = [round(x ** (1 / 2.2) * 255) for x in (0.4, 0.2, 0)] + [255]
+            assert all(abs(a - b) <= 1 for a, b in zip(gamut, expected)), (mode, gamut, expected)
+
+            # Two adjacent windows: HDR mapping is selected in the first
+            # sample only. The second must retain its SDR reference white.
+            samples = []
+            for x, peak in ((0, 12.5), (1, 0)):
+                sample = bytearray(scene_sample((1, 1), (x, 0, 1, 1), (65536, 0, 32768, 0, 65536, 32768)))
+                struct.pack_into("<I", sample, 12, 16)
+                struct.pack_into("<I", sample, 64, 12)
+                struct.pack_into("<I", sample, 76, 1)
+                struct.pack_into("<f", sample, 156, peak)
+                samples.append((sample, struct.pack("<4f", 1, 1, 1, 1), (1, 1)))
+            adjacent = renderer.render(samples[0][1], (1, 1), (2, 1), mode, scene=samples, **options)
+            assert adjacent[4:] == bytes([255] * 4), (mode, "SDR white changed", adjacent)
+            assert abs(adjacent[0] - round((71 / 94) ** (1 / 2.2) * 255)) <= 1
+            if mode == "texture" and not ten_bit:
+                clipped = renderer.render(pixels, (len(levels), 1), (len(levels), 1), mode, **options)
+                rows = [clipped, actual]
+    if capture:
+        capture.parent.mkdir(parents=True, exist_ok=True)
+        image = Image.new("RGB", (810, 250), "#202020")
+        draw = ImageDraw.Draw(image)
+        for y, (label, row) in enumerate(zip(("Before: SDR output clips HDR highlights", "After: per-surface HDR-to-SDR mapping"), rows)):
+            draw.text((12, y * 120 + 10), label, fill="white")
+            ramp = Image.frombytes("RGBA", (9, 1), row, "raw", "BGRA").resize((786, 60), Image.Resampling.NEAREST)
+            image.paste(ramp.convert("RGB"), (12, y * 120 + 35))
+        draw.text((12, 225), "Linear levels: 0, .125, .49, .5, 1, 2, 4, 8, 12.5. Actual Vulkan readback; SDR preview.", fill="white")
+        image.save(capture)
+    print("ICC/HDR: LUT directions, extended values, shaper, shoulder, alpha and adjacent SDR passed (3 paths, 8/10-bit)")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture", type=Path)
     parser.add_argument("--capture-hdr", type=Path)
+    parser.add_argument("--capture-icc-hdr", type=Path)
     parser.add_argument("--capture-shm", type=Path)
     parser.add_argument("--capture-video", type=Path)
     parser.add_argument("--capture-roundtrip", type=Path)
@@ -1484,6 +1569,7 @@ if __name__ == "__main__":
         test(renderer, args.compare_shader_dir)
         test_scene(renderer)
         test_hdr_capture(renderer, args.capture_hdr)
+        test_icc_hdr(renderer, args.capture_icc_hdr)
         test_shm(renderer, args.capture_shm)
         test_modern_rgb(renderer, args.capture_shm)
         test_desktop_color(renderer, args.capture_shm)

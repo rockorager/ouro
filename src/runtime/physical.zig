@@ -8813,8 +8813,10 @@ pub fn Coordinator(comptime protocol: type) type {
             );
             output_config.enable_hdr = output_config.enable_hdr and (settings.hdr orelse true);
             const selected_profile = self.outputSettingsForActivation().outputProfile(settings.icc_profile);
-            if (selected_profile) |profile|
+            if (selected_profile) |profile| {
                 output_config.output_color_description.lut = &profile.output_lut;
+                std.log.info("output {d}: ICC profile selects SDR; HDR calibration is not supported", .{connector.id});
+            }
             var output_committed = false;
             errdefer {
                 if (!output_committed) self.cleanupUnstartedOutput(physical);

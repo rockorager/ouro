@@ -599,13 +599,14 @@ fn packSample(
             color_transform.matrix[2][0],
             color_transform.matrix[2][1],
             color_transform.matrix[2][2],
-            0,
+            color_transform.tone_map_peak,
         },
     };
 }
 
 fn directColorEncoding(source: render_types.color.Description, output: render_types.color.Description) bool {
     return source.lut == null and output.lut == null and
+        !(source.isHdr() and !output.isHdr()) and
         source.transfer == output.transfer and
         source.reference_luminance == output.reference_luminance and
         std.meta.eql(source.primaries, output.primaries);
@@ -756,6 +757,11 @@ test "render-vulkan: direct color flag requires identical opaque encoding" {
     try std.testing.expectEqual(@as(u32, 64), direct.source[0]);
 
     var different = render_types.color.Description.srgb;
+    different.max_luminance = 1000;
+    try std.testing.expect(!directColorEncoding(different, .srgb));
+    const mapped = try packSample(value, try render_types.color.compile(different, .srgb), false, false, null, 0, .{ .x = 0, .y = 0, .width = 1, .height = 1 });
+    try std.testing.expectEqual(@as(f32, 12.5), mapped.color_matrix_2[3]);
+    different = .srgb;
     different.reference_luminance = 100;
     try std.testing.expect(!directColorEncoding(.srgb, different));
     const lut: @import("icc.zig").Lut = .{

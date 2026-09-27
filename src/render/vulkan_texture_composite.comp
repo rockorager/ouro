@@ -121,6 +121,7 @@ vec3 sample_lut(vec3 value, int packed_slot) {
 
 #include "vulkan_shm.glsl"
 #include "vulkan_video.glsl"
+#include "vulkan_tone_map.glsl"
 
 vec4 raw_pixel(Sample item, uint index, ivec2 coordinate) {
     if (item.attributes.x >= 13u) return video_pixel(item, index, coordinate);
@@ -145,6 +146,10 @@ vec4 decode_pixel(Sample item, vec4 value) {
         : decode_transfer(electrical, item.attributes.w);
     mat3 transform = mat3(item.color_matrix_0.xyz, item.color_matrix_1.xyz, item.color_matrix_2.xyz);
     linear = transpose(transform) * linear * item.color_matrix_0.w;
+    if (item.color_matrix_2.w > 0.0) {
+        float optical_alpha = item.affine_tail.z == 1u ? value.a : 1.0;
+        linear = map_hdr_to_sdr(linear / max(optical_alpha, 0.000001), item.color_matrix_2.w) * optical_alpha;
+    }
     float global_alpha = float(item.attributes.z) / 255.0;
     float alpha = value.a * global_alpha;
     vec3 premultiplied = item.affine_tail.z == 1u ? linear * global_alpha : linear * alpha;
@@ -226,7 +231,7 @@ void main() {
         capture_pixel(pixel, color);
         vec3 straight = color.rgb / max(color.a, 0.000001);
         vec3 encoded = frame.output_color.z != 0u
-            ? sample_lut(straight, int(frame.output_color.z))
+            ? sample_lut(encode_transfer(straight, 2u), int(frame.output_color.z))
             : encode_transfer(straight, frame.output_color.x);
         encoded *= color.a;
         imageStore(target_image, pixel, vec4((frame.output_info.z & 0x80000000u) != 0u ? encoded : encoded.bgr, color.a));

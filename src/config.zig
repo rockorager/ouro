@@ -342,7 +342,7 @@ pub fn outputMatches(m: OutputMatch, info: OutputInfo) bool {
 pub fn resolveInput(rules: []const InputRule, info: InputInfo) InputSettings {
     return engine_settings.resolveInput(rules, info);
 }
-pub fn resolveOutput(rules: []const OutputRule, info: OutputInfo) OutputSettings {
+pub fn resolveOutput(rules: []const OutputRule, info: OutputInfo) !OutputSettings {
     return engine_settings.resolveOutput(rules, info);
 }
 
@@ -941,13 +941,13 @@ test "output HDR settings parse overlay and merge removal" {
         .width_mm = 600,
         .height_mm = 340,
     };
-    const external = resolveOutput(snapshot.output_rules, info);
+    const external = try resolveOutput(snapshot.output_rules, info);
     try std.testing.expectEqual(@as(?bool, false), external.hdr);
     try std.testing.expectEqual(@as(?u32, 180), external.scale_120);
     try std.testing.expectEqual(OutputPosition{ .x = -7, .y = 11 }, external.position.?);
     info.connector_id = 43;
-    try std.testing.expectEqual(@as(?bool, true), resolveOutput(snapshot.output_rules, info).hdr);
-    try std.testing.expectEqual(@as(?bool, null), resolveOutput(&.{}, info).hdr);
+    try std.testing.expectEqual(@as(?bool, true), (try resolveOutput(snapshot.output_rules, info)).hdr);
+    try std.testing.expectEqual(@as(?bool, null), (try resolveOutput(&.{}, info)).hdr);
 
     var removed = try mergeSources(std.testing.allocator, &.{
         \\{"output_rules":{"external":{"settings":{"hdr":false,"scale":1.5}}}}

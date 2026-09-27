@@ -582,7 +582,29 @@ Mode, position, scale, enablement, HDR, and ICC profile changes run through Ouro
 atomic KMS reconfiguration path and retain the previous configuration if
 activation or rollback validation fails. `icc_profile` must be an absolute
 path to an ICC v2/v4 RGB Display or ColorSpace profile and requires strict
-Vulkan mode.
+Vulkan mode. A monitor ICC profile selects SDR and logs that choice. An explicit
+`"hdr": true` together with `icc_profile` is rejected as `OutputIccHdrConflict`
+after matching rules are merged; a later `"hdr": false` override is valid.
+This conflict is rejected even when `--disable-hdr` is set. Ordinary SDR
+monitor profiles are not HDR calibrations. Client ICC-tagged content can still
+be rendered on an HDR output without a monitor ICC profile.
+
+Source ICC LUTs preserve extended linear RGB values rather than clipping them
+to sRGB. Matrix/TRC monitor profiles use their own linear RGB gamut for output
+composition; other profiles use a ProPhoto RGB working domain. Output LUTs use
+a gamma-2.2 input shaper to improve shadow precision, and include VCGT calibration
+once at device encoding. The 33³ LUT remains an approximation, particularly at
+gamut boundaries in non-matrix profiles; colors beyond its working domain still
+require mapping. This is not proofing-grade or calibrated HDR support.
+
+On SDR outputs, declared HDR surfaces receive a per-surface highlight shoulder
+and neutral-axis RGB gamut compression before blending. The shoulder leaves
+values through half SDR white unchanged and maps the declared source peak to
+SDR white. SDR windows alongside them are unchanged. Mapping operates on
+straight optical RGB, including for translucent surfaces. This is a fixed,
+metadata-driven policy, not adaptive or perceptually uniform tone mapping.
+`test/vulkan-cursor.py --capture-icc-hdr comparison.png` checks both shader paths
+and produces an SDR preview of actual highlight-ramp readbacks.
 
 Set `"hdr": false` in an output's `settings` to force SDR, or `"hdr": true`
 to prefer HDR when the display and renderer support it. Omitting `hdr` inherits
@@ -1154,11 +1176,13 @@ The offscreen shader fixture's `--capture-isolated isolated.png` checks actual
 sRGB-to-gamma22 and video conversion pixels (including lavapipe), but does not
 replace a real-device Wayland/DMA-BUF capture test.
 
-Declared PQ/HLG or above-reference
-source luminance enables a simple SDR shoulder: maximum linear RGB `p` stays
+On HDR outputs, declared PQ/HLG or above-reference
+source luminance enables a simple SDR capture shoulder: maximum linear RGB `p` stays
 unchanged through 0.5, then maps to `1 - 1/(4p)`; RGB is scaled together to
 retain channel ratios. Reference white maps to 0.75, leaving highlight headroom.
-This is a fixed scene-wide policy, not content-adaptive HDR mastering. Negative
+This is a fixed scene-wide capture policy, not content-adaptive HDR mastering.
+On SDR outputs, capture uses the already per-surface-mapped composition without
+applying another shoulder. Negative
 out-of-gamut values still clip. Untagged out-of-range inputs are not inferred to
 be HDR from their format; those highlights still clip. The output's HDR mode
 alone does not enable the shoulder. HDR input acceptance is not complete HDR

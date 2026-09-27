@@ -4648,6 +4648,9 @@ fn captureFrame(input: Frame, full_damage: []const render.Rect) !Frame {
         render.color.Description.srgb
     else
         input.output_color_description;
+    // compile() uses the LUT's working primaries; capture consumes already
+    // linear composition and never samples the device-encoding LUT itself.
+    working.lut = input.output_color_description.lut;
     working.transfer = .linear;
     // PQ composition is normalized to the display's graphics white. Export
     // that white as SDR white, not display nits / the nominal SDR 80 nits.
@@ -4661,11 +4664,12 @@ fn captureFrame(input: Frame, full_damage: []const render.Rect) !Frame {
     frame.capture_color[1][3] = @floatFromInt(@intFromEnum(frame.capture_encoding));
     // A display's HDR mode alone must not alter SDR screenshot bytes. Choose
     // the SDR shoulder from declared source dynamic range, not buffer depth.
+    // SDR output composition already maps HDR per surface; do not map it twice.
     frame.capture_color[2][3] = 0;
     for (input.sources) |source| {
         const description = source.color_description;
-        if (description.transfer == .st2084_pq or description.transfer == .hlg or
-            description.max_luminance > description.reference_luminance)
+        if (description.isHdr() and input.output_color_description.lut == null and
+            input.output_color_description.isHdr())
         {
             frame.capture_color[2][3] = 1;
             break;
@@ -7316,22 +7320,28 @@ test "render-vulkan: capture converts the HDR working space without changing sca
         input.sources = &.{source};
         for ([_]render.color.Description{ .desktop, hdr }) |output| {
             input.output_color_description = output;
-            try std.testing.expectEqual(@as(f32, 1), (try captureFrame(input, &full)).capture_color[2][3]);
+            try std.testing.expectEqual(@as(f32, if (output.isHdr()) 1 else 0), (try captureFrame(input, &full)).capture_color[2][3]);
         }
     }
 
-    // Output ICC composition already uses linear sRGB at SDR reference white;
+    // Output ICC composition uses the LUT's working gamut at SDR reference white;
     // capture must not apply device calibration or output luminance again.
-    var lut: icc.Lut = undefined;
+    var lut: icc.Lut = .{ .profile_hash = @splat(0), .lut_hash = @splat(0), .rgba = &.{} };
     input.output_color_description.lut = &lut;
     input.output_lut_slot = 3;
     const profiled = try captureFrame(input, &full);
     try std.testing.expectEqual(input.output_lut_slot, profiled.output_lut_slot);
+    try std.testing.expectEqual(@as(f32, 0), profiled.capture_color[2][3]);
+    const prophoto_to_srgb: [3][3]f32 = .{
+        .{ 2.034, -0.728, -0.306 },
+        .{ -0.228, 1.232, -0.004 },
+        .{ -0.009, -0.153, 1.162 },
+    };
     for (0..3) |row| for (0..3) |column| {
         try std.testing.expectApproxEqAbs(
-            @as(f32, if (row == column) 1 else 0),
+            prophoto_to_srgb[row][column],
             profiled.capture_color[row][column],
-            0.00001,
+            0.002,
         );
     };
 }

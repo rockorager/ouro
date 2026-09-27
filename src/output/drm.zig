@@ -233,6 +233,8 @@ fn contentByteCapacity(config: Config) !usize {
 fn validateConfig(config: Config) !void {
     const surface_bytes = surfaceByteCapacity(config);
     const content_bytes = try contentByteCapacity(config);
+    if (config.output_color_description.lut != null and hdrRequested(config.output_color_description))
+        return error.OutputIccHdrConflict;
     if (config.scanout_modifier != null and config.renderer != .vulkan)
         return error.ModifierRequiresVulkan;
     if (config.image_count == 0 or config.max_render_targets < config.image_count or
@@ -2388,6 +2390,16 @@ test "drm output: HDR10 metadata follows the configured output description" {
     try std.testing.expect(automaticHdrDescription(snapshot, config, true) == null);
     config.enable_hdr = true;
     try std.testing.expect(automaticHdrDescription(snapshot, config, false) == null);
+
+    // Adding/removing a monitor profile must change the negotiated mode, not
+    // combine device-encoded SDR pixels with an HDR connector configuration.
+    var lut: @import("../render/icc.zig").Lut = undefined;
+    config.output_color_description.lut = &lut;
+    try std.testing.expect(automaticHdrDescription(snapshot, config, true) == null);
+    config.output_color_description.transfer = .st2084_pq;
+    try std.testing.expectError(error.OutputIccHdrConflict, validateConfig(config));
+    config.output_color_description = .desktop;
+    try std.testing.expectEqual(render.color.TransferFunction.st2084_pq, automaticHdrDescription(snapshot, config, true).?.transfer);
 
     var description = render.color.Description.srgb;
     description.primaries = .{

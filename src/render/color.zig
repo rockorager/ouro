@@ -59,6 +59,23 @@ pub const Description = struct {
     /// color-management-v1 gamma22 guidance. `srgb` retains piecewise math.
     pub const desktop: Description = .{ .primaries = srgb.primaries, .transfer = .gamma22 };
 
+    /// Source ICC working space and fallback domain for non-matrix output
+    /// profiles. ProPhoto's unit cube covers sRGB, P3 and Adobe RGB.
+    pub const icc_working: Description = .{
+        .primaries = .{
+            .red = .{ .x = 0.7347, .y = 0.2653 },
+            .green = .{ .x = 0.1596, .y = 0.8404 },
+            .blue = .{ .x = 0.0366, .y = 0.0001 },
+            .white = .{ .x = 0.3457, .y = 0.3585 },
+        },
+        .transfer = .linear,
+    };
+
+    pub fn isHdr(value: Description) bool {
+        return value.transfer == .st2084_pq or value.transfer == .hlg or
+            value.max_luminance > value.reference_luminance;
+    }
+
     pub fn targetPrimaries(value: Description) Primaries {
         return value.mastering_primaries orelse value.primaries;
     }
@@ -161,24 +178,26 @@ pub const Transform = struct {
     source_transfer: TransferFunction,
     output_transfer: TransferFunction,
     luminance_scale: f32,
+    /// Source peak in SDR working units; zero disables per-surface mapping.
+    tone_map_peak: f32 = 0,
 };
 
 pub fn compile(source: Description, output: Description) !Transform {
     try source.validate();
     try output.validate();
-    // ICC LUTs produce linear-light sRGB. Keep the source luminance metadata,
+    // ICC LUTs produce extended linear ProPhoto. Keep the source luminance metadata,
     // but start the analytical output transform in that working space.
     var working = source;
-    if (source.lut != null) {
-        working.primaries = Description.srgb.primaries;
+    if (source.lut) |lut| {
+        working.primaries = lut.working_primaries;
         working.transfer = .linear;
         working.lut = null;
     }
     const source_xyz = try rgbToXyz(working.primaries);
-    // An output ICC LUT consumes linear-light sRGB. Compositing therefore
+    // An output ICC LUT consumes shaped working RGB. Compositing therefore
     // stays in that working space and the final LUT performs device encoding.
-    const destination_primaries = if (output.lut != null)
-        Description.srgb.primaries
+    const destination_primaries = if (output.lut) |lut|
+        lut.working_primaries
     else
         output.primaries;
     const source_to_output_reference = if (output.lut != null)
@@ -206,6 +225,10 @@ pub fn compile(source: Description, output: Description) !Transform {
             1
         else
             source.reference_luminance / source_to_output_reference,
+        .tone_map_peak = if (source.isHdr() and (output.lut != null or !output.isHdr()))
+            @max(1, source.targetMaxLuminance() / source_to_output_reference)
+        else
+            0,
     };
 }
 
@@ -347,7 +370,7 @@ test "color: PQ output maps encoded SDR white relatively but retains absolute HD
     }
 }
 
-test "color: ICC selects linear sRGB working-space transform" {
+test "color: ICC selects linear ProPhoto working-space transform" {
     var texel = [_][4]f16{.{ 0, 0, 0, 1 }};
     var lut: icc.Lut = .{
         .profile_hash = .{0} ** 32,
@@ -359,15 +382,43 @@ test "color: ICC selects linear sRGB working-space transform" {
     source.lut = &lut;
     const transform = try compile(source, .srgb);
     try std.testing.expectEqual(.linear, transform.source_transfer);
+    const expected: Matrix3 = .{
+        .{ 2.034, -0.728, -0.306 },
+        .{ -0.228, 1.232, -0.004 },
+        .{ -0.009, -0.153, 1.162 },
+    };
     inline for (0..3) |row| inline for (0..3) |column|
         try std.testing.expectApproxEqAbs(
-            @as(f32, if (row == column) 1 else 0),
+            expected[row][column],
             transform.matrix[row][column],
-            0.0001,
+            0.002,
         );
+    var output = Description.srgb;
+    output.lut = &lut;
+    const into_profile = try compile(.srgb, output);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5293), into_profile.matrix[0][0], 0.0005);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0984), into_profile.matrix[1][0], 0.0005);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0169), into_profile.matrix[2][0], 0.0005);
     var hdr = Description.desktop;
     hdr.transfer = .st2084_pq;
     hdr.reference_luminance = 203;
     hdr.max_luminance = 1000;
     try std.testing.expectEqual(@as(f32, 1), (try compile(source, hdr)).luminance_scale);
+}
+
+test "color: only HDR sources on SDR outputs need per-surface mapping" {
+    var hdr = Description.icc_working;
+    hdr.transfer = .st2084_pq;
+    hdr.reference_luminance = 203;
+    hdr.max_luminance = 1000;
+    for ([_]TransferFunction{ .st2084_pq, .hlg, .linear }) |transfer| {
+        hdr.transfer = transfer;
+        try std.testing.expectEqual(@as(f32, 12.5), (try compile(hdr, .desktop)).tone_map_peak);
+        try std.testing.expectEqual(@as(f32, 0), (try compile(hdr, hdr)).tone_map_peak);
+        try std.testing.expectEqual(@as(f32, 0), (try compile(.desktop, hdr)).tone_map_peak);
+    }
+    try std.testing.expectEqual(@as(f32, 0), (try compile(.desktop, .desktop)).tone_map_peak);
+    hdr.mastering_min_luminance = 0;
+    hdr.mastering_max_luminance = 400;
+    try std.testing.expectEqual(@as(f32, 5), (try compile(hdr, .desktop)).tone_map_peak);
 }

@@ -231,10 +231,36 @@ pub fn resolveInput(rules: []const InputRule, info: InputInfo) InputSettings {
     return result;
 }
 
-pub fn resolveOutput(rules: []const OutputRule, info: OutputInfo) OutputSettings {
+pub fn resolveOutput(rules: []const OutputRule, info: OutputInfo) !OutputSettings {
     var result: OutputSettings = .{};
     for (rules) |rule| if (outputMatches(rule.match, info)) overlay(OutputSettings, &result, rule.settings);
+    // Validate the effective settings, not individual rules: a later matching
+    // rule can intentionally turn off an earlier HDR preference.
+    if (result.icc_profile != null and result.hdr == true) return error.OutputIccHdrConflict;
     return result;
+}
+
+test "output settings validate ICC and HDR after merging matching rules" {
+    const info: OutputInfo = .{
+        .name = "DRM-7",
+        .connector_id = 7,
+        .connector_type = 1,
+        .connector_type_id = 1,
+        .width_mm = 600,
+        .height_mm = 340,
+    };
+    var rules = [_]OutputRule{
+        .{ .settings = .{ .hdr = true } },
+        .{ .match = .{ .connector_id = 7 }, .settings = .{ .icc_profile = "/display.icc" } },
+        .{ .match = .{ .connector_id = 8 }, .settings = .{ .hdr = false } },
+    };
+    try std.testing.expectError(error.OutputIccHdrConflict, resolveOutput(&rules, info));
+    rules[2].match.connector_id = 7;
+    try std.testing.expectEqual(@as(?bool, false), (try resolveOutput(&rules, info)).hdr);
+    rules[0].settings.hdr = null;
+    const inherited = try resolveOutput(rules[0..2], info);
+    try std.testing.expectEqual(@as(?bool, null), inherited.hdr);
+    try std.testing.expectEqualStrings("/display.icc", inherited.icc_profile.?);
 }
 
 fn inputMatches(m: InputMatch, info: InputInfo) bool {
