@@ -80,6 +80,11 @@ pub const HdrCapabilities = struct {
     bt2020_rgb: bool = false,
     pq: bool = false,
     hlg: bool = false,
+    /// Desired content luminance from the CTA HDR static metadata block, in
+    /// cd/m². Null when the display does not declare it.
+    max_luminance: ?f32 = null,
+    max_frame_average_luminance: ?f32 = null,
+    min_luminance: ?f32 = null,
 };
 
 pub const ZposProperty = struct {
@@ -610,6 +615,16 @@ fn parseEdidHdrCapabilities(edid: []const u8) HdrCapabilities {
                 0x06 => {
                     capabilities.pq = capabilities.pq or payload[1] & 0x04 != 0;
                     capabilities.hlg = capabilities.hlg or payload[1] & 0x08 != 0;
+                    // CTA-861-H 7.5.13: optional luminance code values follow
+                    // the EOTF and descriptor bytes; zero means undeclared.
+                    if (payload.len >= 4 and payload[3] != 0)
+                        capabilities.max_luminance = ctaLuminance(payload[3]);
+                    if (payload.len >= 5 and payload[4] != 0)
+                        capabilities.max_frame_average_luminance = ctaLuminance(payload[4]);
+                    if (payload.len >= 6 and payload[5] != 0) if (capabilities.max_luminance) |max| {
+                        const ratio = @as(f32, @floatFromInt(payload[5])) / 255.0;
+                        capabilities.min_luminance = max * ratio * ratio / 100.0;
+                    };
                 },
                 else => {},
             };
@@ -617,6 +632,11 @@ fn parseEdidHdrCapabilities(edid: []const u8) HdrCapabilities {
         }
     }
     return capabilities;
+}
+
+/// Desired maximum and frame-average luminance: 50 * 2^(CV/32) cd/m².
+fn ctaLuminance(code: u8) f32 {
+    return 50.0 * std.math.pow(f32, 2.0, @as(f32, @floatFromInt(code)) / 32.0);
 }
 
 fn validEdidBlock(block: []const u8) bool {
@@ -861,6 +881,29 @@ test "drm platform: CTA EDID publishes exact HDR capabilities" {
         .pq = true,
         .hlg = true,
     }, parseEdidHdrCapabilities(&edid));
+}
+
+test "drm platform: CTA HDR static metadata publishes desired luminance" {
+    // Acer KG272K L: max 400 cd/m², frame-average 400 cd/m², min 0.293 cd/m².
+    var edid = [_]u8{0} ** 256;
+    edid[0..8].* = .{ 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00 };
+    edid[126] = 1;
+    setEdidChecksum(edid[0..128]);
+    edid[128] = 0x02;
+    edid[129] = 3;
+    edid[130] = 14;
+    edid[132] = 0xe2;
+    edid[133] = 0x05;
+    edid[134] = 0x80;
+    edid[135] = 0xe6;
+    edid[136..142].* = .{ 0x06, 0x05, 0x01, 96, 96, 69 };
+    setEdidChecksum(edid[128..256]);
+
+    const capabilities = parseEdidHdrCapabilities(&edid);
+    try std.testing.expect(capabilities.bt2020_rgb and capabilities.pq and !capabilities.hlg);
+    try std.testing.expectApproxEqAbs(@as(f32, 400), capabilities.max_luminance.?, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 400), capabilities.max_frame_average_luminance.?, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.293), capabilities.min_luminance.?, 0.001);
 }
 
 test "drm platform: malformed EDID cannot advertise HDR" {

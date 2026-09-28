@@ -71,6 +71,8 @@ pub const OutputSettings = struct {
     position: ?OutputPosition = null,
     scale_120: ?u32 = null,
     icc_profile: ?[]const u8 = null,
+    /// Luminance of SDR (desktop) white on an HDR output, in cd/m².
+    sdr_white: ?f64 = null,
 };
 pub const OutputRule = struct {
     name: []const u8 = "",

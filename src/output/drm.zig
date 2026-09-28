@@ -52,6 +52,9 @@ pub const Config = struct {
     /// Prefer HDR automatically when the connector and render path support it.
     /// Explicit non-default output descriptions are never replaced by this policy.
     enable_hdr: bool = true,
+    /// SDR white on automatic HDR outputs, in cd/m². Null uses the ITU-R
+    /// BT.2408 graphics white of 203 cd/m².
+    sdr_white: ?f32 = null,
     output_color_description: render.color.Description = .desktop,
     /// Aggregate packed source bytes available to one fallback render frame.
     max_source_bytes: usize,
@@ -2259,9 +2262,15 @@ fn automaticHdrDescription(
     var description = render.color.Description.srgb;
     description.primaries = bt2020();
     description.transfer = transfer;
-    description.reference_luminance = 203;
-    description.min_luminance = 0.0001;
-    description.max_luminance = 1000;
+    // Declare the panel's own range so it does not compress a nominal
+    // 1000 cd/m² signal, which dims everything including SDR white.
+    description.max_luminance = capabilities.max_luminance orelse 1000;
+    description.min_luminance = if (capabilities.min_luminance) |min|
+        @min(min, description.max_luminance / 2)
+    else
+        0.0001;
+    // White cannot exceed what the panel can show.
+    description.reference_luminance = @min(config.sdr_white orelse 203, description.max_luminance);
     if (hdrOutputMetadata(snapshot, description) == null) return null;
     return description;
 }
@@ -3876,4 +3885,70 @@ fn drainIdleSimOutput(output: *Output, fixture: *SimFixture) !void {
     try output.beginDrain(&fixture.router, &fixture.ring);
     try output.processKmsEvents(callbacks);
     try output.destroy();
+}
+
+test "drm output: automatic HDR follows the panel's EDID range and SDR white" {
+    var connector: drm.Connector = .{
+        .id = 10,
+        .connector_type = 1,
+        .connector_type_id = 1,
+        .connected = true,
+        .desktop = true,
+        .width_mm = 1,
+        .height_mm = 1,
+        .encoder_id = 20,
+        .mode_start = 0,
+        .mode_count = 0,
+        .encoder_start = 0,
+        .encoder_count = 0,
+        .properties = .{
+            .crtc_id = 1,
+            .colorspace = .{ .id = 2, .bt2020_rgb = 9 },
+            .hdr_output_metadata = .{ .id = 3 },
+            .max_bpc = .{ .id = 4, .minimum = 8, .maximum = 12 },
+            .hdr_capabilities = .{ .bt2020_rgb = true, .pq = true },
+        },
+    };
+    var snapshot: drm.Snapshot = .{
+        .handle = .{ .generation = 1 },
+        .card = .{},
+        .connectors = (&connector)[0..1],
+        .modes = &.{},
+        .connector_encoders = &.{},
+        .encoders = &.{},
+        .crtcs = &.{},
+        .planes = &.{},
+        .formats = &.{},
+        .selection = .{ .connector_index = 0, .mode_index = 0, .crtc_index = 0, .plane_index = 0 },
+    };
+    var config: Config = .{
+        .output_id = .{ .index = 0, .generation = 1 },
+        .scheduler = .{ .refresh_ns = 1, .render_budget_ns = 0 },
+        .max_samples = 1,
+        .max_source_bytes = 4,
+        .max_source_width = 1,
+        .max_source_height = 1,
+    };
+    // A display that declares no luminance keeps the nominal range and
+    // BT.2408 graphics white.
+    const nominal = automaticHdrDescription(snapshot, config, true).?;
+    try std.testing.expectEqual(@as(f32, 1000), nominal.max_luminance);
+    try std.testing.expectEqual(@as(f32, 203), nominal.reference_luminance);
+
+    // A 400 cd/m² panel is told its own peak, so it does not compress a
+    // nominal 1000 cd/m² signal and dim SDR white along with it.
+    connector.properties.hdr_capabilities.max_luminance = 400;
+    connector.properties.hdr_capabilities.min_luminance = 0.293;
+    snapshot.connectors = (&connector)[0..1];
+    const panel = automaticHdrDescription(snapshot, config, true).?;
+    try std.testing.expectEqual(@as(f32, 400), panel.max_luminance);
+    try std.testing.expectEqual(@as(f32, 0.293), panel.min_luminance);
+    try std.testing.expectEqual(@as(f32, 203), panel.reference_luminance);
+    try std.testing.expectEqual(@as(u16, 400), hdrOutputMetadata(snapshot, panel).?.max_display_mastering_luminance);
+
+    config.sdr_white = 300;
+    try std.testing.expectEqual(@as(f32, 300), automaticHdrDescription(snapshot, config, true).?.reference_luminance);
+    // White cannot exceed the panel's peak.
+    config.sdr_white = 600;
+    try std.testing.expectEqual(@as(f32, 400), automaticHdrDescription(snapshot, config, true).?.reference_luminance);
 }

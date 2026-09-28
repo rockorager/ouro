@@ -622,6 +622,16 @@ changes recreate the output so transfer encoding and KMS HDR metadata,
 colorspace, and bit depth change together. A monitor's Standard preset may
 still advertise HDR; use `"hdr": false` to request SDR explicitly.
 
+HDR outputs declare the panel's own range from its EDID HDR static metadata
+(desired maximum and minimum content luminance), falling back to a nominal
+1000 cd/m² when the display declares none, so the panel does not compress the
+signal. `"sdr_white"` sets the luminance of SDR (desktop) white on an HDR
+output in cd/m², from 1 to 10000; it defaults to the BT.2408 graphics white of
+203 cd/m² and is clamped to the panel's peak. Raise it when desktop content
+looks dim compared with the monitor's SDR mode, for example
+`"settings": { "hdr": true, "sdr_white": 300 }`. Changing it recreates the
+output like `hdr`.
+
 ```json
 {
   "output_rules": {
@@ -797,7 +807,8 @@ transforms retain distinct behavior. HLG currently applies its inverse OETF,
 not a complete display OOTF. Input format acceptance is not full HDR support.
 
 On PQ outputs, encoded SDR and ICC content map white to the output's graphics
-white (203 cd/m² by default), rather than fixing desktop white at 80 cd/m².
+white (203 cd/m² by default, or the output's `sdr_white`), rather than fixing
+desktop white at 80 cd/m².
 Explicit linear/scRGB keeps its reference-luminance units and native PQ keeps
 absolute ST 2084 luminance. SDR capture maps the HDR working-space graphics
 white back to SDR white before applying any HDR-source highlight shoulder;

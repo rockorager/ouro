@@ -296,6 +296,8 @@ fn validateRule(rule: anytype) !void {
             return error.InvalidRange;
         if (rule.settings.icc_profile) |path| if (!std.fs.path.isAbsolute(path))
             return error.OutputIccPathNotAbsolute;
+        if (rule.settings.sdr_white) |nits| if (nits < 1 or nits > 10_000)
+            return error.InvalidRange;
     }
 }
 
@@ -967,6 +969,10 @@ test "rule ranges strict fields and partial merge removals" {
     try std.testing.expectError(error.InvalidRange, parseSource(std.testing.allocator, "{\"input_rules\":{\"x\":{\"settings\":{\"rotation\":360}}}}"));
     try std.testing.expectError(error.UnknownField, parseSource(std.testing.allocator, "{\"output_rules\":{\"x\":{\"match\":{\"icc\":\"x\"}}}}"));
     try std.testing.expectError(error.OutputIccPathNotAbsolute, parseSource(std.testing.allocator, "{\"output_rules\":{\"x\":{\"settings\":{\"icc_profile\":\"relative.icc\"}}}}"));
+    var white = try parseSource(std.testing.allocator, "{\"output_rules\":{\"x\":{\"settings\":{\"hdr\":true,\"sdr_white\":300}}}}");
+    defer white.deinit();
+    try std.testing.expectEqual(@as(?f64, 300), white.output_rules[0].settings.sdr_white);
+    try std.testing.expectError(error.InvalidRange, parseSource(std.testing.allocator, "{\"output_rules\":{\"x\":{\"settings\":{\"sdr_white\":0}}}}"));
     var snapshot = try mergeSources(std.testing.allocator, &.{
         "{\"input_rules\":{\"mouse\":{\"match\":{\"name\":\"M*\"}}}}",
         "{\"input_rules\":{\"mouse\":{\"settings\":{\"natural_scroll\":true}}}}",

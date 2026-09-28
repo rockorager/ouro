@@ -548,6 +548,8 @@ pub fn Coordinator(comptime protocol: type) type {
             output_profile: ?*engine_settings.OutputProfile = null,
             // Effective preference used at activation, not the negotiated transfer.
             hdr_preference: bool = true,
+            // SDR white requested for an HDR output at activation, in cd/m².
+            sdr_white: ?f64 = null,
             gamma_owner: ?drm_gamma.Owner = null,
             gamma_ramps: []u16 = &.{},
             session_lock_frame: ?output_scheduler.FrameId = null,
@@ -5324,8 +5326,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 const snapshot = try self.manager.claimSnapshot(claim);
                 const connector = snapshot.selectedConnector();
                 const settings = try configuredOutputSettings(candidate, snapshot);
+                // SDR white is part of the HDR output description, so a new
+                // value recreates the output like an HDR preference change.
                 const hdr_changed = physical.hdr_preference !=
-                    (self.output_config.enable_hdr and (settings.hdr orelse true));
+                    (self.output_config.enable_hdr and (settings.hdr orelse true)) or
+                    !std.meta.eql(physical.sdr_white, settings.sdr_white);
                 const profile_changed = !sameOutputProfile(
                     physical.output_profile,
                     candidate.outputProfile(settings.icc_profile),
@@ -5392,8 +5397,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 const claim = physical.claim orelse return error.StaleClaim;
                 const snapshot = try self.manager.claimSnapshot(claim);
                 const settings = try configuredOutputSettings(self.outputSettingsForActivation(), snapshot);
+                // SDR white is part of the HDR output description, so a new
+                // value recreates the output like an HDR preference change.
                 const hdr_changed = physical.hdr_preference !=
-                    (self.output_config.enable_hdr and (settings.hdr orelse true));
+                    (self.output_config.enable_hdr and (settings.hdr orelse true)) or
+                    !std.meta.eql(physical.sdr_white, settings.sdr_white);
                 const desired_profile = self.outputSettingsForActivation().outputProfile(settings.icc_profile);
                 const profile_changed = !sameOutputProfile(
                     physical.output_profile,
@@ -8850,6 +8858,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 snapshot,
             );
             output_config.enable_hdr = output_config.enable_hdr and (settings.hdr orelse true);
+            output_config.sdr_white = if (settings.sdr_white) |nits| @floatCast(nits) else null;
             const selected_profile = self.outputSettingsForActivation().outputProfile(settings.icc_profile);
             if (selected_profile) |profile| {
                 output_config.output_color_description.lut = &profile.output_lut;
@@ -8971,6 +8980,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 );
             }
             physical.hdr_preference = output_config.enable_hdr;
+            physical.sdr_white = settings.sdr_white;
             output_committed = true;
             _ = retained_visibility_changed;
             // Commits can be applied while their outputs are powered off.
