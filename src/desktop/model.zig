@@ -222,6 +222,9 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             activated: bool = false,
             resizing: bool = false,
             suspended: bool = false,
+            /// Configure 0x0 so the client picks its size; `rect` is only
+            /// the placement anchor until that size commits.
+            natural_size: bool = false,
         };
 
         const PolicyWindow = struct {
@@ -349,6 +352,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                     .activated = value.activated,
                     .resizing = value.resizing,
                     .suspended = value.suspended,
+                    .natural_size = value.natural_size,
                 };
                 try target_value.rect.validate();
                 if (target_value.output) |output| try desktop.validatePolicyOutput(output);
@@ -1547,6 +1551,12 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                                     _ = try desktop.policy.setFloatingGeometry(id, slot.target_scene.geometry, state.floating_pointer);
                                     slot.resize_anchor = null;
                                 }
+                            } else if (state.mode == .floating and state.natural_size) {
+                                // The first sized buffer of a natural-size
+                                // window fixes its centered placement.
+                                const bounds = outputAreaForRect(state.floating, desktop.outputAreas());
+                                if (try desktop.policy.placeNaturalFloating(id, commit.window_width, commit.window_height, bounds)) |rect|
+                                    slot.target_scene.geometry = rect;
                             } else if (state.mode == .floating) {
                                 // Client redraws update size, not the output
                                 // chosen by the last compositor drag.
@@ -1930,15 +1940,29 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             if (slot.initial_committed) return;
             const id = desktop.idFor(index);
             const state = try desktop.policy.windowState(id);
-            const adds_layout = state.mode == .tiled and !state.minimized and
-                !state.fullscreen and !state.maximized;
+            const parent_geometry: ?geometry.Rect = if (slot.parent) |parent| parent: {
+                const parent_slot = &desktop.slots[try desktop.resolveIndex(parent)];
+                break :parent if (parent_slot.content_ready) parent_slot.scene.geometry else null;
+            } else null;
+            const hints: Policy.WindowHints = .{
+                .transient = slot.parent != null,
+                .modal = slot.modal,
+                .min_width = slot.min_width,
+                .min_height = slot.min_height,
+                .max_width = slot.max_width,
+                .max_height = slot.max_height,
+                .anchor = parent_geometry orelse
+                    outputAreaForRect(state.floating, desktop.outputAreas()),
+            };
+            const adds_layout = try desktop.policy.initialMode(id, hints) == .tiled and
+                !state.minimized and !state.fullscreen and !state.maximized;
             try desktop.validateLayout(
                 desktop.layoutCount() + @intFromBool(adds_layout),
                 desktop.outputAreas(),
             );
             try desktop.requireCommandCapacity(desktop.live);
             slot.initial_committed = true;
-            try desktop.policy.initialCommitted(id);
+            try desktop.policy.initialCommitted(id, hints);
             desktop.committed_toplevels += 1;
             try desktop.reflow();
             // An unmapped role has no pixels to expose, so its initial layout
@@ -2084,8 +2108,8 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                     slot.resize_anchor = null;
                 const output_area = outputAreaForRect(desired.rect, desktop.outputAreas());
                 const configure: Shell.ToplevelConfigure = .{
-                    .width = desired.rect.width,
-                    .height = desired.rect.height,
+                    .width = if (desired.natural_size) 0 else desired.rect.width,
+                    .height = if (desired.natural_size) 0 else desired.rect.height,
                     .states = .{
                         .maximized = desired.maximized,
                         .fullscreen = desired.fullscreen,
@@ -2841,6 +2865,12 @@ const TestShell = struct {
     len: usize = 0,
     title: []const u8 = "",
     app_id: []const u8 = "",
+    min_width: i32 = 10,
+    min_height: i32 = 20,
+    max_width: i32 = 0,
+    max_height: i32 = 0,
+    dialog: bool = false,
+    modal: bool = false,
     reject_configure: bool = false,
     stale_configure: bool = false,
     configure_serial: u32 = 40,
@@ -2866,12 +2896,12 @@ const TestShell = struct {
         return .{
             .title = shell.title,
             .app_id = shell.app_id,
-            .min_width = 10,
-            .min_height = 20,
-            .max_width = 0,
-            .max_height = 0,
-            .dialog = false,
-            .modal = false,
+            .min_width = shell.min_width,
+            .min_height = shell.min_height,
+            .max_width = shell.max_width,
+            .max_height = shell.max_height,
+            .dialog = shell.dialog or shell.modal,
+            .modal = shell.modal,
         };
     }
 
@@ -2997,8 +3027,24 @@ const KioskPolicyFactory = struct {
                 policy.base.destroyed(id);
             }
 
-            pub fn initialCommitted(policy: *Self, id: ToplevelId) !void {
-                try policy.base.initialCommitted(id);
+            pub const WindowHints = Base.WindowHints;
+
+            pub fn initialMode(policy: *const Self, id: ToplevelId, hints: WindowHints) !Mode {
+                return policy.base.initialMode(id, hints);
+            }
+
+            pub fn initialCommitted(policy: *Self, id: ToplevelId, hints: WindowHints) !void {
+                try policy.base.initialCommitted(id, hints);
+            }
+
+            pub fn placeNaturalFloating(
+                policy: *Self,
+                id: ToplevelId,
+                width: i32,
+                height: i32,
+                bounds: geometry.Rect,
+            ) !?geometry.Rect {
+                return policy.base.placeNaturalFloating(id, width, height, bounds);
             }
 
             pub fn reset(policy: *Self, id: ToplevelId, output: OutputId, rect: geometry.Rect) !void {
@@ -3136,6 +3182,7 @@ const KioskPolicyFactory = struct {
                         .activated = stacking == 0,
                         .resizing = false,
                         .suspended = false,
+                        .natural_size = false,
                     });
                     stacking += 1;
                 }
@@ -4238,6 +4285,149 @@ test "desktop: restored state is published by the first configure" {
     try std.testing.expectEqual(@as(i32, 30), command.configure.height);
     try std.testing.expect(!command.configure.states.tiled_left);
     try std.testing.expectError(error.AlreadyMapped, desktop.restoreInitialState(id, restored));
+}
+
+fn initialCommitWithHints(desktop: *TestDesktop, shell: *TestShell, index: u32) !void {
+    shell.push(.{ .commit_ready = .{
+        .id = .{ .index = index, .generation = 1 },
+        .serial = 0,
+        .constraints_changed = true,
+        .initial_commit = true,
+        .mapped = false,
+    } });
+    _ = try desktop.consume(shell, 1);
+}
+
+test "desktop: fixed-size windows float at natural size centered on their output" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    // Minimum 10x20 with an equal maximum width fixes one axis.
+    var shell = TestShell{ .max_width = 10 };
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    const id = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    try initialCommitWithHints(&desktop, &shell, 0);
+
+    try std.testing.expectEqual(TestDesktop.Mode.floating, (try desktop.restorableState(id)).mode);
+    try std.testing.expectEqual(@as(usize, 0), desktop.layoutCount());
+    const command = desktop.peekCommand().?;
+    try std.testing.expectEqual(@as(i32, 0), command.configure.width);
+    try std.testing.expectEqual(@as(i32, 0), command.configure.height);
+    try std.testing.expect(!command.configure.states.tiled_left);
+
+    const serial = (try desktop.flushConfigure(&shell)).?;
+    shell.push(.{ .commit_ready = .{
+        .id = .{ .index = 0, .generation = 1 },
+        .serial = serial,
+        .window_width = 30,
+        .window_height = 20,
+    } });
+    _ = try desktop.consume(&shell, 1);
+    const placed = geometry.Rect{ .x = 35, .y = 20, .width = 30, .height = 20 };
+    try std.testing.expectEqual(placed, (try desktop.scene(id)).geometry);
+    try std.testing.expectEqual(placed, (try desktop.restorableState(id)).floating_geometry);
+
+    // Once placed, the window is ordinary floating state: leaving fullscreen
+    // proposes its natural size rather than another 0x0 configure.
+    try desktop.toggleFocusedFullscreen();
+    while (desktop.pendingCommands() != 0) _ = try desktop.flushConfigure(&shell);
+    try desktop.toggleFocusedFullscreen();
+    const restored = desktop.peekCommand().?;
+    try std.testing.expectEqual(@as(i32, 30), restored.configure.width);
+    try std.testing.expectEqual(@as(i32, 20), restored.configure.height);
+}
+
+test "desktop: transient windows float centered over their parent" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const parent = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const parent_rect = (try desktop.scene(parent)).geometry;
+
+    shell.push(created(1));
+    shell.push(.{ .parent_changed = .{
+        .id = .{ .index = 1, .generation = 1 },
+        .parent = .{ .index = 0, .generation = 1 },
+    } });
+    _ = try desktop.consume(&shell, 2);
+    const child = try desktop.idForShell(.{ .index = 1, .generation = 1 });
+    try initialCommitWithHints(&desktop, &shell, 1);
+    try std.testing.expectEqual(TestDesktop.Mode.floating, (try desktop.restorableState(child)).mode);
+    try std.testing.expectEqual(@as(usize, 1), desktop.layoutCount());
+
+    var child_serial: ?u32 = null;
+    while (desktop.peekCommand()) |command| {
+        const serial = (try desktop.flushConfigure(&shell)).?;
+        if (std.meta.eql(command.id, child)) {
+            try std.testing.expectEqual(@as(i32, 0), command.configure.width);
+            try std.testing.expectEqual(@as(i32, 0), command.configure.height);
+            child_serial = serial;
+        } else if (desktop.slots[command.id.index].expected_serial == serial) shell.push(.{ .commit_ready = .{
+            .id = desktop.slots[command.id.index].shell_id,
+            .serial = serial,
+        } });
+    }
+    shell.push(.{ .commit_ready = .{
+        .id = .{ .index = 1, .generation = 1 },
+        .serial = child_serial.?,
+        .window_width = 20,
+        .window_height = 10,
+    } });
+    _ = try desktop.consume(&shell, shell.len);
+
+    try std.testing.expectEqual(parent_rect, (try desktop.scene(parent)).geometry);
+    try std.testing.expectEqual(geometry.Rect{
+        .x = parent_rect.x + @divTrunc(parent_rect.width - 20, 2),
+        .y = parent_rect.y + @divTrunc(parent_rect.height - 10, 2),
+        .width = 20,
+        .height = 10,
+    }, (try desktop.scene(child)).geometry);
+    try std.testing.expect((try desktop.scene(child)).stacking > (try desktop.scene(parent)).stacking);
+}
+
+test "desktop: modal windows float but the bare dialog hint does not" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    shell.push(created(1));
+    _ = try desktop.consume(&shell, 2);
+    const modal = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const dialog = try desktop.idForShell(.{ .index = 1, .generation = 1 });
+
+    shell.modal = true;
+    try initialCommitWithHints(&desktop, &shell, 0);
+    // GTK4 attaches xdg_dialog_v1 to every toplevel.
+    shell.modal = false;
+    shell.dialog = true;
+    try initialCommitWithHints(&desktop, &shell, 1);
+
+    try std.testing.expectEqual(TestDesktop.Mode.floating, (try desktop.restorableState(modal)).mode);
+    try std.testing.expectEqual(TestDesktop.Mode.tiled, (try desktop.restorableState(dialog)).mode);
+}
+
+test "desktop: restored state overrides the default window rules" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{ .max_width = 10, .modal = true };
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    const id = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    try desktop.restoreInitialState(id, .{
+        .maximized = false,
+        .fullscreen = false,
+        .mode = .tiled,
+        .floating_geometry = .{ .x = 7, .y = 9, .width = 40, .height = 30 },
+    });
+    try initialCommitWithHints(&desktop, &shell, 0);
+
+    try std.testing.expectEqual(TestDesktop.Mode.tiled, (try desktop.restorableState(id)).mode);
+    const command = desktop.peekCommand().?;
+    try std.testing.expectEqual(@as(i32, 100), command.configure.width);
+    try std.testing.expectEqual(@as(i32, 60), command.configure.height);
 }
 
 test "desktop: toplevel parents preserve ancestor stacking and reparent on unmap" {

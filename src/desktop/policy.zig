@@ -37,6 +37,11 @@ pub fn Policy(
             // Retain the last drag point after release: an overlapping logical
             // rectangle must not undo the cursor-selected output on the next reflow.
             floating_pointer: ?geometry.Point = null,
+            /// `floating` is only the rectangle to center within: the client
+            /// picks its size from a 0x0 configure, then placement is fixed.
+            natural_size: bool = false,
+            /// Session restore chose this window's state; default rules skip it.
+            restored: bool = false,
             fullscreen: bool = false,
             maximized: bool = false,
             minimized: bool = false,
@@ -91,6 +96,21 @@ pub fn Policy(
             activated: bool,
             resizing: bool,
             suspended: bool,
+            natural_size: bool,
+        };
+
+        /// Copied client hints evaluated by the default window rules when a
+        /// toplevel's initial commit is consumed.
+        pub const WindowHints = struct {
+            transient: bool = false,
+            modal: bool = false,
+            min_width: i32 = 0,
+            min_height: i32 = 0,
+            max_width: i32 = 0,
+            max_height: i32 = 0,
+            /// Where an automatically floated window is centered: its mapped
+            /// parent, otherwise its output's work area.
+            anchor: geometry.Rect,
         };
 
         allocator: std.mem.Allocator,
@@ -206,9 +226,31 @@ pub fn Policy(
             } else |_| {}
         }
 
-        pub fn initialCommitted(policy: *Self, id: ToplevelId) !void {
+        /// Default window rules, matching Sway and Keywork: transient and
+        /// fixed-size windows float. Modal windows float even without a
+        /// parent; the plain dialog hint is ignored because GTK4 attaches it
+        /// to every toplevel.
+        fn wantsFloating(hints: WindowHints) bool {
+            const fixed_size = hints.min_width != 0 and hints.min_height != 0 and
+                (hints.min_width == hints.max_width or hints.min_height == hints.max_height);
+            return hints.transient or hints.modal or fixed_size;
+        }
+
+        /// The mode `initialCommitted` will assign for these hints.
+        pub fn initialMode(policy: *const Self, id: ToplevelId, hints: WindowHints) !Mode {
+            const state = try policy.resolveConst(id);
+            if (state.committed or state.restored or !wantsFloating(hints)) return state.mode;
+            return .floating;
+        }
+
+        pub fn initialCommitted(policy: *Self, id: ToplevelId, hints: WindowHints) !void {
             const state = try policy.resolve(id);
             if (state.committed) return;
+            if (!state.restored and wantsFloating(hints)) {
+                state.mode = .floating;
+                state.floating = hints.anchor;
+                state.natural_size = true;
+            }
             state.committed = true;
             policy.workspace_revision +%= 1;
             if (state.mode == .tiled) {
@@ -246,6 +288,7 @@ pub fn Policy(
             state.fullscreen = value.fullscreen;
             state.mode = value.mode;
             state.floating = value.floating_geometry;
+            state.restored = true;
         }
 
         pub fn windowState(policy: *const Self, id: ToplevelId) !State {
@@ -827,6 +870,7 @@ pub fn Policy(
             if (state.committed) policy.tiling.remove(id);
             state.mode = mode;
             state.floating_pointer = null;
+            state.natural_size = false;
             if (floating) {
                 policy.assignVisual(state, null);
                 policy.removeTile(id);
@@ -840,10 +884,41 @@ pub fn Policy(
         pub fn setFloatingGeometry(policy: *Self, id: ToplevelId, rect: geometry.Rect, pointer: ?geometry.Point) !bool {
             const state = try policy.resolve(id);
             if (state.mode != .floating) return error.NotFloating;
-            const changed = !std.meta.eql(state.floating, rect) or !std.meta.eql(state.floating_pointer, pointer);
+            const changed = !std.meta.eql(state.floating, rect) or
+                !std.meta.eql(state.floating_pointer, pointer) or state.natural_size;
             state.floating_pointer = pointer;
             state.floating = rect;
+            state.natural_size = false;
             return changed;
+        }
+
+        /// Places a natural-size floating window once its first sized buffer
+        /// commits: centered in its anchor, kept inside `bounds` where it fits.
+        /// Returns null when the window is not awaiting natural placement.
+        pub fn placeNaturalFloating(
+            policy: *Self,
+            id: ToplevelId,
+            width: i32,
+            height: i32,
+            bounds: geometry.Rect,
+        ) !?geometry.Rect {
+            const state = try policy.resolve(id);
+            if (state.mode != .floating or !state.natural_size) return null;
+            const anchor = state.floating;
+            const centered_x = std.math.cast(i32, @as(i64, anchor.x) + @divTrunc(@as(i64, anchor.width) - width, 2)) orelse
+                return error.InvalidGeometry;
+            const centered_y = std.math.cast(i32, @as(i64, anchor.y) + @divTrunc(@as(i64, anchor.height) - height, 2)) orelse
+                return error.InvalidGeometry;
+            const rect: geometry.Rect = .{
+                .x = try clampAxis(centered_x, width, bounds.x, bounds.width),
+                .y = try clampAxis(centered_y, height, bounds.y, bounds.height),
+                .width = width,
+                .height = height,
+            };
+            try rect.validate();
+            state.floating = rect;
+            state.natural_size = false;
+            return rect;
         }
 
         pub fn setState(
@@ -1096,6 +1171,8 @@ pub fn Policy(
                     false else false,
                 .resizing = state_value.resizing,
                 .suspended = !visible,
+                .natural_size = state_value.mode == .floating and state_value.natural_size and
+                    !state_value.fullscreen and !state_value.maximized,
             };
         }
 

@@ -191,6 +191,15 @@ the former primary follow it without changing workspace number; windows from
 any disconnected secondary output also move to primary. Matched key
 press/release pairs are consumed before client seat delivery.
 
+New windows tile by default. Following Sway and Keywork, a window floats when
+its initial commit has an xdg-shell parent, sets `xdg_dialog_v1` modal, or fixes
+either axis with equal nonzero minimum and maximum size. The bare dialog hint
+does not float a window, because GTK4 attaches it to every toplevel.
+Automatically floated windows receive a 0x0 configure so the client chooses its
+size; their first sized buffer is centered over the parent or, without one, in
+the output work area. Session-restored state overrides these rules, and a window
+keeps its mode if its hints change after mapping.
+
 Hardware keys work without modifiers and require `wpctl` (WirePlumber) and
 `brightnessctl` on the systemd user manager's executable search path:
 
