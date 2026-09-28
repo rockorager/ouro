@@ -1140,6 +1140,8 @@ pub fn Coordinator(comptime protocol: type) type {
         lock_surface_ids: []SessionLockAdapter.LockSurfaceId,
         inhibitor_surface_ids: []Adapter.SurfaceId,
         session_lock_input_ready: bool = false,
+        /// Lock whose input revocation completed; null while fail-closed.
+        session_lock_input_owner: ?SessionLockAdapter.LockId = null,
         desktop_timer: ?timer.Handle = null,
         desktop_timer_canceling: bool = false,
         idle_timer: ?timer.Handle = null,
@@ -3970,6 +3972,17 @@ pub fn Coordinator(comptime protocol: type) type {
                             else => return err,
                         };
             }
+            // Lock surfaces are unmanaged, so pointer policy never focuses
+            // them. With one lock surface per output, a press must move keys
+            // to the output the user is looking at, as touch does above.
+            if (self.sessionLockActive() and event == .pointer_button and event.pointer_button.pressed) {
+                if (self.seat_adapter.pointerState().focus) |target|
+                    if (self.sessionLockScene(target.surface) != null)
+                        self.setKeyboardSurface(target.surface) catch |err| switch (err) {
+                            error.Exhausted => return false,
+                            else => return err,
+                        };
+            }
             if (!self.input_relative_accepted) {
                 if (!self.sessionLockActive() and !self.input_pointer_consumed)
                     self.relative_pointer_adapter.consume(event) catch return false;
@@ -6535,6 +6548,11 @@ pub fn Coordinator(comptime protocol: type) type {
             return null;
         }
 
+        fn focusedSessionLockSurface(self: *Self) ?Adapter.SurfaceId {
+            const focus = self.seat_adapter.keyboard_focus orelse return null;
+            return if (self.sessionLockScene(focus.surface) != null) focus.surface else null;
+        }
+
         fn sessionLockChanged(self: *Self) !void {
             const unlocked = self.session_lock_adapter.takeUnlocked();
             try self.syncHotkeyPolicy();
@@ -6545,60 +6563,78 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.sessionLockActive()) {
                 // Remember revocation even if unlocking precedes the GPU CQE.
                 if (self.pending_toplevel_capture) |*pending| pending.denied = true;
-                // A down retained before seat acceptance has no contact for
-                // touchCancel to retire. Drop its cached background delivery,
-                // preserving the admission stages that already completed.
-                self.input_touch_delivery = .{};
                 if (self.session_lock_adapter.pendingLock() != null) {
                     for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                         physical.session_lock_frame = null;
                         physical.session_lock_presented = false;
                     }
                 }
-                self.session_lock_input_ready = false;
-                self.interaction.cancelKeyConsumerInput();
-                try self.syncConsumerTimer();
-                @memset(&self.input_method_key_owners, null);
-                if (self.interaction.interactionMode() == .interactive)
-                    try self.desktop.endInteractive(self.interaction.interactionMode().interactive.target.toplevel);
-                self.interaction.suspendClientFocus();
-                var input_ready = true;
-                self.input_method_adapter.setGrabInhibited(true) catch {
-                    input_ready = false;
-                };
-                self.virtual_keyboard_adapter.setInhibited(&self.seat_adapter, true) catch {
-                    input_ready = false;
-                };
-                self.tablet_state.suspendFocus(0) catch {
-                    input_ready = false;
-                };
-                _ = self.tablet_adapter.drainState(&self.tablet_state) catch {
-                    input_ready = false;
-                };
-                self.data_device_adapter.cancelDrag() catch {
-                    input_ready = false;
-                };
-                const pointer = self.seat_adapter.pointerState();
-                self.seat_adapter.setPointerFocus(null, pointer.point) catch {
-                    input_ready = false;
-                };
-                self.seat_adapter.cancelPointerGrab() catch {
-                    input_ready = false;
-                };
-                self.seat_adapter.touchCancel() catch {
-                    input_ready = false;
-                };
-                self.setKeyboardSurface(self.firstSessionLockSurface()) catch |err| switch (err) {
-                    error.Exhausted => input_ready = false,
-                    else => return err,
-                };
-                self.session_lock_input_ready = input_ready;
+                const owner = self.session_lock_adapter.activeLock();
+                if (self.session_lock_input_ready and std.meta.eql(self.session_lock_input_owner, owner)) {
+                    // Lock surface commits and output changes land here after
+                    // input already belongs to this lock. Revoking again would
+                    // drop the locker's own pointer hover, button grab, and
+                    // chosen keyboard surface on every frame it draws. Only
+                    // move keyboard focus when it is not on a mapped lock
+                    // surface, such as when the first surface maps.
+                    self.setKeyboardSurface(self.focusedSessionLockSurface()) catch |err| switch (err) {
+                        error.Exhausted => self.session_lock_input_ready = false,
+                        else => return err,
+                    };
+                    // Enter a newly mapped lock surface under a stationary pointer.
+                    self.pointer_reconcile_pending = true;
+                } else {
+                    // A down retained before seat acceptance has no contact for
+                    // touchCancel to retire. Drop its cached background delivery,
+                    // preserving the admission stages that already completed.
+                    self.input_touch_delivery = .{};
+                    self.session_lock_input_ready = false;
+                    self.session_lock_input_owner = owner;
+                    self.interaction.cancelKeyConsumerInput();
+                    try self.syncConsumerTimer();
+                    @memset(&self.input_method_key_owners, null);
+                    if (self.interaction.interactionMode() == .interactive)
+                        try self.desktop.endInteractive(self.interaction.interactionMode().interactive.target.toplevel);
+                    self.interaction.suspendClientFocus();
+                    var input_ready = true;
+                    self.input_method_adapter.setGrabInhibited(true) catch {
+                        input_ready = false;
+                    };
+                    self.virtual_keyboard_adapter.setInhibited(&self.seat_adapter, true) catch {
+                        input_ready = false;
+                    };
+                    self.tablet_state.suspendFocus(0) catch {
+                        input_ready = false;
+                    };
+                    _ = self.tablet_adapter.drainState(&self.tablet_state) catch {
+                        input_ready = false;
+                    };
+                    self.data_device_adapter.cancelDrag() catch {
+                        input_ready = false;
+                    };
+                    const pointer = self.seat_adapter.pointerState();
+                    self.seat_adapter.setPointerFocus(null, pointer.point) catch {
+                        input_ready = false;
+                    };
+                    self.seat_adapter.cancelPointerGrab() catch {
+                        input_ready = false;
+                    };
+                    self.seat_adapter.touchCancel() catch {
+                        input_ready = false;
+                    };
+                    self.setKeyboardSurface(self.firstSessionLockSurface()) catch |err| switch (err) {
+                        error.Exhausted => input_ready = false,
+                        else => return err,
+                    };
+                    self.session_lock_input_ready = input_ready;
+                }
             } else if (unlocked) {
                 for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                     physical.session_lock_frame = null;
                     physical.session_lock_presented = false;
                 }
                 self.session_lock_input_ready = false;
+                self.session_lock_input_owner = null;
                 try self.input_method_adapter.setGrabInhibited(false);
                 try self.virtual_keyboard_adapter.setInhibited(&self.seat_adapter, false);
                 try self.syncLayerKeyboardFocus();
@@ -6613,9 +6649,11 @@ pub fn Coordinator(comptime protocol: type) type {
             // Enforce lock isolation at the shared focus boundary, including
             // layer commits/removal and keymap-triggered focus reconciliation.
             // With no mapped lock surface (including locker loss), focus nobody.
+            // Keep the lock surface the user chose on another output rather
+            // than snapping back to the first one on unrelated reconciles.
             const surface = if (self.sessionLockActive() and
                 (requested == null or self.sessionLockScene(requested.?) == null))
-                self.firstSessionLockSurface()
+                self.focusedSessionLockSurface() orelse self.firstSessionLockSurface()
             else
                 self.popupKeyboardSurface() orelse requested;
             const focus: ?protocol_text_input.Focus = if (surface) |id| focus: {
