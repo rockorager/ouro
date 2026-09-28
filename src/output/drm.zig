@@ -52,6 +52,9 @@ pub const Config = struct {
     /// Prefer HDR automatically when the connector and render path support it.
     /// Explicit non-default output descriptions are never replaced by this policy.
     enable_hdr: bool = true,
+    /// An output rule explicitly asked for HDR. This also enables automatic
+    /// HDR through DP-to-HDMI converters, which is otherwise withheld.
+    hdr_requested: bool = false,
     /// SDR white on automatic HDR outputs, in cd/m². Null uses the ITU-R
     /// BT.2408 graphics white of 203 cd/m².
     sdr_white: ?f32 = null,
@@ -2252,7 +2255,19 @@ fn automaticHdrDescription(
 ) ?render.color.Description {
     if (!config.enable_hdr or !renderer_capable or
         !std.meta.eql(config.output_color_description, render.color.Description.desktop)) return null;
-    const capabilities = snapshot.selectedConnector().properties.hdr_capabilities;
+    const properties = snapshot.selectedConnector().properties;
+    // Kernels can accept BT.2020 colorimetry for a DP-to-HDMI converter that
+    // cannot forward it (i915 without DP_VSC_SDP_EXT_FOR_COLORIMETRY_SUPPORTED
+    // omits the VSC SDP). The display then reads BT.2020 pixels as BT.709 and
+    // looks washed out, and no atomic test reveals it.
+    if (properties.hdmi_converter and !config.hdr_requested) {
+        std.log.info(
+            "output {d}: automatic HDR skipped behind a DP-to-HDMI converter; set \"hdr\": true to force it",
+            .{snapshot.selectedConnector().id},
+        );
+        return null;
+    }
+    const capabilities = properties.hdr_capabilities;
     const transfer: render.color.TransferFunction = if (capabilities.pq)
         .st2084_pq
     else if (capabilities.hlg)
@@ -2399,6 +2414,20 @@ test "drm output: HDR10 metadata follows the configured output description" {
     try std.testing.expect(automaticHdrDescription(snapshot, config, true) == null);
     config.enable_hdr = true;
     try std.testing.expect(automaticHdrDescription(snapshot, config, false) == null);
+
+    // A DP-to-HDMI converter may drop BT.2020 colorimetry; only an explicit
+    // request enables HDR through one.
+    var converter = connector;
+    converter.properties.hdmi_converter = true;
+    var converter_snapshot = snapshot;
+    converter_snapshot.connectors = &.{converter};
+    try std.testing.expect(automaticHdrDescription(converter_snapshot, config, true) == null);
+    config.hdr_requested = true;
+    try std.testing.expectEqual(
+        render.color.TransferFunction.st2084_pq,
+        automaticHdrDescription(converter_snapshot, config, true).?.transfer,
+    );
+    config.hdr_requested = false;
 
     // Adding/removing a monitor profile must change the negotiated mode, not
     // combine device-encoded SDR pixels with an HDR connector configuration.

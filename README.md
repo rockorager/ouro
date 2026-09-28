@@ -622,6 +622,14 @@ changes recreate the output so transfer encoding and KMS HDR metadata,
 colorspace, and bit depth change together. A monitor's Standard preset may
 still advertise HDR; use `"hdr": false` to request SDR explicitly.
 
+HDR is not chosen automatically on a DP connector whose `subconnector` is
+HDMI, meaning a DP-to-HDMI converter such as a USB-C dongle. Kernels can accept
+BT.2020 colorimetry for a converter that cannot forward it (i915 omits the
+colorimetry SDP when the converter lacks `DP_VSC_SDP_EXT_FOR_COLORIMETRY_SUPPORTED`),
+and the display then shows BT.2020 pixels as BT.709, washed out. No atomic test
+reveals this. An explicit `"hdr": true` still enables HDR through a converter
+known to work.
+
 HDR outputs declare the panel's own range from its EDID HDR static metadata
 (desired maximum and minimum content luminance), falling back to a nominal
 1000 cd/m² when the display declares none, so the panel does not compress the

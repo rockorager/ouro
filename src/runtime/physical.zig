@@ -548,6 +548,8 @@ pub fn Coordinator(comptime protocol: type) type {
             output_profile: ?*engine_settings.OutputProfile = null,
             // Effective preference used at activation, not the negotiated transfer.
             hdr_preference: bool = true,
+            // An explicit "hdr": true, which also allows HDR through DP-to-HDMI converters.
+            hdr_requested: bool = false,
             // SDR white requested for an HDR output at activation, in cd/m².
             sdr_white: ?f64 = null,
             gamma_owner: ?drm_gamma.Owner = null,
@@ -5330,6 +5332,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 // value recreates the output like an HDR preference change.
                 const hdr_changed = physical.hdr_preference !=
                     (self.output_config.enable_hdr and (settings.hdr orelse true)) or
+                    physical.hdr_requested != (self.output_config.enable_hdr and settings.hdr == true) or
                     !std.meta.eql(physical.sdr_white, settings.sdr_white);
                 const profile_changed = !sameOutputProfile(
                     physical.output_profile,
@@ -5401,6 +5404,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 // value recreates the output like an HDR preference change.
                 const hdr_changed = physical.hdr_preference !=
                     (self.output_config.enable_hdr and (settings.hdr orelse true)) or
+                    physical.hdr_requested != (self.output_config.enable_hdr and settings.hdr == true) or
                     !std.meta.eql(physical.sdr_white, settings.sdr_white);
                 const desired_profile = self.outputSettingsForActivation().outputProfile(settings.icc_profile);
                 const profile_changed = !sameOutputProfile(
@@ -8858,6 +8862,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 snapshot,
             );
             output_config.enable_hdr = output_config.enable_hdr and (settings.hdr orelse true);
+            output_config.hdr_requested = output_config.enable_hdr and settings.hdr == true;
             output_config.sdr_white = if (settings.sdr_white) |nits| @floatCast(nits) else null;
             const selected_profile = self.outputSettingsForActivation().outputProfile(settings.icc_profile);
             if (selected_profile) |profile| {
@@ -8980,6 +8985,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 );
             }
             physical.hdr_preference = output_config.enable_hdr;
+            physical.hdr_requested = output_config.hdr_requested;
             physical.sdr_white = settings.sdr_white;
             output_committed = true;
             _ = retained_visibility_changed;

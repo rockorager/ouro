@@ -101,6 +101,9 @@ pub const ConnectorProperties = struct {
     hdr_output_metadata: BlobProperty = .{},
     max_bpc: RangeProperty = .{},
     hdr_capabilities: HdrCapabilities = .{},
+    /// A DP connector whose "subconnector" reports an HDMI downstream port:
+    /// a DP-to-HDMI protocol converter sits between it and the display.
+    hdmi_converter: bool = false,
 };
 pub const CrtcProperties = struct {
     active: u32,
@@ -513,7 +516,28 @@ fn connectorProperties(fd: std.posix.fd_t, props: *c.drmModeObjectProperties) !C
         .hdr_output_metadata = try optionalBlobProperty(fd, props, "HDR_OUTPUT_METADATA"),
         .max_bpc = try optionalRangeProperty(fd, props, "max bpc"),
         .hdr_capabilities = try optionalHdrCapabilities(fd, props),
+        .hdmi_converter = try optionalHdmiConverter(fd, props),
     };
+}
+
+fn optionalHdmiConverter(fd: std.posix.fd_t, props: *c.drmModeObjectProperties) !bool {
+    const found = try propertyByName(fd, props, "subconnector") orelse return false;
+    defer c.drmModeFreeProperty(found.property);
+    return subconnectorIsHdmi(found.property, found.value);
+}
+
+/// Unrecognized property shapes report no converter rather than failing the
+/// connector: the subconnector is advisory.
+fn subconnectorIsHdmi(property: *const c.drmModePropertyRes, value: u64) bool {
+    if (property.*.flags & c.DRM_MODE_PROP_ENUM == 0 or property.*.count_enums < 0) return false;
+    var index: usize = 0;
+    while (index < @as(usize, @intCast(property.*.count_enums))) : (index += 1) {
+        const entry = property.*.enums[index];
+        if (entry.value != value) continue;
+        // Only DP connectors name a subconnector "HDMI".
+        return std.mem.eql(u8, std.mem.sliceTo(entry.name[0..], 0), "HDMI");
+    }
+    return false;
 }
 
 fn crtcProperties(fd: std.posix.fd_t, props: *c.drmModeObjectProperties) !CrtcProperties {
@@ -852,6 +876,30 @@ test "drm platform: color properties preserve driver values" {
         .minimum = 8,
         .maximum = 16,
     }, try parseRangeProperty(&max_bpc, 10));
+}
+
+test "drm platform: subconnector identifies DP-to-HDMI converters" {
+    const names = [_][]const u8{ "Unknown", "VGA", "DVI-D", "HDMI", "DP", "Native" };
+    const values = [_]u64{ 0, 1, 3, 11, 10, 15 };
+    var enums: [names.len]c.struct_drm_mode_property_enum = undefined;
+    for (&enums, names, values) |*entry, name, value| {
+        entry.* = std.mem.zeroes(c.struct_drm_mode_property_enum);
+        @memcpy(entry.name[0..name.len], name);
+        entry.value = value;
+    }
+    var property = std.mem.zeroes(c.drmModePropertyRes);
+    property.flags = c.DRM_MODE_PROP_ENUM | c.DRM_MODE_PROP_IMMUTABLE;
+    property.count_enums = enums.len;
+    property.enums = &enums;
+    try std.testing.expect(subconnectorIsHdmi(&property, 11));
+    try std.testing.expect(!subconnectorIsHdmi(&property, 3));
+    try std.testing.expect(!subconnectorIsHdmi(&property, 1));
+    try std.testing.expect(!subconnectorIsHdmi(&property, 10));
+    try std.testing.expect(!subconnectorIsHdmi(&property, 15));
+    try std.testing.expect(!subconnectorIsHdmi(&property, 0));
+    try std.testing.expect(!subconnectorIsHdmi(&property, 99));
+    property.flags = c.DRM_MODE_PROP_RANGE;
+    try std.testing.expect(!subconnectorIsHdmi(&property, 11));
 }
 
 test "drm platform: malformed color property types are rejected" {
