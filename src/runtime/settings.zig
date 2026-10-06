@@ -159,6 +159,7 @@ const ProfileBinding = struct {
 
 pub const Snapshot = struct {
     arena: std.heap.ArenaAllocator,
+    backdrop_blur_transition_ms: u32 = 180,
     input_rules: []const InputRule,
     output_rules: []const OutputRule,
     profiles: []const ProfileBinding,

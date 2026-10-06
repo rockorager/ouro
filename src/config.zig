@@ -77,6 +77,8 @@ pub const Binding = struct {
 pub const General = struct {
     focus_follows_mouse: bool = false,
     experimental_hotkeys: bool = true,
+    /// Full clear-to-blurred traversal; zero applies backdrop changes instantly.
+    backdrop_blur_transition_ms: u32 = 180,
     inner_gap: u32 = 12,
     outer_gap: u32 = 12,
     /// Reserve center and side tiling bands; shrink side tiles and floating
@@ -980,6 +982,37 @@ test "rule ranges strict fields and partial merge removals" {
     });
     defer snapshot.deinit();
     try std.testing.expect(snapshot.input_rules[0].match.name == null);
+}
+
+test "settings: backdrop blur transition defaults merges and validates milliseconds" {
+    var defaults = try parseSource(std.testing.allocator, "{}");
+    defer defaults.deinit();
+    try std.testing.expectEqual(@as(u32, 180), defaults.general.backdrop_blur_transition_ms);
+    var disabled = try mergeSources(std.testing.allocator, &.{
+        \\{"general":{"backdrop_blur_transition_ms":375}}
+        ,
+        \\{"general":{"backdrop_blur_transition_ms":0}}
+        ,
+    });
+    defer disabled.deinit();
+    try std.testing.expectEqual(@as(u32, 0), disabled.general.backdrop_blur_transition_ms);
+    var restored = try mergeSources(std.testing.allocator, &.{
+        \\{"general":{"backdrop_blur_transition_ms":0}}
+        ,
+        \\{"general":{"backdrop_blur_transition_ms":null}}
+        ,
+    });
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(u32, 180), restored.general.backdrop_blur_transition_ms);
+    try std.testing.expectError(error.InvalidRange, parseSource(std.testing.allocator,
+        \\{"general":{"backdrop_blur_transition_ms":-1}}
+    ));
+    try std.testing.expectError(error.InvalidRange, parseSource(std.testing.allocator,
+        \\{"general":{"backdrop_blur_transition_ms":4294967296}}
+    ));
+    try std.testing.expectError(error.InvalidType, parseSource(std.testing.allocator,
+        \\{"general":{"backdrop_blur_transition_ms":1.5}}
+    ));
 }
 
 test "peripheral: general settings parse and default off" {

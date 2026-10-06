@@ -267,6 +267,21 @@ A validated replacement waits for pending input/output transactions; a newer
 valid reload replaces that waiting candidate. Output changes complete
 asynchronously and can roll back if hardware activation fails.
 
+`general.backdrop_blur_transition_ms` sets the full clear-to-blurred transition
+time in integer milliseconds (default `180`). Set it to `0` to apply blur
+changes instantly; this disables the animation, not the blur. Reversals take
+proportionally less time from the current amount. Reloading retimes an active
+transition without a jump; reloading `0` immediately paints its endpoint.
+Surface content and tint opacity remain independent.
+
+```json
+{
+  "general": {
+    "backdrop_blur_transition_ms": 0
+  }
+}
+```
+
 Removing a configuration-owned scale restores that output's original scale.
 An output with no old or new scale rule retains changes made by external
 display tools. Mode, position, and enablement currently retain their active

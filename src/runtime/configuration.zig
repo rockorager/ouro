@@ -11,6 +11,7 @@ pub fn Prepared(comptime Runtime: type) type {
         pub fn init(allocator: std.mem.Allocator, snapshot: *const config.Snapshot) !@This() {
             var engine = try Runtime.EngineSettings.init(allocator, snapshot.input_rules, snapshot.output_rules);
             errdefer engine.deinit();
+            engine.backdrop_blur_transition_ms = snapshot.general.backdrop_blur_transition_ms;
             const bindings = try Runtime.Bindings.snapshotFromReferenceConfig(allocator, snapshot);
             return .{
                 .engine = engine,

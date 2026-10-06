@@ -5,6 +5,7 @@ Run the compositor in another terminal:
   zig-out/bin/ouro --headless --renderer=pixman --headless-output=320x180@60 \
     --socket=/tmp/ouro-blur.sock --headless-frame-dump=/tmp/ouro-blur.ppm
 Then: uv run --with pillow python test/blur-crossfade.py [--capture /tmp/blur.gif]
+Use --transition-ms to match general.backdrop_blur_transition_ms, including 0.
 This is a synthetic layer-shell client, not ouroshell.
 """
 
@@ -21,7 +22,13 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--socket", default="/tmp/ouro-blur.sock")
 parser.add_argument("--frame-dump", type=Path, default=Path("/tmp/ouro-blur.ppm"))
 parser.add_argument("--capture", type=Path)
+parser.add_argument("--transition-ms", type=int, default=180)
 args = parser.parse_args()
+if args.transition_ms < 0:
+    parser.error("--transition-ms must be nonnegative")
+transition_seconds = args.transition_ms / 1000
+# Check autonomous intermediate frames, not the software renderer's frame rate.
+minimum_frames = 3 if args.transition_ms >= 100 else 1
 s = socket.socket(socket.AF_UNIX)
 s.connect(args.socket)
 pending = b""
@@ -184,24 +191,27 @@ collect(0.1, "background")
 background_frame = frames[-1][1]
 send(effect, 1, ints(region))
 attach(fg, buffer(foreground))
-assert collect(0.32, "appear") >= 5
+assert collect(transition_seconds + 0.14, "appear") >= minimum_frames
 assert collect(0.10, "settled") == 0
 appear = [f for f in frames if f[2] == "appear"]
 reds = [f[1].getpixel((1, 1))[0] for f in appear]
-assert reds[0] > reds[-1] + 20, "blur appeared at full strength without a crossfade"
+if args.transition_ms == 0:
+    assert min(reds) == max(reds), "zero-duration blur animated instead of snapping"
+elif args.transition_ms >= 100:
+    assert reds[0] > reds[-1] + 20, "blur appeared at full strength without a crossfade"
 assert all(a >= b for a, b in zip(reds, reds[1:])), "fade-in reversed unexpectedly"
 send(fg, 6)  # An ordinary retained commit must not restart animation.
 assert collect(0.10, "ordinary-commit") == 0
 send(effect, 1, ints(0))
 send(fg, 6)
-assert collect(0.065, "remove-partial") >= 2
+assert collect(max(0.05, transition_seconds / 3), "remove-partial") >= 1
 send(effect, 1, ints(region))
 send(fg, 6)
-assert collect(0.22, "reverse") >= 2
+assert collect(transition_seconds + 0.14, "reverse") >= 1
 assert collect(0.10, "settled") == 0
 send(effect, 1, ints(0))
 send(fg, 6)
-assert collect(0.3, "remove-full") >= 5
+assert collect(transition_seconds + 0.12, "remove-full") >= minimum_frames
 assert collect(0.10, "settled") == 0
 expected = tuple(round(c * 178 / 255) for c in background_frame.getpixel((1, 1)))
 assert all(abs(a - b) <= 1 for a, b in zip(frames[-1][1].getpixel((1, 1)), expected)), (
@@ -215,7 +225,7 @@ assert all(
 ), "surface content changed during blur"
 send(effect, 1, ints(region))
 send(fg, 6)
-collect(0.065, "reappear")
+collect(max(0.05, transition_seconds / 3), "reappear")
 attach(fg, 0)
 collect(0.12, "unmapped")
 assert collect(0.10, "unmapped-settled") == 0

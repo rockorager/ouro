@@ -207,7 +207,7 @@ test "configuration installs before physical startup claims an output" {
 test "configuration JSON prepares coordinator policy rules and bindings" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"general":{"focus_follows_mouse":true,"inner_gap":37,"outer_gap":9},"bindings":{"super+q":null},"input_rules":{"trackpad":{"match":{"type":"touchpad"},"settings":{"natural_scroll":true}}},"output_rules":{"panel":{"match":{"connector_id":10},"settings":{"scale":1.5}}}}
+        \\{"general":{"focus_follows_mouse":true,"inner_gap":37,"outer_gap":9,"backdrop_blur_transition_ms":375},"bindings":{"super+q":null},"input_rules":{"trackpad":{"match":{"type":"touchpad"},"settings":{"natural_scroll":true}}},"output_rules":{"panel":{"match":{"connector_id":10},"settings":{"scale":1.5}}}}
     ;
     var snapshot = try ouro.config.mergeSources(allocator, &.{json});
     defer snapshot.deinit();
@@ -218,6 +218,7 @@ test "configuration JSON prepares coordinator policy rules and bindings" {
     try std.testing.expect(prepared.policy.focus_follows_mouse);
     try std.testing.expectEqual(@as(u32, 37), prepared.policy.inner_gap);
     try std.testing.expectEqual(@as(u32, 9), prepared.policy.outer_gap);
+    try std.testing.expectEqual(@as(u32, 375), prepared.engine.backdrop_blur_transition_ms);
     try std.testing.expectEqual(@as(usize, 1), prepared.engine.input_rules.len);
     try std.testing.expectEqual(.touchpad, prepared.engine.input_rules[0].match.type.?);
     try std.testing.expectEqual(@as(usize, 1), prepared.engine.output_rules.len);
@@ -238,6 +239,7 @@ test "configuration JSON prepares coordinator policy rules and bindings" {
     try std.testing.expectEqual(@as(u32, 37), coordinator.desktop.policy.inner_gap);
     try std.testing.expectEqual(@as(u32, 9), coordinator.desktop.policy.outer_gap);
     try std.testing.expect(coordinator.desktop.policy.focus_follows_mouse);
+    try std.testing.expectEqual(@as(u32, 375), coordinator.settings.backdrop_blur_transition_ms);
     try std.testing.expectEqualStrings("trackpad", coordinator.settings.input_rules[0].name);
     try std.testing.expectEqual(@as(u32, 180), coordinator.settings.output_rules[0].settings.scale_120.?);
     try coordinator.requestStop();
