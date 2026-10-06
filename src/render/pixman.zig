@@ -484,8 +484,11 @@ pub const Renderer = struct {
                 const destination_offset = @as(usize, @intCast(y)) * destination_stride +
                     @as(usize, @intCast(x)) * 4;
                 const bytes: *[4]u8 = @ptrCast(destination[destination_offset..][0..4].ptr);
-                const value = self.blur_a.items[source_index];
-                bytes.* = @bitCast(value);
+                const blurred: [4]u8 = @bitCast(self.blur_a.items[source_index]);
+                for (bytes, blurred) |*original, filtered| {
+                    original.* = @intCast((@as(u32, original.*) * (255 - sample.blur_alpha) +
+                        @as(u32, filtered) * sample.blur_alpha + 127) / 255);
+                }
                 if (list.output_format == .xrgb8888) bytes[3] = 255;
             }
         }
@@ -1336,6 +1339,21 @@ test "render: pixman backdrop blur smooths transparency and skips opaque coverag
     for (0..3) |_| {
         try renderer.draw(list, partial, &destination, 256);
         try std.testing.expectEqualSlices(u8, &full_result, &destination);
+    }
+
+    var fading_samples = samples;
+    var fading_list = list;
+    fading_list.samples = &fading_samples;
+    for ([_]u8{ 0, 63, 191, 255, 0 }) |alpha| {
+        fading_samples[1].blur_alpha = alpha;
+        try std.testing.expectEqual(alpha != 0, render.hasVisibleBlur(fading_samples[1]));
+        try renderer.draw(fading_list, plan, &destination, 256);
+        for (0..32) |x| {
+            const expected: u8 = @intCast((@as(u32, full_result[x * 4]) * alpha + 127) / 255);
+            try std.testing.expectEqual(expected, destination[x * 4]);
+        }
+        // Foreground content is never faded by the backdrop amount.
+        try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, destination[32 * 4 ..][0..4]);
     }
 
     var opaque_renderer = try Renderer.init(std.testing.allocator, .{

@@ -5124,7 +5124,8 @@ fn recordBlurRegions(
     for (stage.passes, 0..) |pass, index| {
         const set_index: usize = if (index == 0) 0 else if (index == blur.passes - 1) 3 else if (index % 2 == 1) 1 else 2;
         c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &self.blur_scratch.?.descriptor_sets[set_index], 0, null);
-        for (pass.items) |exact| recordBlurDispatch(self, target, frame, exact, index, scale);
+        const alpha = if (index == blur.passes - 1) frame.sources[sample_index].blur_alpha else 255;
+        for (pass.items) |exact| recordBlurDispatch(self, target, frame, exact, index, scale, alpha);
         recordBlurBarrier(target);
         if (trace_gpu and index == blur.levels - 1) target.gpu_trace.mark(target.command_buffer, .blur_downsample);
     }
@@ -5138,13 +5139,14 @@ fn recordBlurDispatch(
     rect: render.Rect,
     pass: usize,
     scale: f32,
+    alpha: u8,
 ) void {
     const source = blur.levelSize(frame.output, blur.sourceLevel(pass));
     const destination = blur.levelSize(frame.output, blur.targetLevel(pass));
     const push: [12]u32 = .{
         source.width,                      source.height,                destination.width, destination.height,
         @intCast(rect.x),                  @intCast(rect.y),             rect.width,        rect.height,
-        @intFromBool(pass >= blur.levels), @bitCast(blur.offset(scale)), 0,                 0,
+        @intFromBool(pass >= blur.levels), @bitCast(blur.offset(scale)), alpha,             0,
     };
     c.vkCmdPushConstants(target.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(@TypeOf(push)), &push);
     c.vkCmdDispatch(target.command_buffer, (rect.width + 7) / 8, (rect.height + 7) / 8, 1);

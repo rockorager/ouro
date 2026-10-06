@@ -1,13 +1,13 @@
 #version 450
 
 layout(local_size_x = 8, local_size_y = 8) in;
-layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D target_image;
+layout(set = 0, binding = 5, rgba16f) uniform image2D target_image;
 layout(set = 0, binding = 8) uniform sampler2D source_image;
 
 layout(push_constant) uniform Blur {
     uvec4 sizes; // logical source width/height, destination width/height
     uvec4 damage;
-    uvec4 filter_info; // upsample, offset bits, unused, unused
+    uvec4 filter_info; // upsample, offset bits, blur alpha (0..255), unused
 } frame;
 
 // Manual bilinear filtering clamps to the logical level size in `sizes`,
@@ -44,5 +44,9 @@ void main() {
             + sampled(position + vec2(0.0, -2.0 * offset))
             + sampled(position + vec2(0.0, 2.0 * offset))) / 12.0;
     }
+    // Only the final upsample blends. Linear scratch still contains the sharp
+    // backdrop; intermediate pyramid levels always run at full strength.
+    if (frame.filter_info.z != 255u)
+        color = mix(imageLoad(target_image, pixel), color, float(frame.filter_info.z) / 255.0);
     imageStore(target_image, pixel, color);
 }

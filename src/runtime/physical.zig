@@ -560,6 +560,9 @@ pub fn Coordinator(comptime protocol: type) type {
             reconfigure: ?OutputReconfigure = null,
             damage_requested: u64 = 0,
             damage_applied: u64 = 0,
+            // Per-output watermark: another output reaching a fade endpoint
+            // must not consume this output's final repaint.
+            blur_frame_ns: u64 = 0,
             screencopy_generation: u64 = 1,
             pending_screencopy: ?PendingScreencopy = null,
             pending_image_copy: ?PendingImageCopy = null,
@@ -774,6 +777,7 @@ pub fn Coordinator(comptime protocol: type) type {
             window_geometry: ?geometry.Rect = null,
             content: OwnedValue(Adapter.Content) = .{},
             effects: ?surface_state.SurfaceRegions.EffectSnapshot = null,
+            blur_fade: BlurFade = .{},
             rendered: ?render_content.Handle = null,
             presentation: ?Presentations.Token = null,
             sample: ?render_list.AppliedSurface = null,
@@ -9765,6 +9769,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 else => return err,
             };
             if (trace) |*work| work.mark("source-finish-end");
+            const effect_now = try monotonicNs();
             const token = self.presentations.admitImported(.{}) catch |err| switch (err) {
                 error.Exhausted => return false,
                 else => return err,
@@ -9774,10 +9779,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 content.surface.sequence,
                 output_api.presentationIdentity(token),
             ) catch unreachable;
-            const effects = content.effects.take();
-            if (layer.effects) |*previous_effects| previous_effects.deinit();
-            layer.effects = effects;
-            const stable_effects = &layer.effects.?;
             // All source, geometry, upload, identity, and presentation
             // admission has succeeded. Only this non-fallible edge publishes
             // the renderer-owned version, consuming a compatible previous
@@ -9791,7 +9792,7 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             if (trace) |*work| work.mark("content-publish-end");
             prepared_owned = false;
-            const sample: render_list.AppliedSurface = .{
+            var sample: render_list.AppliedSurface = .{
                 .sample = binding.sample,
                 .presentation = binding.presentation,
                 .source = render_device.content.resolve(rendered) catch unreachable,
@@ -9809,9 +9810,9 @@ pub fn Coordinator(comptime protocol: type) type {
                     .width = content.surface.size.width,
                     .height = content.surface.size.height,
                 },
-                .opaque_region = stable_effects.opaque_operations,
-                .blur_region = stable_effects.blur_operations,
             };
+            if (!layer.active) layer.blur_fade = .{};
+            layer.blur_fade.replaceEffects(&layer.effects, content.effects.take(), &sample, effect_now);
             const published = .{
                 .peer = candidate.peer,
                 .surface = candidate.surface,
@@ -9990,6 +9991,7 @@ pub fn Coordinator(comptime protocol: type) type {
             sample.opaque_region = content.effects.opaque_operations;
             sample.blur_region = content.effects.blur_operations;
             if (retainedSampleUnchanged(layer.sample.?, sample) and
+                layer.blur_fade.requested == render.hasVisibleBlur(sample) and
                 content.surface.surface_damage.count == 0 and
                 content.surface.buffer_damage.count == 0 and
                 content.frame_callbacks == null and
@@ -10010,6 +10012,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.stats.applied += 1;
                 return true;
             }
+            const effect_now = try monotonicNs();
             const token = self.presentations.admitImported(.{}) catch |err| switch (err) {
                 error.Exhausted => return false,
                 else => return err,
@@ -10051,11 +10054,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 retained.deinit();
                 layer.content.clear();
             }
-            const effects = published.content.effects.take();
-            if (layer.effects) |*previous_effects| previous_effects.deinit();
-            layer.effects = effects;
-            sample.opaque_region = layer.effects.?.opaque_operations;
-            sample.blur_region = layer.effects.?.blur_operations;
+            layer.blur_fade.replaceEffects(&layer.effects, published.content.effects.take(), &sample, effect_now);
             layer.change = .{
                 .previous = previous,
                 .current = damage.SurfaceState.fromSample(sample, .{
@@ -10579,6 +10578,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.frame_change_layers[change_count] = layer;
                 change_count += 1;
             }
+            const blur_frame_ns = try monotonicNs();
+            const animate_blur = try self.prepareBlurFrame(
+                physical.blur_frame_ns,
+                blur_frame_ns,
+                sample_count,
+                &change_count,
+            );
             const capture_request: ?output_api.CaptureRequest = if (physical.pending_screencopy) |pending|
                 if (pending.awaiting_output) .{
                     .token = pending.token,
@@ -10739,6 +10745,8 @@ pub fn Coordinator(comptime protocol: type) type {
                         }
                     }
                     self.stats.submitted += 1;
+                    physical.blur_frame_ns = blur_frame_ns;
+                    if (animate_blur) try output.request(.animation, blur_frame_ns);
                     self.markFrameChangesApplied(
                         @intCast(physical.id.index),
                         self.frame_change_layers[0..change_count],
@@ -10761,6 +10769,43 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.finishOutcome(failure.frame, false);
                 },
             }
+        }
+
+        /// Animation is output work, not a new client commit/presentation.
+        /// Merge with any existing change to preserve the planner's one-change
+        /// per sample contract, including the alpha-zero endpoint.
+        fn prepareBlurFrame(self: *Self, previous_ns: u64, now: u64, sample_count: usize, change_count: *usize) !bool {
+            var animate = false;
+            for (0..sample_count) |index| {
+                const layer = matching: {
+                    for (self.app_layers[0..self.app_layer_count]) |*candidate| {
+                        if (candidate.active and candidate.binding != null and
+                            std.meta.eql(candidate.binding.?, self.frame_bindings[index])) break :matching candidate;
+                    }
+                    continue;
+                };
+                self.frame_samples[index].blur_alpha = layer.blur_fade.alpha(now);
+                if (!layer.blur_fade.needsRepaint(previous_ns)) continue;
+                animate = animate or layer.blur_fade.running(now);
+                var found = false;
+                for (self.frame_changes[0..change_count.*]) |*change| {
+                    const current = change.current orelse continue;
+                    if (!std.meta.eql(current.sample, self.frame_samples[index].sample)) continue;
+                    change.invalidate_bounds = true;
+                    found = true;
+                    break;
+                }
+                if (found) continue;
+                try self.ensureFrameStorage(@max(sample_count, change_count.*) + 1);
+                const sample = self.frame_samples[index];
+                self.frame_changes[change_count.*] = .{
+                    .current = damage.SurfaceState.fromSample(sample, sample.effect_size),
+                    .invalidate_bounds = true,
+                };
+                self.frame_change_layers[change_count.*] = null;
+                change_count.* += 1;
+            }
+            return animate;
         }
 
         fn advanceScreencopyGeneration(
@@ -16000,6 +16045,193 @@ fn translatedPoint(value: geometry.Point, delta: anytype) geometry.Point {
         .x = translatedCoordinate(value.x, delta.x),
         .y = translatedCoordinate(value.y, delta.y),
     };
+}
+
+/// One compositor-owned amount per surface. Reversals travel from the current
+/// amount at the same speed (a full traversal takes 180 ms). Region storage stays
+/// in the layer's snapshot, never in a client commit or an animation callback.
+const BlurFade = struct {
+    const duration_ns = 180 * std.time.ns_per_ms;
+    requested: bool = false,
+    from: f64 = 0,
+    start_ns: u64 = 0,
+    end_ns: u64 = 0,
+
+    fn amount(self: BlurFade, now: u64) f64 {
+        const target: f64 = if (self.requested) 1 else 0;
+        if (now >= self.end_ns) return target;
+        const elapsed: f64 = @floatFromInt(now -| self.start_ns);
+        return self.from + (target - self.from) * elapsed / @as(f64, @floatFromInt(self.end_ns - self.start_ns));
+    }
+
+    fn alpha(self: BlurFade, now: u64) u8 {
+        return @intFromFloat(@round(self.amount(now) * 255));
+    }
+
+    fn running(self: BlurFade, now: u64) bool {
+        return now < self.end_ns;
+    }
+
+    fn needsRepaint(self: BlurFade, previous_ns: u64) bool {
+        return previous_ns < self.end_ns;
+    }
+
+    fn request(self: *BlurFade, requested: bool, now: u64) void {
+        if (self.requested == requested) return;
+        self.from = self.amount(now);
+        self.requested = requested;
+        self.start_ns = now;
+        const distance = if (requested) 1 - self.from else self.from;
+        self.end_ns = now + @as(u64, @intFromFloat(@round(distance * duration_ns)));
+    }
+
+    fn replaceEffects(
+        self: *BlurFade,
+        stored: *?surface_state.SurfaceRegions.EffectSnapshot,
+        incoming: surface_state.SurfaceRegions.EffectSnapshot,
+        sample: *render.SurfaceSample,
+        now: u64,
+    ) void {
+        var effects = incoming;
+        sample.opaque_region = effects.opaque_operations;
+        sample.blur_region = effects.blur_operations;
+        sample.blur_alpha = 255;
+        self.request(render.hasVisibleBlur(sample.*), now);
+        if (stored.*) |*previous| {
+            // A clear request removes protocol geometry immediately, but the
+            // mapped surface keeps its old region until its fade reaches zero.
+            // Swap ownership so repeated empty commits cannot free that region.
+            if (effects.blur_operations.len == 0 and self.running(now))
+                std.mem.swap([]render.RegionOperation, &effects.blur_operations, &previous.blur_operations);
+            previous.deinit();
+        }
+        stored.* = effects;
+        sample.opaque_region = effects.opaque_operations;
+        sample.blur_region = effects.blur_operations;
+    }
+};
+
+test "physical: damage: blur fade reverses continuously and repaints each output endpoint" {
+    const ms = std.time.ns_per_ms;
+    var fade: BlurFade = .{};
+    fade.request(true, 10 * ms);
+    try std.testing.expectEqual(@as(u8, 0), fade.alpha(10 * ms));
+    try std.testing.expectEqual(@as(u8, 85), fade.alpha(70 * ms));
+    fade.request(true, 70 * ms); // ordinary commits never restart the clock
+    try std.testing.expectEqual(@as(u64, 190 * ms), fade.end_ns);
+    fade.request(false, 70 * ms);
+    try std.testing.expectEqual(@as(u8, 85), fade.alpha(70 * ms));
+    try std.testing.expectEqual(@as(u8, 43), fade.alpha(100 * ms));
+    fade.request(true, 100 * ms);
+    try std.testing.expectEqual(@as(u8, 43), fade.alpha(100 * ms));
+    try std.testing.expectEqual(@as(u8, 255), fade.alpha(250 * ms));
+    try std.testing.expect(!fade.running(250 * ms));
+    try std.testing.expect(!fade.needsRepaint(250 * ms));
+    try std.testing.expect(fade.needsRepaint(240 * ms)); // slower output still needs final frame
+    fade.request(false, 300 * ms);
+    try std.testing.expectEqual(@as(u8, 0), fade.alpha(480 * ms));
+    try std.testing.expect(fade.needsRepaint(479 * ms));
+    try std.testing.expect(!fade.needsRepaint(480 * ms));
+}
+
+test "physical: damage: blur removal owns old geometry through commits resize and reversal" {
+    const allocator = std.testing.allocator;
+    const ms = std.time.ns_per_ms;
+    const region = [_]render.RegionOperation{.{ .add = .{ .x = 2, .y = 3, .width = 11, .height = 7 } }};
+    var fade: BlurFade = .{};
+    var effects: ?surface_state.SurfaceRegions.EffectSnapshot = null;
+    defer if (effects) |*value| value.deinit();
+    var sample: render.SurfaceSample = .{
+        .sample = .{ .surface = 1, .commit_sequence = 1 },
+        .presentation = .{ .slot = 0, .generation = 1 },
+        .source = .{ .size = .{ .width = 20, .height = 16 }, .stride = 80, .format = .argb8888_premultiplied, .bytes = &.{} },
+        .crop = render.SourceRect.pixels(0, 0, 20, 16),
+        .destination = .{ .x = 0, .y = 0, .width = 20, .height = 16 },
+        .clip = .{ .x = 0, .y = 0, .width = 20, .height = 16 },
+        .effect_size = .{ .width = 20, .height = 16 },
+    };
+    for ([_]bool{ true, true, false, false, true, false, false }, [_]u64{ 10, 40, 100, 130, 145, 160, 300 }) |requested, time| {
+        sample.destination.x += 2;
+        sample.destination.width += 1;
+        sample.effect_size.width += 1;
+        fade.replaceEffects(&effects, .{
+            .allocator = allocator,
+            .opaque_operations = try allocator.alloc(render.RegionOperation, 0),
+            .blur_operations = try allocator.dupe(render.RegionOperation, if (requested) &region else &.{}),
+        }, &sample, time * ms);
+        if (time == 40) try std.testing.expectEqual(@as(u64, 190 * ms), fade.end_ns);
+        if (time == 130) try std.testing.expectEqual(@as(u8, 85), fade.alpha(time * ms));
+        if (time == 145) try std.testing.expectEqual(@as(u8, 64), fade.alpha(time * ms));
+        if (time < 300) {
+            try std.testing.expectEqualDeep(&region, sample.blur_region);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), sample.blur_region.len);
+            try std.testing.expectEqual(@as(u8, 0), fade.alpha(time * ms));
+        }
+        try std.testing.expectEqual(@as(u8, 255), sample.global_alpha);
+    }
+}
+
+test "physical: damage: blur frames merge damage without commits and stop after both output endpoints" {
+    const C = Coordinator(@import("core_protocol"));
+    const ms = std.time.ns_per_ms;
+    const binding = try output_api.appliedSampleBinding(.{ .index = 1, .generation = 1 }, 7, .{ .slot = 0, .generation = 1 });
+    const region = [_]render.RegionOperation{.{ .add = .{ .x = 0, .y = 0, .width = 20, .height = 16 } }};
+    const sample: render.SurfaceSample = .{
+        .sample = binding.sample,
+        .presentation = binding.presentation,
+        .source = .{ .size = .{ .width = 20, .height = 16 }, .stride = 80, .format = .argb8888_premultiplied, .bytes = &.{} },
+        .crop = render.SourceRect.pixels(0, 0, 20, 16),
+        .destination = .{ .x = 0, .y = 0, .width = 20, .height = 16 },
+        .clip = .{ .x = 0, .y = 0, .width = 20, .height = 16 },
+        .effect_size = .{ .width = 20, .height = 16 },
+        .blur_region = &region,
+    };
+    var layers = [_]C.Layer{.{ .active = true, .binding = binding }};
+    layers[0].blur_fade.request(true, 10 * ms);
+    var bindings = [_]output_api.SampleBinding{binding};
+    var changes: [3]damage.Change = undefined;
+    var change_layers: [3]?*C.Layer = undefined;
+    // Only frame preparation fields are needed; no clients or KMS are involved.
+    var owner: C = undefined;
+    owner.app_layers = &layers;
+    owner.app_layer_count = 1;
+    // Capacity must include scratch growth requested for a new change.
+    var sample_storage: [3]render.SurfaceSample = undefined;
+    sample_storage[0] = sample;
+    owner.frame_samples = &sample_storage;
+    owner.frame_bindings = &bindings;
+    owner.frame_changes = &changes;
+    owner.frame_change_layers = &change_layers;
+    var count: usize = 1;
+    changes[0] = .{ .current = damage.SurfaceState.fromSample(sample, sample.effect_size) };
+    try std.testing.expect(try owner.prepareBlurFrame(0, 70 * ms, 1, &count));
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expect(changes[0].invalidate_bounds);
+    try std.testing.expectEqual(@as(u8, 85), sample_storage[0].blur_alpha);
+    // Each output independently consumes its endpoint; no client commits.
+    for ([_]u64{ 190, 205 }) |now| {
+        count = 0;
+        try std.testing.expect(!try owner.prepareBlurFrame(70 * ms, now * ms, 1, &count));
+        try std.testing.expectEqual(@as(usize, 1), count);
+        try std.testing.expect(changes[0].invalidate_bounds);
+        try std.testing.expectEqual(@as(u8, 255), sample_storage[0].blur_alpha);
+    }
+    count = 0;
+    try std.testing.expect(!try owner.prepareBlurFrame(205 * ms, 220 * ms, 1, &count));
+    try std.testing.expectEqual(@as(usize, 0), count);
+    layers[0].blur_fade.request(false, 220 * ms);
+    count = 0;
+    try std.testing.expect(!try owner.prepareBlurFrame(390 * ms, 400 * ms, 1, &count));
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(@as(u8, 0), sample_storage[0].blur_alpha);
+    // Unmapped surfaces have no sample, so even an unfinished fade cannot
+    // schedule frames or retain ghost geometry.
+    layers[0].blur_fade.request(true, 410 * ms);
+    layers[0].active = false;
+    count = 0;
+    try std.testing.expect(!try owner.prepareBlurFrame(400 * ms, 420 * ms, 0, &count));
+    try std.testing.expectEqual(@as(usize, 0), count);
 }
 
 fn retainedSampleUnchanged(previous: render.SurfaceSample, current: render.SurfaceSample) bool {

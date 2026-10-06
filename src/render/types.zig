@@ -336,6 +336,9 @@ pub const SurfaceSample = struct {
     /// bilinear. Both preserve aligned 1:1 pixels without filtering.
     filter: Filter = .adaptive,
     global_alpha: u8 = 255,
+    /// Crossfade from the original backdrop to fixed-strength blur, independent
+    /// of surface content opacity. Zero also disables blur work.
+    blur_alpha: u8 = 255,
     /// Surface-local effect geometry. A zero effect size disables all effects.
     effect_size: Size = .{ .width = 0, .height = 0 },
     opaque_region: []const RegionOperation = &.{},
@@ -474,7 +477,7 @@ pub fn validateSample(sample: SurfaceSample) ValidationError!usize {
 /// opacity is sufficient to prove the blur invisible without inspecting region
 /// geometry; renderers additionally skip declared opaque subregions per pixel.
 pub fn hasVisibleBlur(sample: SurfaceSample) bool {
-    return sample.blur_region.len != 0 and sample.effect_size.width != 0 and
+    return sample.blur_alpha != 0 and sample.blur_region.len != 0 and sample.effect_size.width != 0 and
         !(sample.global_alpha == 255 and
             (sample.source.format == .xrgb8888 or effectRegionCoversSurface(
                 sample.opaque_region,

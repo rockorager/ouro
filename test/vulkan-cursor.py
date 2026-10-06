@@ -76,7 +76,7 @@ class Renderer:
                timings=None, scene=None, damage=None, timing_repeats=1,
                source_format=0, source_stride=None, raw_output=False, output_reference=80,
                video_planes=None, representation=0, capture_transfer=0, capture_shoulder=False, rgb_output=False,
-               capture16=False, blur=False, blur_scale=1, blur_steps=None, legacy_blur=False,
+               capture16=False, blur=False, blur_scale=1, blur_steps=None, legacy_blur=False, blur_alpha=255,
                luts=None, source_lut=0, output_lut=0, tone_map_peak=0):
         d = self.device
         sw, sh = source_size
@@ -194,15 +194,16 @@ class Renderer:
                 source_images = [image(*dimensions, fmt, v.VK_IMAGE_USAGE_SAMPLED_BIT | v.VK_IMAGE_USAGE_TRANSFER_DST_BIT)
                                  for data, dimensions, fmt, stride, texel_bytes in video_planes]
                 plane_uploads = [buffer(data, v.VK_BUFFER_USAGE_TRANSFER_SRC_BIT) for data, *_ in video_planes]
-            linear, linear_view = image(w, h, v.VK_FORMAT_R32G32B32A32_SFLOAT,
+            # Match the compositor's rgba16f storage image qualifiers.
+            linear, linear_view = image(w, h, v.VK_FORMAT_R16G16B16A16_SFLOAT,
                 v.VK_IMAGE_USAGE_STORAGE_BIT | v.VK_IMAGE_USAGE_SAMPLED_BIT | v.VK_IMAGE_USAGE_TRANSFER_DST_BIT)
             if blur:
                 assert texture and continuation
                 bw, bh = (w, h) if legacy_blur else ((w + 1) // 2, (h + 1) // 2)
-                blurred, blurred_view = image(bw, bh, v.VK_FORMAT_R32G32B32A32_SFLOAT,
+                blurred, blurred_view = image(bw, bh, v.VK_FORMAT_R16G16B16A16_SFLOAT,
                     v.VK_IMAGE_USAGE_STORAGE_BIT | v.VK_IMAGE_USAGE_SAMPLED_BIT | v.VK_IMAGE_USAGE_TRANSFER_DST_BIT)
                 if not legacy_blur:
-                    small, small_view = image((w + 3) // 4, (h + 3) // 4, v.VK_FORMAT_R32G32B32A32_SFLOAT,
+                    small, small_view = image((w + 3) // 4, (h + 3) // 4, v.VK_FORMAT_R16G16B16A16_SFLOAT,
                         v.VK_IMAGE_USAGE_STORAGE_BIT | v.VK_IMAGE_USAGE_SAMPLED_BIT | v.VK_IMAGE_USAGE_TRANSFER_DST_BIT)
             if copy_capture:
                 copied, _ = image(w, h, v.VK_FORMAT_B8G8R8A8_UNORM,
@@ -377,7 +378,7 @@ class Renderer:
                     v.vkCmdBindDescriptorSets(cmd, v.VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, [blur_sets[selected]], 0, None)
                     for rect in pass_rects[i]:
                         push = struct.pack("<12I", *source_size, *target_size, *rect, int(i >= 3),
-                                           struct.unpack("<I", struct.pack("<f", .75 * scale))[0], 0, 0)
+                                           struct.unpack("<I", struct.pack("<f", .75 * scale))[0], blur_alpha if i == 5 else 255, 0)
                         v.vkCmdPushConstants(cmd, pl, v.VK_SHADER_STAGE_COMPUTE_BIT, 0, 48, v.ffi.from_buffer(push))
                         v.vkCmdDispatch(cmd, (rect[2] + 7) // 8, (rect[3] + 7) // 8, 1)
                     barrier(v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -795,7 +796,59 @@ def kawase_plan(size, rect, scale):
     return [required], rectangles
 
 
-def test_blur_damage(renderer, capture_path=None, size=(100, 100)):
+def test_blur_crossfade(renderer, capture_path=None):
+    """Execute final-pass blending, including tint/content, at unequal amounts."""
+    width, height = 320, 180
+    background = Image.new("RGBA", (width, height), "#264b63")
+    draw = ImageDraw.Draw(background)
+    for x in range(0, width, 16):
+        draw.rectangle((x, 0, x + 7, height), fill="#edac55")
+    for y in range(12, height, 29):
+        draw.rectangle((0, y, width, y + 5), fill="#63c5b5")
+    draw.text((12, 18), "Backdrop detail / compositor blur", fill="white")
+    foreground = Image.new("RGBA", (width, height), (0, 0, 0, 77))
+    draw = ImageDraw.Draw(foreground)
+    draw.rounded_rectangle((65, 62, 255, 120), radius=8, fill=(30, 35, 45, 255))
+    draw.text((85, 86), "Content stays sharp", fill="white")
+    packed = scene_sample((width, height), (0, 0, width, height), (65536, 0, 32768, 0, 65536, 32768))
+    # PNG RGBA is converted to the premultiplied BGRA layout used by this fixture.
+    scene = [(packed, image.tobytes("raw", "BGRA"), (width, height)) for image in (background, foreground)]
+    steps = [(1, 1, *kawase_plan((width, height), (0, 0, width, height), 1))]
+    options = dict(scene=scene, continuation=True, blur=True, blur_steps=steps,
+                   capture16=True, capture_phases=1, capture_transfer=1)
+    captures = {}
+    for alpha in (0, 63, 191, 255):
+        _, actual, _ = renderer.render(scene[0][1], (width, height), (width, height), "texture",
+                                        blur_alpha=alpha, **options)
+        captures[alpha] = struct.unpack(f"<{width * height * 4}H", actual)
+    sharp, blurred = captures[0], captures[255]
+    assert max(abs(a - b) for a, b in zip(sharp, blurred)) > 1000
+    for alpha in (63, 191):
+        expected = [a + (b - a) * alpha / 255 for a, b in zip(sharp, blurred)]
+        # Half-float storage and independent final-pass rounding cost < 0.2%.
+        assert max(abs(a - b) for a, b in zip(captures[alpha], expected)) < 128
+    offset = (90 * width + 75) * 4
+    assert all(value[offset:offset + 4] == sharp[offset:offset + 4] for value in captures.values()), "content opacity changed"
+    if capture_path:
+        frames = []
+        # A 180 ms traversal at 100 fps, with endpoint holds. These are shader
+        # readbacks, not a recording of a Wayland client or the runtime clock.
+        for step in range(19):
+            _, actual, _ = renderer.render(scene[0][1], (width, height), (width, height), "texture",
+                blur_alpha=round(step * 255 / 18), **(options | {"capture16": False, "capture_transfer": 0}))
+            image = Image.frombytes("RGBA", (width, height), actual, "raw", "BGRA").convert("RGB").resize((960, 540))
+            frames.append(image)
+        frames[0].save(capture_path, save_all=True, append_images=frames[1:],
+                       duration=[600] + [10] * 17 + [900], loop=0)
+        sheet = Image.new("RGB", (960, 210), "#202020")
+        for index, step in enumerate((0, 9, 18)):
+            sheet.paste(frames[step].resize((320, 180)), (index * 320, 30))
+            ImageDraw.Draw(sheet).text((index * 320 + 10, 10), ("Clear", "90 ms", "180 ms")[index], fill="white")
+        sheet.save(capture_path.with_suffix(".png"))
+    print("Blur crossfade: 0/63/191/255 linear blends and unchanged opaque content passed")
+
+
+def test_blur_damage(renderer, capture_path=None, size=(100, 100), blur_alpha=255):
     start_draws = renderer.draw_count
     width, height = size
     whole = [(0, 0, width, height)]
@@ -807,7 +860,7 @@ def test_blur_damage(renderer, capture_path=None, size=(100, 100)):
                        for c in (x * 25 // width, y * 20 // height, 45, 64))
     top = bytes((10, 20, 30, 40)) * (width * height)
     scene = [(packed, data, (width, height)) for data in (background, foreground, top)]
-    options = dict(scene=scene, continuation=True, blur=True, capture16=True, capture_phases=1)
+    options = dict(scene=scene, continuation=True, blur=True, capture16=True, capture_phases=1, blur_alpha=blur_alpha)
     full_steps = [(1, 1, *kawase_plan((width, height), whole[0], 1)),
                   (2, .5, *kawase_plan((width, height), whole[0], .5))]
     _, reference, _ = renderer.render(background, (width, height), (width, height), "texture",
@@ -848,7 +901,7 @@ def test_blur_damage(renderer, capture_path=None, size=(100, 100)):
             draw.text((10 + i * 410, 12), label, fill="white")
         draw.rectangle((830 + 42 * 4, 34 + 50 * 4, 830 + 49 * 4, 34 + 55 * 4), outline="yellow", width=1)
         sheet.save(capture_path)
-    print(f"FP32 blur damage {size}: {renderer.draw_count - start_draws} draws passed (overlapping effects, poisoned support, tiny/edge damage, untouched export pixels)")
+    print(f"Blur damage {size}: {renderer.draw_count - start_draws} draws passed (overlapping effects, poisoned support, tiny/edge damage, untouched export pixels)")
 
 
 def test_blur_influence(renderer):
@@ -1552,6 +1605,8 @@ if __name__ == "__main__":
     parser.add_argument("--capture-roundtrip", type=Path)
     parser.add_argument("--capture-isolated", type=Path)
     parser.add_argument("--capture-blur", type=Path)
+    parser.add_argument("--capture-blur-crossfade", type=Path, help="write a shader-readback crossfade GIF and comparison PNG")
+    parser.add_argument("--blur-crossfade-only", action="store_true")
     parser.add_argument("--capture-surface", type=Path, nargs=2, metavar=("SOURCE_2X", "OUTPUT"))
     parser.add_argument("--compare-shader-dir", type=Path)
     parser.add_argument("--benchmark", action="store_true", help="time UHD sampled-composition filter variants offscreen")
@@ -1562,6 +1617,10 @@ if __name__ == "__main__":
         parser.error("--benchmark-blur requires --compare-shader-dir")
     renderer = Renderer()
     try:
+        if args.blur_crossfade_only:
+            test_blur_crossfade(renderer, args.capture_blur_crossfade)
+            test_blur_damage(renderer, size=(509, 317), blur_alpha=63)
+            raise SystemExit(0)
         if args.benchmark:
             benchmark(renderer)
         if args.benchmark_blur:
@@ -1578,6 +1637,7 @@ if __name__ == "__main__":
         test_capture_shoulder(renderer, args.capture_roundtrip)
         test_capture16(renderer)
         test_blur_precision(renderer)
+        test_blur_crossfade(renderer, args.capture_blur_crossfade)
         test_blur_damage(renderer, args.capture_blur)
         test_blur_damage(renderer, size=(509, 317))
         test_blur_influence(renderer)
