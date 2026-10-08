@@ -268,27 +268,30 @@ fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
 }
 
 test "gamma control: exact regular payload is read from offset zero" {
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const file = try tmp.dir.createFile("ramps", .{ .read = true });
-    defer file.close();
+    const file = try tmp.dir.createFile(io, "ramps", .{ .read = true });
+    defer file.close(io);
     const expected = [_]u16{ 1, 2, 3, 4, 5, 6 };
-    try file.writeAll(std.mem.sliceAsBytes(&expected));
-    try file.seekTo(5);
+    try file.writeStreamingAll(io, std.mem.sliceAsBytes(&expected));
+    try std.testing.expectEqual(@as(usize, 5), linux.lseek(file.handle, 5, linux.SEEK.SET));
     const actual = try readPayload(std.testing.allocator, file.handle, 2);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualSlices(u16, &expected, actual);
 }
 test "gamma control: rejects malformed payloads" {
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const file = try tmp.dir.createFile("ramps", .{ .read = true });
-    defer file.close();
-    try file.writeAll(&([_]u8{0} ** 11));
+    const file = try tmp.dir.createFile(io, "ramps", .{ .read = true });
+    defer file.close(io);
+    try file.writeStreamingAll(io, &([_]u8{0} ** 11));
     try std.testing.expectError(error.InvalidGamma, readPayload(std.testing.allocator, file.handle, 2));
-    try file.setEndPos(13);
+    try file.setLength(io, 13);
     try std.testing.expectError(error.InvalidGamma, readPayload(std.testing.allocator, file.handle, 2));
-    const descriptors = try std.posix.pipe();
+    var descriptors: [2]linux.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&descriptors, .{ .CLOEXEC = true })));
     defer _ = linux.close(descriptors[0]);
     defer _ = linux.close(descriptors[1]);
     try std.testing.expectError(error.InvalidGamma, readPayload(std.testing.allocator, descriptors[0], 1));
@@ -297,7 +300,7 @@ test "gamma adapter is compile checked and reset is exactly once" {
     const protocol = @import("core_protocol");
     const Resolver = struct {
         resets: usize = 0,
-        pub fn resolveGammaOutput(_: *@This(), _: wayring.io_uring.Peer, _: objects.Handle, _: objects.Object) !struct { id: u32, size: u32 } {
+        pub fn resolveGammaOutput(_: *@This(), _: wayring.io_uring.Peer, _: objects.Handle, _: *objects.Object) !struct { id: u32, size: u32 } {
             return error.Unsupported;
         }
         pub fn applyGamma(_: *@This(), _: u32, _: []const u16) !void {}
@@ -335,6 +338,7 @@ test "gamma adapter duplicate, backpressure, and stale generation" {
     const duplicate = try adapter.acquire();
     duplicate.output = 9;
     try std.testing.expect(adapter.hasOther(duplicate, 9));
+    try adapter.ensureOutbound(1);
     adapter.outbound.appendAssumeCapacity(.{ .owner = A.id(owner), .event = .failed });
     try std.testing.expectError(error.Exhausted, adapter.outputRemoved(9));
     try std.testing.expect(owner.valid);

@@ -369,7 +369,7 @@ test "output power adapter remains core-protocol compile checked when generated"
     if (@hasDecl(protocol, "zwlr_output_power_manager_v1")) {
         const Id = packed struct { index: u32, generation: u32 };
         const Resolver = struct {
-            pub fn resolveOutput(_: *@This(), _: wayring.io_uring.Peer, _: objects.Handle, _: objects.Object) !struct { id: Id, mode: Mode } {
+            pub fn resolveOutput(_: *@This(), _: wayring.io_uring.Peer, _: objects.Handle, _: *objects.Object) !struct { id: Id, mode: Mode } {
                 return error.InvalidOutput;
             }
         };
