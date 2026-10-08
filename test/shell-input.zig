@@ -5117,11 +5117,10 @@ fn layerPopupOutputLifecycle(cycle: enum { power, session, hotplug }, pointer_se
         for (0..512) |_| {
             client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
             _ = try loop.turn(coordinator);
-            if (!coordinator.physical_outputs[0].connected and
-                !coordinator.physical_outputs[0].removing) break;
+            if (coordinator.physical_outputs[0].connection == .detached) break;
             try waitForEither(&root.ring, client_reactor.ring);
         }
-        try std.testing.expect(!coordinator.physical_outputs[0].connected);
+        try std.testing.expect(coordinator.physical_outputs[0].connection == .detached);
         try std.testing.expectEqual(layer_state.output, coordinator.output_adapter.primaryOutput());
         const retained_work_area = coordinator.desktop.workArea();
         fixture.second_desktop = false;
@@ -5216,12 +5215,11 @@ fn layerPopupOutputLifecycle(cycle: enum { power, session, hotplug }, pointer_se
             client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
             _ = try loop.turn(coordinator);
             if (handler.layer_closed == 1 and
-                !coordinator.physical_outputs[1].connected and
-                !coordinator.physical_outputs[1].removing) break;
+                coordinator.physical_outputs[1].connection == .detached) break;
             _ = linux.sched_yield();
         }
         try std.testing.expectEqual(@as(usize, 1), handler.layer_closed);
-        try std.testing.expect(!coordinator.physical_outputs[1].connected);
+        try std.testing.expect(coordinator.physical_outputs[1].connection == .detached);
         try std.testing.expectEqual(
             popup_configures_before_reposition + 1,
             handler.popup_configure_count,
@@ -5687,12 +5685,11 @@ test "shell-input: popup retains parent keyboard focus and applies each configur
         client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
         if (handler.popup_configure_count > before_removal and
-            !coordinator.physical_outputs[1].connected and
-            !coordinator.physical_outputs[1].removing) break;
+            coordinator.physical_outputs[1].connection == .detached) break;
         _ = linux.sched_yield();
     }
     try std.testing.expect(handler.popup_configure_count > before_removal);
-    try std.testing.expect(!coordinator.physical_outputs[1].connected);
+    try std.testing.expect(coordinator.physical_outputs[1].connection == .detached);
     const current_serial = handler.popup_configures[handler.popup_configure_count - 1];
     try std.testing.expect(stale_serial != current_serial);
 

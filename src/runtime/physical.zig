@@ -525,19 +525,66 @@ pub fn Coordinator(comptime protocol: type) type {
             owner: Owner,
             phase: Phase = .desired,
         };
+        /// Slot lifecycle of a physical output. Removal is a nested state
+        /// whose stages advance strictly in order; only `setPhysicalOutputConnection`
+        /// changes it, keeping `pending_output_removals` exact.
+        const OutputConnection = union(enum) {
+            attached,
+            removing: Removal,
+            /// Fully retired; the slot may be reused by a new connector.
+            detached,
+
+            const Removal = enum {
+                /// Waiting for KMS scanout to drain and be destroyed.
+                draining,
+                /// The wl_output global retirement has been queued.
+                global_retired,
+                /// Output-bound protocol state is torn down; waiting until
+                /// every client has observed the global retirement.
+                protocol_retired,
+            };
+
+            /// Whether clients and policy still treat the output as present.
+            pub fn connected(self: OutputConnection) bool {
+                return switch (self) {
+                    .attached => true,
+                    .removing => |stage| stage != .protocol_retired,
+                    .detached => false,
+                };
+            }
+        };
+        /// Scanout intent, orthogonal to the connection lifecycle. DPMS
+        /// suspends scanout but keeps the logical display used by clients;
+        /// output configuration disables both.
+        const OutputPower = enum {
+            on,
+            /// DPMS off was requested and scanout is draining.
+            suspending,
+            /// DPMS off.
+            suspended,
+            /// Disabled by output configuration.
+            disabled,
+
+            fn wantsScanout(self: OutputPower) bool {
+                return self == .on or self == .suspending;
+            }
+
+            fn suspendsScanout(self: OutputPower) bool {
+                return self == .suspending or self == .suspended;
+            }
+
+            fn retainsLayout(self: OutputPower) bool {
+                return self != .disabled;
+            }
+        };
         const PhysicalOutput = struct {
             id: PhysicalOutputId,
-            connected: bool = true,
-            desired_enabled: bool = true,
+            connection: OutputConnection = .attached,
+            power: OutputPower = .on,
             // Published geometry survives temporary KMS drains (hotplug and VT
             // switches) so client commits do not depend on scanout availability.
             layout_initialized: bool = false,
-            // DPMS suspends scanout, not the logical display used by clients.
-            power_suspended: bool = false,
             repaint_available: bool = false,
-            removing: bool = false,
-            removal_global_pending: bool = false,
-            removal_protocol_retired: bool = false,
             connector_id: u32 = 0,
             claim: ?drm.ClaimHandle = null,
             protocol_output: OutputAdapter.OutputId,
@@ -575,8 +622,8 @@ pub fn Coordinator(comptime protocol: type) type {
 
             fn hasLayout(self: *const PhysicalOutput) bool {
                 return self.kms_output != null or
-                    (self.layout_initialized and self.connected and !self.removing and
-                        (self.desired_enabled or self.power_suspended));
+                    (self.layout_initialized and self.connection == .attached and
+                        self.power.retainsLayout());
             }
         };
         const Presentations = presentation.Queue(Imported);
@@ -3227,7 +3274,7 @@ pub fn Coordinator(comptime protocol: type) type {
             var primary_promoted = false;
             if (primary_missing) {
                 for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                    if (!physical.connected or physical.removing or
+                    if (physical.connection != .attached or
                         std.mem.indexOfScalar(u32, connectors, physical.connector_id) == null)
                         continue;
                     diagnostics.logDisplay("hotplug-promote connector={d}", .{physical.connector_id});
@@ -3240,7 +3287,7 @@ pub fn Coordinator(comptime protocol: type) type {
             for (connectors) |connector_id| {
                 var known = false;
                 for (self.physical_outputs[0..self.physical_output_count]) |physical| {
-                    if (physical.connected and physical.connector_id == connector_id) {
+                    if (physical.connection.connected() and physical.connector_id == connector_id) {
                         known = true;
                         break;
                     }
@@ -3252,7 +3299,7 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             var removal_requested = false;
             for (self.physical_outputs[0..self.physical_output_count]) |physical| {
-                if (!physical.connected or physical.removing) continue;
+                if (physical.connection != .attached) continue;
                 if (std.mem.indexOfScalar(u32, connectors, physical.connector_id) == null) {
                     diagnostics.logDisplay("hotplug-removed connector={d}", .{physical.connector_id});
                     if (!primary_promoted and std.meta.eql(
@@ -4631,7 +4678,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn pointerPhysicalOutput(self: *Self) ?*PhysicalOutput {
             const pointer = self.interaction.pointerPosition();
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                if (!physical.connected or physical.kms_output == null) continue;
+                if (!physical.connection.connected() or physical.kms_output == null) continue;
                 const bounds = self.outputBoundsFor(physical) catch continue;
                 const right = @as(i64, bounds.x) + bounds.width;
                 const bottom = @as(i64, bounds.y) + bounds.height;
@@ -4751,7 +4798,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         // Keep the existing DPMS exception, but leave outputs
                         // drained for session switches or topology replacement.
                         if (physical == null or
-                            (physical.?.kms_output == null and !physical.?.power_suspended) or
+                            (physical.?.kms_output == null and !physical.?.power.suspendsScanout()) or
                             try clipToOutput(
                                 destination,
                                 self.outputBoundsFor(physical.?) catch {
@@ -4970,7 +5017,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn primaryPhysicalOutput(self: *const Self) *const PhysicalOutput {
             const primary = self.output_adapter.primaryOutput();
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
-                if (physical.connected and std.meta.eql(physical.protocol_output, primary))
+                if (physical.connection.connected() and std.meta.eql(physical.protocol_output, primary))
                     return physical;
             unreachable;
         }
@@ -4978,7 +5025,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn primaryPhysicalOutputMutable(self: *Self) *PhysicalOutput {
             const primary = self.output_adapter.primaryOutput();
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
-                if (physical.connected and std.meta.eql(physical.protocol_output, primary))
+                if (physical.connection.connected() and std.meta.eql(physical.protocol_output, primary))
                     return physical;
             unreachable;
         }
@@ -5036,7 +5083,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 primary.management_head,
             )).enabled) return;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                if (!physical.connected or physical.removing or physical.kms_output == null) continue;
+                if (physical.connection != .attached or physical.kms_output == null) continue;
                 if (!(try self.output_management_adapter.lifecycle.currentHead(
                     physical.management_head,
                 )).enabled) continue;
@@ -5110,14 +5157,14 @@ pub fn Coordinator(comptime protocol: type) type {
         fn connectedPhysicalOutputCount(self: *const Self) usize {
             var count: usize = 0;
             for (self.physical_outputs[0..self.physical_output_count]) |physical|
-                count += @intFromBool(physical.connected);
+                count += @intFromBool(physical.connection.connected());
             return count;
         }
 
         fn connectedPhysicalOutputsClaimed(self: *const Self) bool {
             var found = false;
             for (self.physical_outputs[0..self.physical_output_count]) |physical| {
-                if (!physical.connected) continue;
+                if (!physical.connection.connected()) continue;
                 found = true;
                 if (physical.claim == null) return false;
             }
@@ -5129,7 +5176,7 @@ pub fn Coordinator(comptime protocol: type) type {
             id: OutputAdapter.OutputId,
         ) ?*const PhysicalOutput {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
-                if (physical.connected and std.meta.eql(physical.protocol_output, id))
+                if (physical.connection.connected() and std.meta.eql(physical.protocol_output, id))
                     return physical;
             return null;
         }
@@ -5139,7 +5186,7 @@ pub fn Coordinator(comptime protocol: type) type {
             id: OutputAdapter.OutputId,
         ) ?*PhysicalOutput {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
-                if (physical.connected and std.meta.eql(physical.protocol_output, id))
+                if (physical.connection.connected() and std.meta.eql(physical.protocol_output, id))
                     return physical;
             return null;
         }
@@ -5150,7 +5197,7 @@ pub fn Coordinator(comptime protocol: type) type {
         ) ?*PhysicalOutput {
             if (id.index >= self.physical_output_count) return null;
             const physical = &self.physical_outputs[id.index];
-            return if (physical.connected and std.meta.eql(physical.id, id)) physical else null;
+            return if (physical.connection.connected() and std.meta.eql(physical.id, id)) physical else null;
         }
 
         fn physicalOutputForManagementHead(
@@ -5158,7 +5205,7 @@ pub fn Coordinator(comptime protocol: type) type {
             id: protocol_output_management.HeadId,
         ) ?*const PhysicalOutput {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
-                if (physical.connected and std.meta.eql(physical.management_head, id))
+                if (physical.connection.connected() and std.meta.eql(physical.management_head, id))
                     return physical;
             return null;
         }
@@ -5188,7 +5235,7 @@ pub fn Coordinator(comptime protocol: type) type {
             id: ForeignToplevelListAdapter.OutputId,
         ) ?*const PhysicalOutput {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
-                if (physical.connected and
+                if (physical.connection.connected() and
                     std.meta.eql(foreignOutputId(physical.protocol_output), id)) return physical;
             return null;
         }
@@ -5198,7 +5245,7 @@ pub fn Coordinator(comptime protocol: type) type {
             id: WorkspaceAdapter.OutputId,
         ) ?*const PhysicalOutput {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
-                if (physical.connected and
+                if (physical.connection.connected() and
                     std.meta.eql(workspaceOutputId(physical.protocol_output), id)) return physical;
             return null;
         }
@@ -5208,7 +5255,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 const desktop_id: Desktop.OutputId = .{
                     .value = @as(u64, physical.id.generation) << 32 | physical.id.index,
                 };
-                if (physical.connected and std.meta.eql(desktop_id, id))
+                if (physical.connection.connected() and std.meta.eql(desktop_id, id))
                     return workspaceOutputId(physical.protocol_output);
             }
             return null;
@@ -5336,7 +5383,7 @@ pub fn Coordinator(comptime protocol: type) type {
             var index: usize = 0;
             var changed = false;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                if (!physical.connected) continue;
+                if (!physical.connection.connected()) continue;
                 const current = try self.output_management_adapter.lifecycle.currentHead(
                     physical.management_head,
                 );
@@ -5468,7 +5515,7 @@ pub fn Coordinator(comptime protocol: type) type {
             id: protocol_output_management.HeadId,
         ) ?*PhysicalOutput {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
-                if (physical.connected and std.meta.eql(physical.management_head, id))
+                if (physical.connection.connected() and std.meta.eql(physical.management_head, id))
                     return physical;
             return null;
         }
@@ -5637,7 +5684,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (command.mode == .off) {
                     self.output_power_transition = command;
                     try self.pausePhysicalOutput(physical);
-                    physical.power_suspended = true;
+                    physical.power = .suspending;
                     return;
                 }
                 const claim = physical.claim orelse {
@@ -5680,8 +5727,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.markProtocol(command.peer, ProtocolReady.output_power);
                     continue;
                 };
-                physical.desired_enabled = true;
-                physical.power_suspended = false;
+                physical.power = .on;
                 try self.publishOutputLayout();
                 // Retained clients need not commit again just because DPMS
                 // ended. Present their latest contents, including on primary.
@@ -5921,7 +5967,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn firstCaptureOutput(self: *const Self) ?*output_api.Output {
             for (self.physical_outputs[0..self.physical_output_count]) |physical|
-                if (physical.connected) if (physical.kms_output) |output| return output;
+                if (physical.connection.connected()) if (physical.kms_output) |output| return output;
             return null;
         }
 
@@ -6047,7 +6093,7 @@ pub fn Coordinator(comptime protocol: type) type {
             rect: geometry.Rect,
         ) ?*const PhysicalOutput {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                if (!physical.connected or physical.kms_output == null) continue;
+                if (!physical.connection.connected() or physical.kms_output == null) continue;
                 const bounds = self.outputBoundsFor(physical) catch continue;
                 if (rectangleContains(bounds, rect)) return physical;
             }
@@ -6061,7 +6107,7 @@ pub fn Coordinator(comptime protocol: type) type {
             var best: ?*const PhysicalOutput = null;
             var best_area: u64 = 0;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                if (!physical.connected or physical.kms_output == null) continue;
+                if (!physical.connection.connected() or physical.kms_output == null) continue;
                 const bounds = self.outputBoundsFor(physical) catch continue;
                 if (rectangleContains(bounds, rect)) return physical;
                 const area = rectangleIntersectionArea(bounds, rect);
@@ -6251,7 +6297,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.topology_refresh_pending or self.output_reconfigure != null or
                 self.output_power_transition != null) return null;
             const physical = &self.physical_outputs[0];
-            if (!physical.connected or physical.removing or physical.drain_started or
+            if (physical.connection != .attached or physical.drain_started or
                 physical.reconfigure != null) return null;
             const output = physical.kms_output orelse return null;
             if (!output.accepting_frames or output.paused) return null;
@@ -7378,7 +7424,7 @@ pub fn Coordinator(comptime protocol: type) type {
             physical: *PhysicalOutput,
             now: u64,
         ) !bool {
-            if (!physical.connected) return false;
+            if (!physical.connection.connected()) return false;
             const output = physical.kms_output orelse return false;
             output.request(.damage, now) catch |err| switch (err) {
                 error.OutputPaused => return false,
@@ -7450,7 +7496,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const pinned_output = self.layerShellOutput(layer);
             var requested = false;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                if (!physical.connected or physical.kms_output == null) continue;
+                if (!physical.connection.connected() or physical.kms_output == null) continue;
                 const bounds = try self.outputBoundsFor(physical);
                 const previous_visible = if (pinned_output) |id|
                     change.previous != null and std.meta.eql(id, physical.protocol_output)
@@ -7540,7 +7586,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn advanceOutputGlobals(self: *Self) !void {
             while (self.output_global_index < self.physical_output_count) {
                 const physical = &self.physical_outputs[self.output_global_index];
-                if (!physical.connected) {
+                if (!physical.connection.connected()) {
                     self.output_global_index += 1;
                     continue;
                 }
@@ -7567,17 +7613,17 @@ pub fn Coordinator(comptime protocol: type) type {
         fn advancePhysicalOutputRemovals(self: *Self) !void {
             if (self.pending_output_removals == 0) return;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                if (!physical.removing or physical.kms_output != null) continue;
-                if (!physical.removal_global_pending) {
+                if (physical.connection != .removing or physical.kms_output != null) continue;
+                if (physical.connection.removing == .draining) {
                     self.output_adapter.retireOutput(physical.protocol_output) catch |err| switch (err) {
                         error.GlobalUpdateActive => return,
                         else => return err,
                     };
-                    physical.removal_global_pending = true;
+                    self.setPhysicalOutputConnection(physical, .{ .removing = .global_retired });
                     self.xdg_output_adapter.outputRemoved(physical.protocol_output);
                     self.markProtocolAll(ProtocolReady.output | ProtocolReady.xdg_output);
                 }
-                if (!physical.removal_protocol_retired) {
+                if (physical.connection.removing == .global_retired) {
                     const layer_ids = try self.layer_shell_adapter.ids(self.layer_surface_ids);
                     for (layer_ids) |id| {
                         const state = try self.layer_shell_adapter.state(id);
@@ -7614,8 +7660,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         (@as(u64, physical.protocol_output.generation) << 32) |
                             physical.protocol_output.index,
                     );
-                    physical.connected = false;
-                    physical.removal_protocol_retired = true;
+                    self.setPhysicalOutputConnection(physical, .{ .removing = .protocol_retired });
                     self.markProtocolAll(ProtocolReady.output_management |
                         ProtocolReady.output_power | ProtocolReady.gamma_control |
                         ProtocolReady.layer_shell);
@@ -7635,21 +7680,21 @@ pub fn Coordinator(comptime protocol: type) type {
                     },
                     .complete => break,
                 };
-                self.setPhysicalOutputRemoving(physical, false);
-                physical.removal_global_pending = false;
-                physical.removal_protocol_retired = false;
+                self.setPhysicalOutputConnection(physical, .detached);
                 return;
             }
         }
 
-        fn setPhysicalOutputRemoving(
+        fn setPhysicalOutputConnection(
             self: *Self,
             physical: *PhysicalOutput,
-            removing: bool,
+            next: OutputConnection,
         ) void {
-            if (physical.removing == removing) return;
-            physical.removing = removing;
-            if (removing) {
+            const was_removing = physical.connection == .removing;
+            const is_removing = next == .removing;
+            physical.connection = next;
+            if (was_removing == is_removing) return;
+            if (is_removing) {
                 self.pending_output_removals += 1;
             } else {
                 std.debug.assert(self.pending_output_removals > 0);
@@ -8331,7 +8376,7 @@ pub fn Coordinator(comptime protocol: type) type {
         ) ?*const PhysicalOutput {
             if (self.physicalOutputContainingSceneRect(cursor)) |output| return output;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                if (!physical.connected or physical.kms_output == null) continue;
+                if (!physical.connection.connected() or physical.kms_output == null) continue;
                 const bounds = self.outputBoundsFor(physical) catch continue;
                 if (rectanglesIntersect(bounds, cursor)) return physical;
             }
@@ -8537,7 +8582,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
                 var existing: ?*PhysicalOutput = null;
                 for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                    if (physical.connected and physical.connector_id == connector_id) {
+                    if (physical.connection.connected() and physical.connector_id == connector_id) {
                         existing = physical;
                         break;
                     }
@@ -8566,7 +8611,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     };
                     if (replace_management_heads)
                         try self.replaceManagementHead(physical, snapshot, state);
-                    if (!physical.desired_enabled) continue;
+                    if (!physical.power.wantsScanout()) continue;
                     self.activatePhysicalOutput(
                         physical,
                         snapshot,
@@ -8670,7 +8715,7 @@ pub fn Coordinator(comptime protocol: type) type {
         ) !*PhysicalOutput {
             var reusable: ?usize = null;
             for (self.physical_outputs[0..self.physical_output_count], 0..) |physical, index| {
-                if (!physical.connected and physical.id.generation != std.math.maxInt(u32)) {
+                if (physical.connection == .detached and physical.id.generation != std.math.maxInt(u32)) {
                     reusable = index;
                     break;
                 }
@@ -8751,7 +8796,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (appending)
                     self.physical_output_count -= 1
                 else
-                    self.physical_outputs[index].connected = false;
+                    self.physical_outputs[index].connection = .detached;
             }
             const physical = &self.physical_outputs[index];
             if (make_primary) try self.promotePrimaryPhysicalOutput(physical);
@@ -8763,7 +8808,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn nextPhysicalOutputX(self: *Self) !i32 {
             var right: i64 = 0;
             for (self.physical_outputs[0..self.physical_output_count]) |physical| {
-                if (!physical.connected) continue;
+                if (!physical.connection.connected()) continue;
                 const state = try self.output_management_adapter.lifecycle.currentHead(
                     physical.management_head,
                 );
@@ -12026,7 +12071,7 @@ pub fn Coordinator(comptime protocol: type) type {
             var selected: ?*PhysicalOutput = null;
             var largest: u64 = 0;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                if (!physical.connected or physical.kms_output == null or physical.claim == null) continue;
+                if (!physical.connection.connected() or physical.kms_output == null or physical.claim == null) continue;
                 if (self.boundLayerOutput(layer)) |bound| if (!std.meta.eql(bound, physical.protocol_output)) continue;
                 const bounds = self.outputBoundsFor(physical) catch continue;
                 const intersection = (clipToOutput(layer.sample.?.destination, bounds) catch continue) orelse continue;
@@ -12316,7 +12361,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn publishPresentedSessionLock(self: *Self) !void {
             const lock = self.session_lock_adapter.pendingLock() orelse return;
             for (self.physical_outputs[0..self.physical_output_count]) |physical| {
-                if (!physical.connected or physical.kms_output == null) continue;
+                if (!physical.connection.connected() or physical.kms_output == null) continue;
                 if (!physical.session_lock_presented) return;
             }
             self.session_lock_adapter.publishLocked(lock) catch |err| switch (err) {
@@ -13046,7 +13091,7 @@ pub fn Coordinator(comptime protocol: type) type {
         ) !?*output_api.Output {
             if (self.boundLayerOutput(layer)) |output_id| {
                 const physical = self.physicalOutputForProtocolId(output_id) orelse return null;
-                if (!physical.connected) return null;
+                if (!physical.connection.connected()) return null;
                 return physical.kms_output;
             }
             return self.outputForDestination(destination);
@@ -13529,14 +13574,14 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.output_reconfigure != null or self.output_power_transition != null)
                 return error.InvalidState;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                if (!physical.connected or physical.connector_id != connector_id) continue;
+                if (!physical.connection.connected() or physical.connector_id != connector_id) continue;
                 if (std.meta.eql(
                     physical.protocol_output,
                     self.output_adapter.primaryOutput(),
                 )) return error.PrimaryOutput;
-                if (physical.removing) return;
-                self.setPhysicalOutputRemoving(physical, true);
-                errdefer self.setPhysicalOutputRemoving(physical, false);
+                if (physical.connection == .removing) return;
+                self.setPhysicalOutputConnection(physical, .{ .removing = .draining });
+                errdefer self.setPhysicalOutputConnection(physical, .attached);
                 try self.pausePhysicalOutput(physical);
                 // An output without the shared DRM readiness poll may pause
                 // and drain synchronously, leaving no completion to drive the
@@ -13552,7 +13597,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const output = physical.kms_output orelse return;
             if (!output.accepting_frames) return;
             diagnostics.logDisplay("pause-request connector={d} removing={} topology_refresh={} reconfigure={} power_transition={} session_disable={} stopping={}", .{
-                physical.connector_id,                physical.removing,
+                physical.connector_id,                physical.connection == .removing,
                 self.topology_refresh_pending,        self.output_reconfigure != null,
                 self.output_power_transition != null, self.session_disable_pending,
                 self.stopping,
@@ -13620,7 +13665,7 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 const available = !locked and self.session.state == .enabled and
-                    physical.connected and !physical.removing and
+                    physical.connection == .attached and
                     if (physical.kms_output) |output| output.accepting_frames else false;
                 if (physical.repaint_available != available) {
                     physical.repaint_available = available;
@@ -13703,7 +13748,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const windows = try self.desktop.sceneSnapshotGrowing(self.allocator, &self.scene_windows);
             for (self.clients.items) |*client| if (client.active) {
                 for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                    if (!physical.connected) continue;
+                    if (!physical.connection.connected()) continue;
                     const bounds = self.outputBoundsFor(physical) catch continue;
                     var count: usize = 0;
                     for (self.app_layers[0..self.app_layer_count]) |*layer| {
@@ -13851,7 +13896,7 @@ pub fn Coordinator(comptime protocol: type) type {
         ) !void {
             var preferred_scale: ?u32 = null;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                if (!physical.connected) continue;
+                if (!physical.connection.connected()) continue;
                 if (bound_output) |output| {
                     if (!std.meta.eql(output, physical.protocol_output)) continue;
                 } else {
@@ -13912,7 +13957,7 @@ pub fn Coordinator(comptime protocol: type) type {
             {
                 var pending = false;
                 for (self.physical_outputs[0..self.physical_output_count]) |physical| {
-                    if (physical.removing or physical.drain_started or
+                    if (physical.connection == .removing or physical.drain_started or
                         (physical.kms_output != null and physical.kms_output.?.paused))
                     {
                         pending = true;
@@ -13962,7 +14007,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     if (!self.stopping and power_transition) {
                         const command = self.output_power_transition.?;
                         self.output_power_transition = null;
-                        physical.desired_enabled = false;
+                        physical.power = .suspended;
                         try self.promoteEnabledPhysicalOutput();
                         if (self.output_power_adapter.peekCommand()) |current| {
                             if (std.meta.eql(current, command)) {
@@ -14038,7 +14083,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn advanceTopologyRefresh(self: *Self) !void {
             for (self.physical_outputs[0..self.physical_output_count]) |physical|
-                if (physical.removing) {
+                if (physical.connection == .removing) {
                     self.traceTopologyRefreshWait(.output_removal);
                     return;
                 };
@@ -14130,7 +14175,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     primary_state.x,
                     true,
                 );
-                self.setPhysicalOutputRemoving(primary, true);
+                self.setPhysicalOutputConnection(primary, .{ .removing = .draining });
             }
             try self.activateAdditionalOutputs(handle, replace_management_heads);
             if (management_update) {
@@ -14223,7 +14268,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 // The probe compares against the pre-unplug snapshot, so a
                 // returning connector can also be reported as changed. Its
                 // old head is retired; activateAdditionalOutputs adds it anew.
-                if (!physical.connected) continue;
+                if (!physical.connection.connected()) continue;
                 if (physical.kms_output != null) continue;
                 if (std.mem.indexOfScalar(
                     u32,
@@ -14242,7 +14287,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     );
                     physical.claim = claim;
                     try self.replaceManagementHead(physical, snapshot, state);
-                    if (physical.desired_enabled)
+                    if (physical.power.wantsScanout())
                         try self.activatePhysicalOutput(
                             physical,
                             snapshot,
@@ -14384,8 +14429,7 @@ pub fn Coordinator(comptime protocol: type) type {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 const pending = physical.reconfigure orelse continue;
                 const state = pending.desired;
-                physical.desired_enabled = state.enabled;
-                physical.power_suspended = false;
+                physical.power = if (state.enabled) .on else .disabled;
                 if (!state.enabled) {
                     _ = try self.output_management_adapter.publishHead(
                         physical.management_head,
@@ -14443,7 +14487,14 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 const pending = physical.reconfigure orelse continue;
-                physical.desired_enabled = pending.previous.enabled;
+                // Rollback reactivated every previously enabled output, so a
+                // DPMS suspension survives only on outputs left disabled.
+                physical.power = if (pending.previous.enabled)
+                    .on
+                else if (physical.power.suspendsScanout())
+                    .suspended
+                else
+                    .disabled;
                 if (!pending.previous.enabled) {
                     _ = try self.output_management_adapter.publishHead(
                         physical.management_head,
@@ -14609,7 +14660,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const now = monotonicNs() catch return;
             var requested = false;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                if (!physical.connected or physical.kms_output == null) continue;
+                if (!physical.connection.connected() or physical.kms_output == null) continue;
                 const visible = if (pinned_output) |output|
                     std.meta.eql(output, physical.protocol_output)
                 else

@@ -998,8 +998,7 @@ test "physical coordinator preserves programmed primary color state across secon
     try fixture.signalHotplug();
     for (0..256) |_| {
         _ = try loop.turn(coordinator);
-        if (!coordinator.physical_outputs[1].connected and
-            !coordinator.physical_outputs[1].removing and
+        if (coordinator.physical_outputs[1].connection == .detached and
             !coordinator.topology_refresh_pending) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
@@ -1010,8 +1009,7 @@ test "physical coordinator preserves programmed primary color state across secon
     try std.testing.expectEqual(primary_scanout_id, primary_kms.outputId());
     try std.testing.expect(primary_kms.accepting_frames);
     try std.testing.expectEqual(primary_management_head, coordinator.physical_outputs[0].management_head);
-    try std.testing.expect(!coordinator.physical_outputs[1].connected);
-    try std.testing.expect(!coordinator.physical_outputs[1].removing);
+    try std.testing.expect(coordinator.physical_outputs[1].connection == .detached);
     try std.testing.expect(coordinator.physical_outputs[1].kms_output == null);
     try std.testing.expect(coordinator.physical_outputs[1].claim == null);
     try std.testing.expect(!(try coordinator.output_adapter.outputPublished(protocol_output)));
@@ -1042,12 +1040,12 @@ test "physical coordinator preserves programmed primary color state across secon
     for (0..512) |_| {
         _ = try loop.turn(coordinator);
         if (!coordinator.topology_refresh_pending and
-            coordinator.physical_outputs[1].connected and
+            coordinator.physical_outputs[1].connection.connected() and
             coordinator.physical_outputs[1].kms_output != null and
             coordinator.output_global_index == 2) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
-    try std.testing.expect(coordinator.physical_outputs[1].connected);
+    try std.testing.expect(coordinator.physical_outputs[1].connection.connected());
     try std.testing.expect(coordinator.physical_outputs[1].kms_output != null);
     try std.testing.expectEqual(physical_id.index, coordinator.physical_outputs[1].id.index);
     try std.testing.expect(physical_id.generation != coordinator.physical_outputs[1].id.generation);
@@ -1495,19 +1493,18 @@ test "physical coordinator fails over from a disconnected primary output" {
     try fixture.signalHotplug();
     for (0..512) |_| {
         _ = try loop.turn(coordinator);
-        if (!coordinator.physical_outputs[0].connected and
-            !coordinator.physical_outputs[0].removing and
+        if (coordinator.physical_outputs[0].connection == .detached and
             coordinator.physical_outputs[1].kms_output != null) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
-    try std.testing.expect(!coordinator.physical_outputs[0].connected);
+    try std.testing.expect(coordinator.physical_outputs[0].connection == .detached);
     try std.testing.expect(coordinator.physical_outputs[0].kms_output == null);
     try std.testing.expect(!(try coordinator.output_adapter.outputPublished(primary_protocol)));
     try std.testing.expectError(
         error.InvalidHead,
         coordinator.output_management_adapter.lifecycle.currentHead(primary_head),
     );
-    try std.testing.expect(coordinator.physical_outputs[1].connected);
+    try std.testing.expect(coordinator.physical_outputs[1].connection.connected());
     try std.testing.expectEqual(@as(u32, 11), coordinator.physical_outputs[1].connector_id);
     try std.testing.expect(coordinator.physical_outputs[1].kms_output != null);
     try std.testing.expect(try coordinator.output_adapter.outputPublished(secondary_protocol));
@@ -1544,12 +1541,12 @@ test "physical coordinator fails over from a disconnected primary output" {
     for (0..512) |_| {
         _ = try loop.turn(coordinator);
         if (!coordinator.topology_refresh_pending and
-            coordinator.physical_outputs[0].connected and
+            coordinator.physical_outputs[0].connection.connected() and
             coordinator.physical_outputs[0].kms_output != null and
             coordinator.physical_outputs[1].kms_output != null) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
-    try std.testing.expect(coordinator.physical_outputs[0].connected);
+    try std.testing.expect(coordinator.physical_outputs[0].connection.connected());
     try std.testing.expectEqual(@as(u32, 10), coordinator.physical_outputs[0].connector_id);
     try std.testing.expect(!std.meta.eql(
         primary_protocol,
@@ -1611,13 +1608,12 @@ test "physical coordinator replaces the last disconnected output exactly" {
     for (0..512) |_| {
         _ = try loop.turn(coordinator);
         if (!coordinator.topology_refresh_pending and
-            !coordinator.physical_outputs[0].connected and
-            !coordinator.physical_outputs[0].removing and
+            coordinator.physical_outputs[0].connection == .detached and
             coordinator.physical_outputs[1].kms_output != null) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
     try std.testing.expect(!coordinator.topology_refresh_pending);
-    try std.testing.expect(!coordinator.physical_outputs[0].connected);
+    try std.testing.expect(coordinator.physical_outputs[0].connection == .detached);
     try std.testing.expect(!(try coordinator.output_adapter.outputPublished(
         disconnected_protocol,
     )));
@@ -1987,7 +1983,7 @@ fn generatedMultiHeadApply(
         const transaction_complete = handler.succeeded == @as(usize, 1) + @intFromBool(reenable_second) or
             handler.failed == 1;
         const hotplug_complete = !hotplug_during_apply or (hotplug_signaled and
-            !coordinator.physical_outputs[1].connected and !coordinator.hotplug_refresh_pending);
+            !coordinator.physical_outputs[1].connection.connected() and !coordinator.hotplug_refresh_pending);
         var outputs_inactive = true;
         for (coordinator.physical_outputs[0..coordinator.physical_output_count]) |physical|
             outputs_inactive = outputs_inactive and physical.kms_output == null;
@@ -2021,9 +2017,9 @@ fn generatedMultiHeadApply(
     try std.testing.expectEqual(hotplug_during_apply, hotplug_signaled);
     try std.testing.expectEqual(session_disable_during_apply, session_disable_signaled);
     if (hotplug_during_apply) {
-        try std.testing.expect(coordinator.physical_outputs[0].connected);
+        try std.testing.expect(coordinator.physical_outputs[0].connection.connected());
         try std.testing.expect(coordinator.physical_outputs[0].kms_output != null);
-        try std.testing.expect(!coordinator.physical_outputs[1].connected);
+        try std.testing.expect(!coordinator.physical_outputs[1].connection.connected());
         try std.testing.expect(coordinator.physical_outputs[1].kms_output == null);
         try std.testing.expectEqual(
             coordinator.physical_outputs[0].protocol_output,
@@ -2823,12 +2819,11 @@ test "generated session lock publishes only after presentation and client loss s
     for (0..512) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (!coordinator.physical_outputs[1].connected and
-            !coordinator.physical_outputs[1].removing and
+        if (coordinator.physical_outputs[1].connection == .detached and
             handler.surface_leaves == 2) break;
         _ = linux.sched_yield();
     }
-    try std.testing.expect(!coordinator.physical_outputs[1].connected);
+    try std.testing.expect(coordinator.physical_outputs[1].connection == .detached);
     const retired_lock = try coordinator.session_lock_adapter.surfaceState(lock_ids[0]);
     try std.testing.expect(retired_lock.retired);
     try std.testing.expect(!retired_lock.mapped);
