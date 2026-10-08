@@ -396,7 +396,7 @@ test "output power: removal discards a pending command and releases exclusivity"
     try std.testing.expect(adapter.findOutput(42) == null);
     const replacement = try adapter.slots.acquire();
     replacement.output = 42;
-    try std.testing.expect(adapter.findOutput(42) == null);
+    try std.testing.expect(!adapter.findOtherOutput(replacement, 42));
 }
 
 test "output power: duplicate control fails without taking exclusivity" {
