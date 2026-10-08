@@ -999,7 +999,7 @@ test "physical coordinator preserves programmed primary color state across secon
     for (0..256) |_| {
         _ = try loop.turn(coordinator);
         if (coordinator.physical_outputs[1].connection == .detached and
-            !coordinator.topology_refresh_pending) break;
+            coordinator.output_operation != .topology_refresh) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
     try std.testing.expectEqual(drains_before_unplug + 1, coordinator.stats.output_drains);
@@ -1039,7 +1039,7 @@ test "physical coordinator preserves programmed primary color state across secon
     try fixture.signalHotplug();
     for (0..512) |_| {
         _ = try loop.turn(coordinator);
-        if (!coordinator.topology_refresh_pending and
+        if (coordinator.output_operation != .topology_refresh and
             coordinator.physical_outputs[1].connection.connected() and
             coordinator.physical_outputs[1].kms_output != null and
             coordinator.output_global_index == 2) break;
@@ -1150,7 +1150,7 @@ test "physical coordinator rebuilds an output when its modes change" {
     try fixture.releaseHeldFlips();
     for (0..512) |_| {
         _ = try loop.turn(coordinator);
-        if (!coordinator.topology_refresh_pending and
+        if (coordinator.output_operation != .topology_refresh and
             coordinator.physical_outputs[0].kms_output != null)
         {
             const snapshot = coordinator.output_adapter.logicalSnapshot(
@@ -1241,7 +1241,7 @@ test "physical coordinator preserves outputs while changing and adding connector
     try fixture.signalHotplug();
     for (0..768) |_| {
         _ = try loop.turn(coordinator);
-        if (!coordinator.topology_refresh_pending and
+        if (coordinator.output_operation != .topology_refresh and
             coordinator.physical_output_count == 3 and
             coordinator.physical_outputs[2].kms_output != null and
             coordinator.output_global_index == 3) break;
@@ -1313,7 +1313,7 @@ test "physical coordinator rebuilds multiple changed outputs together" {
     try fixture.signalHotplug();
     for (0..768) |_| {
         _ = try loop.turn(coordinator);
-        if (!coordinator.topology_refresh_pending and
+        if (coordinator.output_operation != .topology_refresh and
             coordinator.physical_outputs[0].kms_output != null and
             coordinator.physical_outputs[1].kms_output != null)
         {
@@ -1414,7 +1414,7 @@ test "physical coordinator falls back when topology changes during targeted refr
     try fixture.releaseHeldFlips();
     for (0..768) |_| {
         _ = try loop.turn(coordinator);
-        if (!coordinator.topology_refresh_pending and
+        if (coordinator.output_operation != .topology_refresh and
             !coordinator.hotplug_refresh_pending and
             coordinator.physical_outputs[0].kms_output != null and
             coordinator.physical_outputs[1].kms_output != null)
@@ -1540,7 +1540,7 @@ test "physical coordinator fails over from a disconnected primary output" {
     try fixture.signalHotplug();
     for (0..512) |_| {
         _ = try loop.turn(coordinator);
-        if (!coordinator.topology_refresh_pending and
+        if (coordinator.output_operation != .topology_refresh and
             coordinator.physical_outputs[0].connection.connected() and
             coordinator.physical_outputs[0].kms_output != null and
             coordinator.physical_outputs[1].kms_output != null) break;
@@ -1593,11 +1593,11 @@ test "physical coordinator replaces the last disconnected output exactly" {
     try fixture.signalHotplug();
     for (0..256) |_| {
         _ = try loop.turn(coordinator);
-        if (coordinator.topology_refresh_pending and
+        if (coordinator.output_operation == .topology_refresh and
             coordinator.physical_outputs[0].kms_output == null) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
-    try std.testing.expect(coordinator.topology_refresh_pending);
+    try std.testing.expect(coordinator.output_operation == .topology_refresh);
     try std.testing.expect(coordinator.physical_outputs[0].kms_output == null);
     try std.testing.expect(!(try coordinator.output_management_adapter.lifecycle.currentHead(
         coordinator.physical_outputs[0].management_head,
@@ -1607,12 +1607,12 @@ test "physical coordinator replaces the last disconnected output exactly" {
     try fixture.signalHotplug();
     for (0..512) |_| {
         _ = try loop.turn(coordinator);
-        if (!coordinator.topology_refresh_pending and
+        if (coordinator.output_operation != .topology_refresh and
             coordinator.physical_outputs[0].connection == .detached and
             coordinator.physical_outputs[1].kms_output != null) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
-    try std.testing.expect(!coordinator.topology_refresh_pending);
+    try std.testing.expect(coordinator.output_operation != .topology_refresh);
     try std.testing.expect(coordinator.physical_outputs[0].connection == .detached);
     try std.testing.expect(!(try coordinator.output_adapter.outputPublished(
         disconnected_protocol,
@@ -1735,11 +1735,11 @@ fn settingsHdrReconfigure(global_hdr: bool, initial_hdr: ?bool, fail_activation:
         var policy: Coordinator.PolicySnapshot = .{ .inner_gap = 0, .outer_gap = 0 };
         if (fail_activation) fixture.fail_create_bo_at = fixture.bo_count;
         try coordinator.installConfig(&engine, &bindings, &policy);
-        try std.testing.expectEqual(recreate, coordinator.output_reconfigure != null);
+        try std.testing.expectEqual(recreate, coordinator.output_operation == .reconfigure);
         try std.testing.expectEqual(!recreate, coordinator.configInstallReady());
         for (0..256) |_| {
             _ = try loop.turn(coordinator);
-            if (coordinator.output_reconfigure == null and physicalOutputsSettled(coordinator)) break;
+            if (coordinator.output_operation != .reconfigure and physicalOutputsSettled(coordinator)) break;
             if (root.ring.cq_ready() == 0) try pauseReady(&root.ring);
         }
         try std.testing.expect(coordinator.configInstallReady());
@@ -1816,10 +1816,10 @@ test "primary scale reconfiguration preserves a single shared DRM reader" {
                     readers += @intFromBool(output.readinessPrepared());
                 };
             try std.testing.expectEqual(@as(usize, 1), readers);
-            if (coordinator.output_reconfigure == null and physicalOutputsSettled(coordinator)) break;
+            if (coordinator.output_operation != .reconfigure and physicalOutputsSettled(coordinator)) break;
             if (root.ring.cq_ready() == 0) try pauseReady(&root.ring);
         }
-        try std.testing.expect(coordinator.output_reconfigure == null);
+        try std.testing.expect(coordinator.output_operation != .reconfigure);
         try std.testing.expect(coordinator.configInstallReady());
         try std.testing.expect(physicalOutputsSettled(coordinator));
         const state = try coordinator.output_management_adapter.lifecycle.currentHead(coordinator.physical_outputs[0].management_head);
@@ -1968,14 +1968,14 @@ fn generatedMultiHeadApply(
         }
         _ = try loop.turn(coordinator);
         if (hotplug_during_apply and !hotplug_signaled and
-            coordinator.output_reconfigure != null)
+            coordinator.output_operation == .reconfigure)
         {
             fixture.second_desktop = false;
             try fixture.signalHotplug();
             hotplug_signaled = true;
         }
         if (session_disable_during_apply and !session_disable_signaled and
-            coordinator.output_reconfigure != null)
+            coordinator.output_operation == .reconfigure)
         {
             try fixture.signalSession(.disable);
             session_disable_signaled = true;
@@ -2001,12 +2001,12 @@ fn generatedMultiHeadApply(
             _ = try drainClient(&reactor, &driver, &handler);
             _ = try loop.turn(coordinator);
             if (!fixture.hotplug_pending and
-                !coordinator.topology_refresh_pending and
+                coordinator.output_operation != .topology_refresh and
                 !coordinator.hotplug_refresh_pending) break;
             if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
                 try waitForEither(&root.ring, reactor.ring);
         }
-        try std.testing.expect(!coordinator.topology_refresh_pending);
+        try std.testing.expect(coordinator.output_operation != .topology_refresh);
     }
     try std.testing.expectEqual(
         if (fail_second_activation) 0 else @as(usize, 1) + @intFromBool(reenable_second),
@@ -2312,7 +2312,7 @@ test "generated client leases and hotplugs two non-desktop connectors" {
             handler.bind_flushed = true;
         }
         _ = try loop.turn(coordinator);
-        if (coordinator.primaryKmsOutput() != null and !coordinator.topology_refresh_pending) break;
+        if (coordinator.primaryKmsOutput() != null and coordinator.output_operation != .topology_refresh) break;
         if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, reactor.ring);
     }
@@ -3069,6 +3069,123 @@ test "generated output power client drains and recreates the physical output" {
     try std.testing.expectEqual(powers, handler.powers);
     try std.testing.expectEqual(@as(usize, 0), handler.failed);
     try std.testing.expectEqual([2]usize{ 3, 3 }, handler.mode_counts);
+
+    _ = try client.prepareClose();
+    try submitClient(&reactor, &driver, &handler);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..256) |_| {
+        const client_progress = try drainClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and client_progress.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
+test "output power command waits for an in-flight topology refresh" {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    fixture.second_desktop = true;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-refresh-power-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platformsWithHotplug(), coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.physical_output_count == 2 and
+            coordinator.physical_outputs[1].kms_output != null) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+
+    // Hold a secondary flip so the refresh for its mode change waits for
+    // the drain across several turns.
+    fixture.held_crtc = 31;
+    const secondary_kms = coordinator.physical_outputs[1].kms_output.?;
+    try secondary_kms.request(.damage, 1);
+    coordinator.physical_outputs[1].damage_requested +%= 1;
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (secondary_kms.in_flight_frame != null) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expect(secondary_kms.in_flight_frame != null);
+    fixture.second_mode_width = 4;
+    try fixture.signalHotplug();
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.topology_refresh_wait == .output_drain) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expectEqual(.output_drain, coordinator.topology_refresh_wait);
+
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, clientReactorConfig());
+    var client = try ClientConnection.attach(
+        allocator,
+        &reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
+        .{ .max_objects = 16, .max_client_ids = 15 },
+    );
+    var driver = ClientDriver.init(&client);
+    const actor = try client.actor();
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: OutputPowerClientHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+        .hold_primary_off = true,
+    };
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.output_power_adapter.peekCommand() != null) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    // The primary power-off is queued, not started, while the refresh owns
+    // the outputs.
+    try std.testing.expect(coordinator.output_power_adapter.peekCommand() != null);
+    try std.testing.expect(coordinator.output_operation == .topology_refresh);
+    try std.testing.expect(coordinator.physical_outputs[0].kms_output != null);
+    try std.testing.expectEqual(.on, coordinator.physical_outputs[0].power);
+
+    try fixture.releaseHeldFlips();
+    for (0..768) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.mode_counts[0] == 2 and coordinator.output_operation == .idle and
+            coordinator.physical_outputs[0].kms_output == null) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.mode_counts[0]);
+    try std.testing.expectEqual(protocol.zwlr_output_power_v1.mode.off.value, handler.modes[0][1]);
+    try std.testing.expectEqual(@as(usize, 0), handler.failed);
+    try std.testing.expect(coordinator.output_operation == .idle);
+    try std.testing.expect(coordinator.physical_outputs[0].kms_output == null);
+    try std.testing.expectEqual(.suspended, coordinator.physical_outputs[0].power);
+    try std.testing.expect(coordinator.physical_outputs[1].kms_output != null);
+    try std.testing.expectEqual(@as(?i32, 4), (try coordinator.output_adapter.logicalSnapshot(
+        coordinator.physical_outputs[1].protocol_output,
+    )).width);
 
     _ = try client.prepareClose();
     try submitClient(&reactor, &driver, &handler);

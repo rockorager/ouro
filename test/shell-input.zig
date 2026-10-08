@@ -5128,11 +5128,11 @@ fn layerPopupOutputLifecycle(cycle: enum { power, session, hotplug }, pointer_se
         for (0..512) |_| {
             client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
             _ = try loop.turn(coordinator);
-            if (coordinator.topology_refresh_pending and
+            if (coordinator.output_operation == .topology_refresh and
                 coordinator.physical_outputs[1].kms_output == null) break;
             try waitForEither(&root.ring, client_reactor.ring);
         }
-        try std.testing.expect(coordinator.topology_refresh_pending);
+        try std.testing.expect(coordinator.output_operation == .topology_refresh);
         try std.testing.expect(coordinator.physical_outputs[1].kms_output == null);
         const applied_before = coordinator.stats.applied;
         const submitted_before = coordinator.stats.submitted;
@@ -5155,11 +5155,11 @@ fn layerPopupOutputLifecycle(cycle: enum { power, session, hotplug }, pointer_se
         for (0..512) |_| {
             client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
             _ = try loop.turn(coordinator);
-            if (!coordinator.topology_refresh_pending and
+            if (coordinator.output_operation != .topology_refresh and
                 coordinator.stats.presented > presented_before and handler.releases == 3) break;
             try waitForEither(&root.ring, client_reactor.ring);
         }
-        try std.testing.expect(!coordinator.topology_refresh_pending);
+        try std.testing.expect(coordinator.output_operation != .topology_refresh);
         try std.testing.expect(coordinator.physical_outputs[1].kms_output != null);
         try std.testing.expect(coordinator.stats.presented > presented_before);
         try std.testing.expectEqual(@as(usize, 3), handler.releases);

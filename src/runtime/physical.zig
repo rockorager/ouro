@@ -525,6 +525,20 @@ pub fn Coordinator(comptime protocol: type) type {
             owner: Owner,
             phase: Phase = .desired,
         };
+        /// The coordinator-wide output operation in progress. Operations are
+        /// mutually exclusive: hotplug, output-management, output-power, and
+        /// configuration requests that arrive meanwhile stay queued and are
+        /// resumed by `resumeDeferredOutputWork` when the operation ends.
+        const OutputOperation = union(enum) {
+            idle,
+            /// DPMS off for one output; ends when its scanout drains.
+            power_off: OutputPowerAdapter.Command,
+            /// Output-management or configuration transaction.
+            reconfigure: OutputReconfigureTransaction,
+            /// DRM rescan after hotplug. While `draining`, it waits for the
+            /// changed outputs (or, after a fallback, all outputs) to drain.
+            topology_refresh: struct { draining: bool },
+        };
         /// Slot lifecycle of a physical output. Removal is a nested state
         /// whose stages advance strictly in order; only `setPhysicalOutputConnection`
         /// changes it, keeping `pending_output_removals` exact.
@@ -1043,13 +1057,11 @@ pub fn Coordinator(comptime protocol: type) type {
         drm_lease_global_update: enum { none, adding, removing } = .none,
         drm_lease_topology_generation: ?u32 = null,
         drm_remove_pending: bool = false,
-        topology_refresh_pending: bool = false,
-        topology_refresh_draining: bool = false,
         topology_refresh_wait: TopologyRefreshWait = .none,
         topology_refresh_wait_started: ?diagnostics.Stamp = null,
         output_global_index: usize = 1,
         pending_output_removals: usize = 0,
-        output_reconfigure: ?OutputReconfigureTransaction = null,
+        output_operation: OutputOperation = .idle,
         gamma_platform: drm_gamma.Platform,
         shm: Shm,
         adapter: Adapter,
@@ -1216,7 +1228,6 @@ pub fn Coordinator(comptime protocol: type) type {
         cursor_layer: Layer,
         cursor_offset_sequence: u64 = 0,
         drag_icon_root: ?Adapter.SurfaceId = null,
-        output_power_transition: ?OutputPowerAdapter.Command = null,
         stopping: bool = false,
         wayring_shutdown_requested: bool = false,
         session_disable_pending: bool = false,
@@ -1477,7 +1488,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.output_management.mode_capacity,
             );
             errdefer allocator.free(self.output_management_modes);
-            self.output_power_transition = null;
             self.stopping = false;
             self.session_disable_pending = false;
             self.stats = .{};
@@ -1537,13 +1547,11 @@ pub fn Coordinator(comptime protocol: type) type {
             self.drm_lease_global_update = .none;
             self.drm_lease_topology_generation = null;
             self.drm_remove_pending = false;
-            self.topology_refresh_pending = false;
-            self.topology_refresh_draining = false;
             self.topology_refresh_wait = .none;
             self.topology_refresh_wait_started = null;
             self.output_global_index = 1;
             self.pending_output_removals = 0;
-            self.output_reconfigure = null;
+            self.output_operation = .idle;
             self.gamma_platform = platforms.gamma;
             self.shm = try Shm.init(allocator, config.shm);
             errdefer self.shm.deinit(allocator);
@@ -2187,7 +2195,7 @@ pub fn Coordinator(comptime protocol: type) type {
         /// Whether a replacement can be attempted without racing pending work.
         pub fn configInstallReady(self: *const Self) bool {
             self.interaction.canInstallKeyConsumerSnapshot() catch return false;
-            return self.output_reconfigure == null and self.output_power_transition == null;
+            return self.output_operation == .idle;
         }
 
         /// Atomically installs engine, key-consumer, and desktop-policy state.
@@ -2202,8 +2210,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.desktop.validatePolicySnapshot(policy);
             if (candidate.profiles.len != 0 and self.output_config.renderer != .vulkan)
                 return error.OutputIccRequiresVulkan;
-            if (self.output_reconfigure != null or self.output_power_transition != null)
-                return error.OutputTransactionPending;
+            if (self.output_operation != .idle) return error.OutputTransactionPending;
             if (self.connectedPhysicalOutputsClaimed()) {
                 try self.beginConfigOutputReconfigure(candidate, key_consumer, policy, true);
                 return;
@@ -2432,8 +2439,8 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.terminalFailure()) |err| return err;
             if (!self.stopping) {
                 self.stopping = true;
-                if (self.output_reconfigure) |transaction| {
-                    switch (transaction.owner) {
+                if (self.output_operation == .reconfigure) {
+                    switch (self.output_operation.reconfigure.owner) {
                         .config => |config_value| {
                             var config = config_value;
                             config.engine.deinit();
@@ -2442,7 +2449,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         },
                         else => {},
                     }
-                    self.output_reconfigure = null;
+                    self.output_operation = .idle;
                     for (self.physical_outputs[0..self.physical_output_count]) |*physical|
                         physical.reconfigure = null;
                 }
@@ -3252,8 +3259,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 return;
             }
             if (self.manager.currentHandle() == null or self.session_disable_pending or
-                self.output_reconfigure != null or self.output_power_transition != null or
-                self.topology_refresh_pending) return;
+                self.output_operation != .idle) return;
             const handle = self.manager.currentHandle() orelse return;
             const probe = try self.manager.probeConnectorChanges(
                 handle,
@@ -3317,19 +3323,15 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn requestTopologyRefresh(self: *Self, updated_connectors: []const u32) !void {
-            if (self.topology_refresh_pending) return;
-            if (self.stopping or self.session_disable_pending or
-                self.output_reconfigure != null or self.output_power_transition != null)
+            if (self.output_operation == .topology_refresh) return;
+            if (self.stopping or self.session_disable_pending or self.output_operation != .idle)
                 return error.InvalidState;
-            self.topology_refresh_pending = true;
-            self.topology_refresh_draining = updated_connectors.len != 0;
+            const draining = updated_connectors.len != 0;
+            self.output_operation = .{ .topology_refresh = .{ .draining = draining } };
             diagnostics.logDisplay("refresh-request changed={any} draining={}", .{
-                updated_connectors, self.topology_refresh_draining,
+                updated_connectors, draining,
             });
-            errdefer {
-                self.topology_refresh_pending = false;
-                self.topology_refresh_draining = false;
-            }
+            errdefer self.output_operation = .idle;
             try self.drm_lease_adapter.deviceUnavailable(.physical);
             self.markProtocolAll(ProtocolReady.drm_lease);
             self.drm_lease_desired = false;
@@ -5303,19 +5305,19 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn consumeOutputManagementCommands(self: *Self) !void {
-            if (self.output_reconfigure != null or self.output_power_transition != null) return;
+            if (self.output_operation != .idle) return;
             while (self.output_management_adapter.peekCommand()) |command| {
                 const supported = self.outputManagementCommandSupported(command.heads);
                 const unchanged = self.outputManagementCommandUnchanged(command.heads);
                 if (supported and command.operation == .apply and !unchanged) {
-                    self.output_reconfigure = .{
+                    self.output_operation = .{ .reconfigure = .{
                         .owner = .{ .protocol = .{
                             .peer = command.peer,
                             .configuration = command.configuration,
                         } },
-                    };
+                    } };
                     errdefer {
-                        self.output_reconfigure = null;
+                        self.output_operation = .idle;
                         for (self.physical_outputs[0..self.physical_output_count]) |*physical|
                             physical.reconfigure = null;
                     }
@@ -5435,9 +5437,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (take_ownership) try self.promoteConfig(candidate, key_consumer.?, policy.?);
                 return;
             }
-            self.output_reconfigure = .{ .owner = .config_reconcile };
+            self.output_operation = .{ .reconfigure = .{ .owner = .config_reconcile } };
             if (take_ownership) {
-                self.output_reconfigure.?.owner = .{ .config = .{
+                self.output_operation.reconfigure.owner = .{ .config = .{
                     .engine = candidate.*,
                     .key_consumer = key_consumer.?.*,
                     .policy = policy.?.*,
@@ -5447,12 +5449,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 policy.?.* = undefined;
             }
             errdefer {
-                if (self.output_reconfigure.?.owner == .config) {
-                    candidate.* = self.output_reconfigure.?.owner.config.engine;
-                    key_consumer.?.* = self.output_reconfigure.?.owner.config.key_consumer;
-                    policy.?.* = self.output_reconfigure.?.owner.config.policy;
+                const owner = self.output_operation.reconfigure.owner;
+                if (owner == .config) {
+                    candidate.* = owner.config.engine;
+                    key_consumer.?.* = owner.config.key_consumer;
+                    policy.?.* = owner.config.policy;
                 }
-                self.output_reconfigure = null;
+                self.output_operation = .idle;
                 for (self.physical_outputs[0..self.physical_output_count]) |*physical|
                     physical.reconfigure = null;
             }
@@ -5659,8 +5662,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn consumeOutputPowerCommands(self: *Self) !void {
-            if (self.output_power_transition != null or
-                self.output_reconfigure != null) return;
+            if (self.output_operation != .idle) return;
             while (self.output_power_adapter.peekCommand()) |command| {
                 const physical = self.physicalOutputForIdMutable(command.output) orelse {
                     try self.output_power_adapter.completeCommand(command, .failed);
@@ -5682,7 +5684,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     physical.id.index, physical.id.generation, physical.connector_id, command.mode,
                 });
                 if (command.mode == .off) {
-                    self.output_power_transition = command;
+                    self.output_operation = .{ .power_off = command };
                     try self.pausePhysicalOutput(physical);
                     physical.power = .suspending;
                     return;
@@ -6294,8 +6296,7 @@ pub fn Coordinator(comptime protocol: type) type {
             // ordinary path. A saved plan never owns an output or a frame.
             if (self.physical_output_count != 1 or self.stopping or
                 self.session_disable_pending or self.drm_remove_pending or
-                self.topology_refresh_pending or self.output_reconfigure != null or
-                self.output_power_transition != null) return null;
+                self.output_operation != .idle) return null;
             const physical = &self.physical_outputs[0];
             if (physical.connection != .attached or physical.drain_started or
                 physical.reconfigure != null) return null;
@@ -7664,7 +7665,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.markProtocolAll(ProtocolReady.output_management |
                         ProtocolReady.output_power | ProtocolReady.gamma_control |
                         ProtocolReady.layer_shell);
-                    if (!self.stopping and !self.topology_refresh_pending) {
+                    if (!self.stopping and self.output_operation != .topology_refresh) {
                         try self.publishOutputLayout();
                         try self.consumeOutputManagementCommands();
                     }
@@ -8560,7 +8561,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn reconcileActiveOutputConfig(self: *Self) void {
-            if (self.output_reconfigure != null or self.output_power_transition != null) return;
+            if (self.output_operation != .idle) return;
             self.beginConfigOutputReconfigure(&self.settings, null, null, false) catch |err| switch (err) {
                 // Topology replacement briefly publishes the protocol output
                 // before its new scanout claim is installed. The completed
@@ -8856,9 +8857,11 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn outputSettingsForActivation(self: *Self) *const engine_settings.Snapshot {
-            if (self.output_reconfigure) |transaction| {
-                if (transaction.phase == .desired and transaction.owner == .config)
-                    return &self.output_reconfigure.?.owner.config.engine;
+            switch (self.output_operation) {
+                .reconfigure => |*transaction| if (transaction.phase == .desired and
+                    transaction.owner == .config)
+                    return &transaction.owner.config.engine,
+                else => {},
             }
             return &self.settings;
         }
@@ -13570,8 +13573,7 @@ pub fn Coordinator(comptime protocol: type) type {
         /// Begins terminal removal of one non-primary desktop connector. The
         /// drain and protocol mutation remain coordinator-owned.
         pub fn requestConnectorRemoval(self: *Self, connector_id: u32) !void {
-            if (self.stopping or self.session_disable_pending or
-                self.output_reconfigure != null or self.output_power_transition != null)
+            if (self.stopping or self.session_disable_pending or self.output_operation != .idle)
                 return error.InvalidState;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 if (!physical.connection.connected() or physical.connector_id != connector_id) continue;
@@ -13596,10 +13598,9 @@ pub fn Coordinator(comptime protocol: type) type {
         fn pausePhysicalOutput(self: *Self, physical: *PhysicalOutput) !void {
             const output = physical.kms_output orelse return;
             if (!output.accepting_frames) return;
-            diagnostics.logDisplay("pause-request connector={d} removing={} topology_refresh={} reconfigure={} power_transition={} session_disable={} stopping={}", .{
-                physical.connector_id,                physical.connection == .removing,
-                self.topology_refresh_pending,        self.output_reconfigure != null,
-                self.output_power_transition != null, self.session_disable_pending,
+            diagnostics.logDisplay("pause-request connector={d} removing={} operation={t} session_disable={} stopping={}", .{
+                physical.connector_id, physical.connection == .removing,
+                self.output_operation, self.session_disable_pending,
                 self.stopping,
             });
             try self.output_adapter.setAvailable(physical.protocol_output, false);
@@ -13952,8 +13953,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn advanceDrain(self: *Self) !void {
             if (!self.stopping and !self.session_disable_pending and
-                !self.drm_remove_pending and !self.topology_refresh_pending and
-                self.output_reconfigure == null and self.output_power_transition == null)
+                !self.drm_remove_pending and self.output_operation == .idle)
             {
                 var pending = false;
                 for (self.physical_outputs[0..self.physical_output_count]) |physical| {
@@ -13983,7 +13983,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     if (!self.stopping and physical.reconfigure != null) continue;
                     if (self.stopping) self.abandonPending();
                     try self.destroyDrainedPhysicalOutput(physical);
-                    const connector_survives_refresh = self.topology_refresh_pending and
+                    const connector_survives_refresh = self.output_operation == .topology_refresh and
                         std.mem.indexOfScalar(
                             u32,
                             self.hotplug_connector_ids[0..self.hotplug_connector_count],
@@ -14000,23 +14000,21 @@ pub fn Coordinator(comptime protocol: type) type {
                         );
                         self.markProtocolAll(ProtocolReady.output_management);
                     }
-                    const power_transition = if (self.output_power_transition) |command|
-                        std.meta.eql(command.output, physical.id)
-                    else
-                        false;
-                    if (!self.stopping and power_transition) {
-                        const command = self.output_power_transition.?;
-                        self.output_power_transition = null;
-                        physical.power = .suspended;
-                        try self.promoteEnabledPhysicalOutput();
-                        if (self.output_power_adapter.peekCommand()) |current| {
-                            if (std.meta.eql(current, command)) {
-                                try self.output_power_adapter.completeCommand(command, .succeeded);
-                                self.markProtocol(command.peer, ProtocolReady.output_power);
+                    if (!self.stopping) switch (self.output_operation) {
+                        .power_off => |command| if (std.meta.eql(command.output, physical.id)) {
+                            self.output_operation = .idle;
+                            physical.power = .suspended;
+                            try self.promoteEnabledPhysicalOutput();
+                            if (self.output_power_adapter.peekCommand()) |current| {
+                                if (std.meta.eql(current, command)) {
+                                    try self.output_power_adapter.completeCommand(command, .succeeded);
+                                    self.markProtocol(command.peer, ProtocolReady.output_power);
+                                }
                             }
-                        }
-                        try self.consumeOutputPowerCommands();
-                    }
+                            try self.resumeDeferredOutputWork();
+                        },
+                        else => {},
+                    };
                 }
             }
             try self.ensureDrmReadiness();
@@ -14024,9 +14022,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.finishOutputReconfigure();
                 return;
             }
-            if (!self.stopping and self.topology_refresh_pending) {
+            if (!self.stopping and self.output_operation == .topology_refresh) {
                 try self.advanceTopologyRefresh();
-                if (self.topology_refresh_pending) return;
+                if (self.output_operation == .topology_refresh) return;
             }
             if (!self.anyKmsOutput() and !self.drm_remove_pending and
                 (self.stopping or self.session_disable_pending))
@@ -14096,7 +14094,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 return;
             }
             if (self.anyKmsOutput()) {
-                if (self.topology_refresh_draining and
+                if (self.output_operation.topology_refresh.draining and
                     self.hotplug_updated_connector_count != 0)
                 {
                     for (self.physical_outputs[0..self.physical_output_count]) |physical| {
@@ -14111,7 +14109,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     }
                     self.traceTopologyRefreshWait(.none);
                     try self.refreshChangedTopology();
-                } else if (!self.topology_refresh_draining) {
+                } else if (!self.output_operation.topology_refresh.draining) {
                     self.traceTopologyRefreshWait(.none);
                     try self.refreshActiveTopology();
                 } else {
@@ -14130,7 +14128,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.manager.clearEvents();
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
                 physical.claim = null;
-            const replace_management_heads = self.topology_refresh_draining;
+            const replace_management_heads = self.output_operation.topology_refresh.draining;
             var management_update = false;
             if (replace_management_heads) {
                 try self.output_management_adapter.beginUpdate();
@@ -14184,12 +14182,8 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             try self.advanceOutputGlobals();
             try self.publishOutputLayout();
-            self.reconcileActiveOutputConfig();
-            try self.consumeOutputManagementCommands();
-            self.topology_refresh_pending = false;
-            self.topology_refresh_draining = false;
             self.hotplug_updated_connector_count = 0;
-            try self.advancePhysicalOutputRemovals();
+            try self.finishTopologyRefresh();
         }
 
         fn refreshChangedTopology(self: *Self) !void {
@@ -14305,12 +14299,8 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.ensureDrmLeasing(topology);
             try self.advanceOutputGlobals();
             try self.publishOutputLayout();
-            self.reconcileActiveOutputConfig();
-            try self.consumeOutputManagementCommands();
-            self.topology_refresh_pending = false;
-            self.topology_refresh_draining = false;
             self.hotplug_updated_connector_count = 0;
-            try self.advancePhysicalOutputRemovals();
+            try self.finishTopologyRefresh();
         }
 
         fn refreshActiveTopology(self: *Self) !void {
@@ -14339,7 +14329,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 error.NoPrimaryPlane,
                 => {
                     diagnostics.logDisplay("refresh-fallback path=preserve reason={t} action=pause-all", .{cause});
-                    self.topology_refresh_draining = true;
+                    self.output_operation.topology_refresh.draining = true;
                     try self.pauseAllOutputs();
                     return;
                 },
@@ -14359,16 +14349,15 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.ensureDrmLeasing(try self.manager.snapshot(handle));
             try self.advanceOutputGlobals();
             try self.publishOutputLayout();
-            self.reconcileActiveOutputConfig();
-            try self.consumeOutputManagementCommands();
-            self.topology_refresh_pending = false;
-            self.topology_refresh_draining = false;
             self.hotplug_updated_connector_count = 0;
-            try self.advancePhysicalOutputRemovals();
+            try self.finishTopologyRefresh();
         }
 
         fn outputReconfigureReady(self: *Self) bool {
-            const transaction = self.output_reconfigure orelse return false;
+            const transaction = switch (self.output_operation) {
+                .reconfigure => |transaction| transaction,
+                else => return false,
+            };
             for (self.physical_outputs[0..self.physical_output_count]) |physical| {
                 const pending = physical.reconfigure orelse continue;
                 const output = physical.kms_output orelse {
@@ -14381,7 +14370,10 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn finishOutputReconfigure(self: *Self) !void {
-            const transaction = self.output_reconfigure orelse return error.InvalidState;
+            const transaction = switch (self.output_operation) {
+                .reconfigure => |transaction| transaction,
+                else => return error.InvalidState,
+            };
             if (transaction.phase == .rollback)
                 return self.finishOutputReconfigureRollback(transaction);
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
@@ -14416,7 +14408,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         pending.desired.width,     pending.desired.height,    pending.desired.refresh_millihz,
                         pending.desired.scale_120, pending.desired.transform, err,
                     });
-                    self.output_reconfigure.?.phase = .rollback;
+                    self.output_operation.reconfigure.phase = .rollback;
                     for (self.physical_outputs[0..self.physical_output_count]) |*candidate|
                         if (candidate.reconfigure != null and candidate.kms_output != null)
                             try self.pausePhysicalOutput(candidate);
@@ -14530,7 +14522,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.publishOutputLayout();
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
                 physical.reconfigure = null;
-            self.output_reconfigure = null;
+            self.output_operation = .idle;
             self.markProtocolAll(ProtocolReady.output_power);
             switch (transaction.owner) {
                 .protocol => |owner| if (self.output_management_adapter.peekCommand()) |command| {
@@ -14556,13 +14548,25 @@ pub fn Coordinator(comptime protocol: type) type {
                 },
                 .config_reconcile => {},
             }
+            try self.resumeDeferredOutputWork();
+            if (self.session_disable_pending) try self.pauseAllOutputs();
+            if (self.output_operation != .idle or self.session_disable_pending)
+                try self.advanceDrain();
+        }
+
+        fn finishTopologyRefresh(self: *Self) !void {
+            self.output_operation = .idle;
+            self.reconcileActiveOutputConfig();
+            try self.resumeDeferredOutputWork();
+            try self.advancePhysicalOutputRemovals();
+        }
+
+        /// Starts work deferred while an output operation ran. Each step
+        /// returns early once one of them begins the next operation.
+        fn resumeDeferredOutputWork(self: *Self) !void {
             try self.processHotplug();
             try self.consumeOutputManagementCommands();
             try self.consumeOutputPowerCommands();
-            if (self.session_disable_pending) try self.pauseAllOutputs();
-            if (self.output_reconfigure != null or self.output_power_transition != null or
-                self.topology_refresh_pending or self.session_disable_pending)
-                try self.advanceDrain();
         }
 
         /// Drops applied protocol/presentation ownership only after the output
