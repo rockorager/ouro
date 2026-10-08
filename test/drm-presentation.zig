@@ -3687,7 +3687,7 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource, options: struct {
     }
     const abandoned_surface = coordinator.cursor_layer.surface.?;
     try std.testing.expectEqual(2 + noop_count, coordinator.stats.applied);
-    try std.testing.expect(!coordinator.cursor_layer.source_release_pending);
+    try std.testing.expect(coordinator.cursor_layer.lifetime.source == .none);
     try std.testing.expect(coordinator.cursor_layer.content.owned);
     try std.testing.expect(coordinator.cursor_layer.content.value.attachment_lease == null);
     try std.testing.expect(coordinator.cursor_layer.content.value.release_callbacks == null);

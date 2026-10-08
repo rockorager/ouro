@@ -6800,8 +6800,7 @@ fn runCommitDuringRepaint(synchronized: bool, hold_primary: bool, retirement_pen
         };
         layer.retired_source = .{ .peer = layer.peer.?, .content = layer.content.value };
         layer.content.owned = true;
-        layer.retains_source = true;
-        layer.source_release_pending = true;
+        layer.lifetime.source = .retained;
     }
     const blocked = hold_primary or synchronized or retirement_pending;
     const commit_count: usize = if (blocked and !retirement_pending) 2 else 1;
@@ -6827,7 +6826,7 @@ fn runCommitDuringRepaint(synchronized: bool, hold_primary: bool, retirement_pen
             const layer = findLayer(coordinator.app_layers, ids[0]).?;
             try std.testing.expect(layer.retired_source != null);
             try std.testing.expect(!layer.retired_source.?.releasable);
-            try std.testing.expect(layer.retains_source);
+            try std.testing.expectEqual(.retained, layer.lifetime.source);
             try std.testing.expect(layer.content.owned);
         }
         try std.testing.expectEqual(applied_before, coordinator.stats.applied);

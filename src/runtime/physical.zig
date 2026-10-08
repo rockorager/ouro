@@ -145,6 +145,192 @@ fn OwnedValue(comptime T: type) type {
     };
 }
 
+/// Client-facing obligations of one applied surface layer, as a statechart
+/// with three orthogonal regions in one byte:
+///
+///   source   the client buffer: `releasing` once rendering no longer needs
+///            it, or `retained` while the renderer keeps borrowing it.
+///   outcome  presentation feedback and frame callbacks are ready to send.
+///   retire   the layer is going away, after its outcome and then after its
+///            source release. It accepts no new content meanwhile.
+///
+/// An outcome is delivered only after a non-retained source is released.
+/// Retirement only advances; the caller abandons the layer once it is
+/// `after_source_release` with no source left.
+const LayerLifetime = packed struct(u8) {
+    source: Source = .none,
+    outcome: bool = false,
+    retire: Retire = .none,
+    _padding: u3 = 0,
+
+    const Source = enum(u2) { none, releasing, retained };
+    const Retire = enum(u2) { none, after_outcome, after_source_release };
+
+    pub const Input = enum {
+        /// Publish content whose buffer is released once rendered.
+        publish,
+        /// Publish content that keeps borrowing its buffer.
+        publish_retained,
+        /// Publish a commit without a new attachment, keeping the source.
+        republish,
+        /// Consume a commit without output, then retire.
+        discard,
+        /// Discard an unpresented presentation, then retire.
+        discard_presentation,
+        outcome_ready,
+        outcome_delivered,
+        source_released,
+        /// The retained source moved to `Layer.retired_source`.
+        source_retired,
+        /// Stop retaining the source so it can be released.
+        force_release,
+        /// Retire once the outstanding presentation outcome is delivered.
+        retire_after_outcome,
+        /// Retire once the source is released; no presentation remains.
+        retire_after_source_release,
+        abandon,
+    };
+
+    const TransitionError = error{
+        Retiring,
+        SourceBusy,
+        OutcomePending,
+        NoOutcome,
+        OutcomeBeforeRelease,
+        SourceNotReleasing,
+        SourceNotRetained,
+        NoSource,
+    };
+
+    pub inline fn step(state: LayerLifetime, comptime input: Input) TransitionError!LayerLifetime {
+        var next = state;
+        switch (input) {
+            .publish, .publish_retained, .discard => {
+                if (state.retire != .none) return error.Retiring;
+                if (state.source != .none) return error.SourceBusy;
+                if (state.outcome) return error.OutcomePending;
+                next.source = if (input == .publish_retained) .retained else .releasing;
+                if (input == .discard) {
+                    next.outcome = true;
+                    next.retire = .after_outcome;
+                }
+            },
+            .republish => {
+                if (state.retire != .none) return error.Retiring;
+                if (state.source == .releasing) return error.SourceBusy;
+                if (state.outcome) return error.OutcomePending;
+            },
+            .discard_presentation => {
+                if (state.retire == .after_source_release) return error.Retiring;
+                next.outcome = true;
+                next.retire = .after_outcome;
+            },
+            .outcome_ready => {
+                if (state.retire == .after_source_release) return error.Retiring;
+                next.outcome = true;
+            },
+            .outcome_delivered => {
+                if (!state.outcome) return error.NoOutcome;
+                if (state.source == .releasing) return error.OutcomeBeforeRelease;
+                next.outcome = false;
+                if (state.retire == .after_outcome) next.retire = .after_source_release;
+            },
+            .source_released => {
+                if (state.source != .releasing) return error.SourceNotReleasing;
+                next.source = .none;
+            },
+            .source_retired => {
+                if (state.source != .retained) return error.SourceNotRetained;
+                next.source = .none;
+            },
+            .force_release => {
+                if (state.source == .none) return error.NoSource;
+                next.source = .releasing;
+            },
+            .retire_after_outcome => {
+                if (state.retire == .after_source_release) return error.Retiring;
+                next.retire = .after_outcome;
+            },
+            .retire_after_source_release => {
+                if (state.retire == .after_outcome) return error.Retiring;
+                if (state.source == .none) return error.NoSource;
+                if (state.outcome) return error.OutcomePending;
+                next.retire = .after_source_release;
+            },
+            .abandon => next = .{},
+        }
+        return next;
+    }
+
+    /// Whether the layer may receive a new commit.
+    inline fn acceptsContent(state: LayerLifetime) bool {
+        return state.retire == .none;
+    }
+
+    /// Whether a retiring layer has nothing left to wait for.
+    inline fn retired(state: LayerLifetime) bool {
+        return state.retire == .after_source_release and state.source == .none;
+    }
+};
+
+test "layer lifetime: reachable states keep release, outcome, and retirement order" {
+    const statechart = @import("../statechart.zig");
+    const all_inputs = comptime std.enums.values(LayerLifetime.Input);
+    const completion_inputs = [_]LayerLifetime.Input{
+        .outcome_ready, .outcome_delivered, .source_released, .force_release,
+    };
+    const content_inputs = [_]LayerLifetime.Input{
+        .publish, .publish_retained, .republish, .discard,
+    };
+
+    var reachable_storage: [256]LayerLifetime = undefined;
+    const reachable = statechart.members(
+        LayerLifetime,
+        &statechart.reach(LayerLifetime, all_inputs, .{}),
+        &reachable_storage,
+    );
+    // 3 sources × 2 outcomes × 2 for live and after_outcome, plus the three
+    // sources with no outcome after the outcome.
+    try std.testing.expectEqual(@as(usize, 3 * 2 * 2 + 3), reachable.len);
+
+    for (reachable) |state| {
+        // Only the outcome is left to deliver once retirement awaits release.
+        if (state.retire == .after_source_release) try std.testing.expect(!state.outcome);
+
+        var next: [all_inputs.len]LayerLifetime = undefined;
+        for (statechart.successors(LayerLifetime, all_inputs, state, &next)) |successor| {
+            // Retirement only advances, except through abandonment.
+            if (@as(u8, @bitCast(successor)) == 0) continue;
+            try std.testing.expect(@intFromEnum(successor.retire) >= @intFromEnum(state.retire));
+        }
+        // A retiring layer accepts no new content.
+        inline for (content_inputs) |input| {
+            if (!state.acceptsContent())
+                try std.testing.expectError(error.Retiring, state.step(input));
+        }
+        // An outcome waits for a non-retained source to be released.
+        if (state.source == .releasing and state.outcome)
+            try std.testing.expectError(error.OutcomeBeforeRelease, state.step(.outcome_delivered));
+
+        // Liveness: completions alone settle every state. A live layer ends
+        // with nothing to deliver or release; a retiring one becomes
+        // abandonable.
+        var settled_storage: [256]LayerLifetime = undefined;
+        const settled = statechart.members(
+            LayerLifetime,
+            &statechart.reach(LayerLifetime, &completion_inputs, state),
+            &settled_storage,
+        );
+        const settles = for (settled) |candidate| {
+            if (state.retire == .none) {
+                if (candidate.retire == .none and !candidate.outcome and
+                    candidate.source != .releasing) break true;
+            } else if (candidate.retired()) break true;
+        } else false;
+        try std.testing.expect(settles);
+    }
+}
+
 fn copyCaptureRegion(
     destination: []u8,
     destination_stride: u32,
@@ -845,16 +1031,12 @@ pub fn Coordinator(comptime protocol: type) type {
             binding: ?output_api.SampleBinding = null,
             change: ?damage.Change = null,
             candidate: OwnedValue(Candidate) = .{},
-            source_release_pending: bool = false,
-            outcome_pending: bool = false,
+            lifetime: LayerLifetime = .{},
             callback_data: ?u32 = null,
             feedback_outcome: ?Adapter.PresentationOutcome = null,
             feedback_output: ?OutputAdapter.OutputId = null,
             change_output_count: usize = 0,
             outcome_output_count: usize = 0,
-            retire_after_outcome: bool = false,
-            retire_after_source_release: bool = false,
-            retains_source: bool = false,
             floating: bool = false,
             retired_source: ?RetiredSource = null,
             retry_queued: bool = false,
@@ -9058,7 +9240,7 @@ pub fn Coordinator(comptime protocol: type) type {
             // redrawing retained pixels leaves finishOutcome ignoring them
             // as untracked, so the client never gets its frame callback.
             for (self.app_layers[0..self.app_layer_count]) |*layer| {
-                if (!layer.active or layer.presentation == null or layer.outcome_pending or
+                if (!layer.active or layer.presentation == null or layer.lifetime.outcome or
                     self.appLayerOutputTrackingPending(layer)) continue;
                 _ = self.requestLayerOutputDamage(
                     layer,
@@ -9437,7 +9619,7 @@ pub fn Coordinator(comptime protocol: type) type {
                                     const content = layer.content.get() orelse return error.MissingContent;
                                     _ = try self.adapter.activateFrames(surface, content);
                                     layer.feedback_outcome = .discarded;
-                                    layer.outcome_pending = true;
+                                    layer.lifetime = try layer.lifetime.step(.outcome_ready);
                                     _ = try self.retryLayerOutcome(layer);
                                     _ = try self.retryRetiredSource(layer);
                                 }
@@ -9515,7 +9697,7 @@ pub fn Coordinator(comptime protocol: type) type {
             // clearing the previous borrowed source. Keep the next candidate
             // pending until that retirement slot is available, before any
             // renderer, effect, or presentation ownership changes.
-            if (layer.retains_source and layer.retired_source != null and
+            if (layer.lifetime.source == .retained and layer.retired_source != null and
                 !try self.retryRetiredSource(layer)) return false;
             const candidate = layer.candidate.get().?;
             if (candidate.superseded) {
@@ -9543,7 +9725,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 return self.applyRetainedCandidate(layer, pending.id, surface_scene, needs_frame);
             };
             if (attachment.buffer == null) {
-                if (layer.retains_source) {
+                if (layer.lifetime.source == .retained) {
                     try self.retireLayerSource(layer);
                     _ = try self.retryRetiredSource(layer);
                 }
@@ -9843,7 +10025,11 @@ pub fn Coordinator(comptime protocol: type) type {
             // admission has succeeded. Only this non-fallible edge publishes
             // the renderer-owned version, consuming a compatible previous
             // handle in place when it is uniquely owned by this layer.
-            if (layer.retains_source) try self.retireLayerSource(layer);
+            if (layer.lifetime.source == .retained) try self.retireLayerSource(layer);
+            const lifetime = if (retained_source)
+                try layer.lifetime.step(.publish_retained)
+            else
+                try layer.lifetime.step(.publish);
             if (trace) |*work| work.mark("content-publish-begin");
             const rendered = publish: {
                 const publish_start = if (self.performance != null) diagnostics.Stamp.now() else null;
@@ -9909,8 +10095,7 @@ pub fn Coordinator(comptime protocol: type) type {
             layer.surface = published.surface;
             layer.id = published.id;
             layer.presentation = token;
-            layer.source_release_pending = true;
-            layer.retains_source = retained_source;
+            layer.lifetime = lifetime;
             self.syncLayerRetry(layer);
             layer.sample = sample;
             layer.binding = binding;
@@ -9935,7 +10120,7 @@ pub fn Coordinator(comptime protocol: type) type {
             needs_frame: *bool,
         ) !bool {
             if (!layer.active or layer.rendered == null or layer.sample == null) {
-                if (layer.retains_source) try self.retireLayerSource(layer);
+                if (layer.lifetime.source == .retained) try self.retireLayerSource(layer);
                 const candidate = layer.candidate.take() orelse return error.MissingCandidate;
                 var content = candidate.content;
                 defer content.deinit();
@@ -10086,7 +10271,8 @@ pub fn Coordinator(comptime protocol: type) type {
             ) catch unreachable;
             sample.sample = binding.sample;
             sample.presentation = binding.presentation;
-            const retained_content = if (layer.retains_source)
+            const lifetime = try layer.lifetime.step(.republish);
+            const retained_content = if (layer.lifetime.source == .retained)
                 layer.content.get() orelse return error.MissingContent
             else
                 null;
@@ -10101,7 +10287,6 @@ pub fn Coordinator(comptime protocol: type) type {
             );
             const previous = layer.change.?.current;
             var published = layer.candidate.take() orelse return error.MissingCandidate;
-            const retains_source = layer.retains_source;
             if (retained_content) |retained| {
                 published.content.surface.attachment = retained.surface.attachment;
                 retained.surface.attachment = null;
@@ -10133,8 +10318,7 @@ pub fn Coordinator(comptime protocol: type) type {
             layer.id = published.id;
             layer.presentation = token;
             token_owned = false;
-            layer.source_release_pending = retains_source;
-            layer.retains_source = retains_source;
+            layer.lifetime = lifetime;
             layer.sample = sample;
             layer.binding = binding;
             if (association_changed) self.output_associations_dirty = true;
@@ -10232,7 +10416,7 @@ pub fn Coordinator(comptime protocol: type) type {
             var available = self.app_layers.len - self.app_layer_count;
             for (self.app_layers[0..self.app_layer_count]) |*layer|
                 available += @intFromBool(layer.presentation == null and !layer.candidate.owned and
-                    !self.appLayerOutputTrackingPending(layer));
+                    layer.lifetime.acceptsContent() and !self.appLayerOutputTrackingPending(layer));
             if (available >= needed) return;
             const old_len = self.app_layers.len;
             const minimum = try std.math.add(usize, old_len, needed - available);
@@ -10301,7 +10485,10 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn layerAvailableForBatch(self: *Self, layer: *Layer, used: usize) bool {
+            // A retiring layer still owns its old surface's obligations; the
+            // surface's next commit takes another layer.
             if (layer.presentation != null or layer.candidate.owned or
+                !layer.lifetime.acceptsContent() or
                 self.appLayerOutputTrackingPending(layer)) return false;
             for (self.applied_layers[0..used]) |assigned| if (assigned == layer) return false;
             return true;
@@ -10323,16 +10510,14 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             const candidate = layer.candidate.take() orelse return error.MissingCandidate;
             if (layer.active) if (layer.id) |id| self.queueLayerRemoval(id);
-            if (layer.retains_source) try self.retireLayerSource(layer);
+            if (layer.lifetime.source == .retained) try self.retireLayerSource(layer);
+            layer.lifetime = try layer.lifetime.step(.discard);
             layer.content.set(candidate.content);
             layer.peer = candidate.peer;
             layer.surface = candidate.surface;
             layer.id = candidate.id;
             layer.presentation = token;
-            layer.source_release_pending = true;
-            layer.outcome_pending = true;
             layer.feedback_outcome = .discarded;
-            layer.retire_after_outcome = true;
             // Visibility changes at commit consumption, independently of
             // live-client release encoding retained below.
             if (layerHasOutputAssociation(layer)) self.output_associations_dirty = true;
@@ -12441,7 +12626,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 } else if (!was_presented and layer.feedback_outcome == null) {
                     layer.feedback_outcome = .discarded;
                 }
-                if (!output_pending) layer.outcome_pending = true;
+                if (!output_pending) layer.lifetime = try layer.lifetime.step(.outcome_ready);
                 self.syncLayerRetry(layer);
             }
             for (self.app_layers[0..self.app_layer_count]) |*layer|
@@ -12480,43 +12665,25 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.stats.retained_retry_visits += 1;
                 defer self.syncLayerRetry(layer);
                 _ = try self.retryRetiredSource(layer);
-                if (layer.retire_after_source_release) {
-                    if (layer.source_release_pending and
-                        !try self.retryLayerSourceReleaseForced(layer)) continue;
-                    if (layer.retired_source != null)
-                        self.abandonLayerKeepingRetired(layer)
-                    else
-                        self.abandonLayer(layer);
+                if (try self.retryLayerRetirement(layer)) {
                     changed = true;
                     continue;
                 }
-                if (layer.source_release_pending and !layer.retains_source)
+                if (layer.lifetime.retire == .after_source_release) continue;
+                if (layer.lifetime.source == .releasing)
                     _ = try self.retryLayerSourceRelease(layer);
                 if (layer.presentation == null and layer.callback_data != null)
                     _ = try self.retryLayerFrameCallbacks(layer);
-                if (layer.outcome_pending and
-                    (!layer.source_release_pending or layer.retains_source))
-                {
+                if (layer.lifetime.outcome and layer.lifetime.source != .releasing)
                     changed = (try self.retryLayerOutcome(layer)) or changed;
-                }
             }
-            _ = try self.retryRetiredSource(&self.cursor_layer);
-            if (self.cursor_layer.retire_after_source_release) {
-                if (!self.cursor_layer.source_release_pending or
-                    try self.retryLayerSourceReleaseForced(&self.cursor_layer))
-                {
-                    if (self.cursor_layer.retired_source != null)
-                        self.abandonLayerKeepingRetired(&self.cursor_layer)
-                    else
-                        self.abandonLayer(&self.cursor_layer);
-                    changed = true;
-                }
-            }
-            if (self.cursor_layer.source_release_pending and !self.cursor_layer.retains_source)
-                _ = try self.retryLayerSourceRelease(&self.cursor_layer);
-            if (self.cursor_layer.outcome_pending and
-                (!self.cursor_layer.source_release_pending or self.cursor_layer.retains_source))
-                changed = (try self.retryLayerOutcome(&self.cursor_layer)) or changed;
+            const cursor = &self.cursor_layer;
+            _ = try self.retryRetiredSource(cursor);
+            changed = (try self.retryLayerRetirement(cursor)) or changed;
+            if (cursor.lifetime.source == .releasing)
+                _ = try self.retryLayerSourceRelease(cursor);
+            if (cursor.lifetime.outcome and cursor.lifetime.source != .releasing)
+                changed = (try self.retryLayerOutcome(cursor)) or changed;
             if (changed) try self.requestOutputDamage();
             return changed;
         }
@@ -12530,9 +12697,9 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             const token = layer.presentation orelse return error.MissingPresentation;
             const content = layer.content.get() orelse return error.MissingContent;
-            if (layer.source_release_pending and !layer.retains_source and
+            if (layer.lifetime.source == .releasing and
                 !try self.retryLayerSourceRelease(layer)) return false;
-            if (!layer.retains_source) {
+            if (layer.lifetime.source != .retained) {
                 std.debug.assert(content.attachment_lease == null);
                 std.debug.assert(content.release_callbacks == null);
                 std.debug.assert(content.surface.attachment == null or
@@ -12579,32 +12746,32 @@ pub fn Coordinator(comptime protocol: type) type {
                 _ = try self.adapter.activateFrames(layer.surface.?, content);
             if (layer.callback_data != null and !try self.retryLayerFrameCallbacks(layer))
                 return false;
+            const lifetime = try layer.lifetime.step(.outcome_delivered);
             try self.presentations.finish(token);
-            if (!layer.retains_source) {
+            if (layer.lifetime.source != .retained) {
                 content.deinit();
                 layer.content.clear();
             }
             layer.presentation = null;
-            layer.outcome_pending = false;
+            layer.lifetime = lifetime;
             layer.feedback_outcome = null;
             layer.feedback_output = null;
             if (self.appLayerOutputRow(self.app_layer_feedback_outputs, layer)) |outputs|
                 @memset(outputs, false);
-            if (layer.retire_after_outcome) {
-                layer.retire_after_outcome = false;
-                if (layer.source_release_pending and
-                    !try self.retryLayerSourceReleaseForced(layer))
-                {
-                    layer.retire_after_source_release = true;
-                    return false;
-                }
-                if (layer.retired_source != null)
-                    self.abandonLayerKeepingRetired(layer)
-                else
-                    self.abandonLayer(layer);
-                return true;
-            }
-            return false;
+            return self.retryLayerRetirement(layer);
+        }
+
+        /// Abandons a layer retiring after its source release once nothing
+        /// remains to release. Returns whether the layer was abandoned.
+        fn retryLayerRetirement(self: *Self, layer: *Layer) !bool {
+            if (layer.lifetime.retire != .after_source_release) return false;
+            if (layer.lifetime.source != .none and
+                !try self.retryLayerSourceReleaseForced(layer)) return false;
+            if (layer.retired_source != null)
+                self.abandonLayerKeepingRetired(layer)
+            else
+                self.abandonLayer(layer);
+            return true;
         }
 
         fn retryLayerFrameCallbacks(self: *Self, layer: *Layer) !bool {
@@ -12654,8 +12821,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (trace) |*work| work.mark("release-begin");
             defer if (trace) |*work| work.mark("release-return");
             if (!try self.releaseSource(layer.peer, content, if (trace) |*work| work else null)) return false;
-            layer.source_release_pending = false;
-            layer.retains_source = false;
+            layer.lifetime = try layer.lifetime.step(.source_released);
             return true;
         }
 
@@ -12746,6 +12912,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn retireLayerSource(self: *Self, layer: *Layer) !void {
             defer self.syncLayerRetry(layer);
             if (layer.retired_source != null) return error.RetiredSourceOccupied;
+            const lifetime = try layer.lifetime.step(.source_retired);
             const releasable = if (layer.rendered) |rendered|
                 if (self.render_device) |render_device|
                     (render_device.content.resolve(rendered) catch return error.StaleContent).retained_shm
@@ -12760,8 +12927,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .content = content,
                 .releasable = releasable,
             };
-            layer.source_release_pending = false;
-            layer.retains_source = false;
+            layer.lifetime = lifetime;
         }
 
         fn retryRetiredSource(self: *Self, layer: *Layer) !bool {
@@ -12775,7 +12941,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn retryLayerSourceReleaseForced(self: *Self, layer: *Layer) !bool {
-            layer.retains_source = false;
+            layer.lifetime = try layer.lifetime.step(.force_release);
             return self.retryLayerSourceRelease(layer);
         }
 
@@ -13451,9 +13617,10 @@ pub fn Coordinator(comptime protocol: type) type {
         // completion work belong here; ordinary scene layers are never polled.
         fn syncLayerRetry(self: *Self, layer: *Layer) void {
             const index = self.appLayerIndex(layer) orelse return;
-            const pending = layer.retired_source != null or layer.retire_after_source_release or
-                (layer.source_release_pending and !layer.retains_source) or
-                (layer.presentation == null and layer.callback_data != null) or layer.outcome_pending;
+            const pending = layer.retired_source != null or
+                layer.lifetime.retire == .after_source_release or
+                layer.lifetime.source == .releasing or
+                (layer.presentation == null and layer.callback_data != null) or layer.lifetime.outcome;
             if (!pending) return self.removeLayerRetry(layer);
             if (layer.retry_queued) return;
             layer.retry_queued = true;
@@ -13524,7 +13691,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 {
                     if (layer.feedback_outcome == null)
                         layer.feedback_outcome = .discarded;
-                    layer.outcome_pending = true;
+                    // A layer holding a presentation is never retiring after release.
+                    layer.lifetime = layer.lifetime.step(.outcome_ready) catch unreachable;
                     self.syncLayerRetry(layer);
                 }
             }
@@ -14585,8 +14753,8 @@ pub fn Coordinator(comptime protocol: type) type {
             if (layerHasOutputAssociation(layer)) self.output_associations_dirty = true;
             layer.active = false;
             layer.feedback_outcome = .discarded;
-            layer.outcome_pending = true;
-            layer.retire_after_outcome = true;
+            // A layer holding a presentation is never retiring after release.
+            layer.lifetime = layer.lifetime.step(.discard_presentation) catch unreachable;
             _ = self.retryLayerOutcome(layer) catch {};
         }
 
@@ -14622,10 +14790,12 @@ pub fn Coordinator(comptime protocol: type) type {
             if (layer.id) |id| self.queueLayerRemoval(id);
             if (layerHasOutputAssociation(layer)) self.output_associations_dirty = true;
             layer.active = false;
+            // A presentation is never held while retiring after release, and
+            // without one no outcome remains to deliver.
             if (layer.presentation != null) {
-                layer.retire_after_outcome = true;
-            } else if (layer.source_release_pending) {
-                layer.retire_after_source_release = true;
+                layer.lifetime = layer.lifetime.step(.retire_after_outcome) catch unreachable;
+            } else if (layer.lifetime.source != .none) {
+                layer.lifetime = layer.lifetime.step(.retire_after_source_release) catch unreachable;
             } else {
                 self.abandonLayer(layer);
             }
@@ -15536,9 +15706,8 @@ fn layerVacant(layer: anytype) bool {
     return !layer.active and layer.peer == null and layer.surface == null and
         layer.id == null and !layer.content.owned and layer.rendered == null and
         layer.presentation == null and layer.sample == null and layer.binding == null and
-        layer.change == null and !layer.candidate.owned and !layer.source_release_pending and
-        !layer.outcome_pending and layer.callback_data == null and !layer.retire_after_outcome and
-        !layer.retire_after_source_release and !layer.retains_source and
+        layer.change == null and !layer.candidate.owned and
+        @as(u8, @bitCast(layer.lifetime)) == 0 and layer.callback_data == null and
         layer.retired_source == null;
 }
 
