@@ -5916,7 +5916,7 @@ test "invalid generated surface request posts the specified protocol error" {
         .attach = .{ .buffer = null, .x = 1, .y = 0 },
     });
     try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
-    try std.testing.expectEqual(wayring.connection.Lifecycle.draining, context.actor.lifecycle);
+    try std.testing.expectEqual(wayring.connection.Lifecycle.draining, context.actor.lifecycle());
     try std.testing.expectEqual(@as(u64, 0), (try context.adapter.getSurface(surface)).sequence);
 
     var descriptor_scratch: [1]linux.fd_t = undefined;

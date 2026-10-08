@@ -30,7 +30,7 @@ test "global removal: fixes v2 accepts ack and reports duplicate ack on the fixe
     const err = (try f.pop(protocol.wl_display)).@"error";
     try std.testing.expectEqual(@as(?u32, v2.id), err.object_id);
     try std.testing.expectEqual(protocol.wl_fixes.@"error".invalid_ack_remove.value, err.code);
-    try std.testing.expectEqual(.draining, (try f.actor()).lifecycle);
+    try std.testing.expectEqual(.draining, (try f.actor()).lifecycle());
 }
 
 test "global removal: transient seat waits for offers even with no resources or devices" {

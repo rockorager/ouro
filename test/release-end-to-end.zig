@@ -240,7 +240,7 @@ test "SHM attachment survives buffer destruction through import and release" {
                     );
                     if (result == .terminal) return result.terminal.cause;
                 }
-                if (!actor.receive_active) {
+                if (!actor.receiveActive()) {
                     try reactor.prepareReceive(peer);
                     prepared = true;
                 }

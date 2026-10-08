@@ -1744,7 +1744,7 @@ test "data device: dropped offers accept final actions and MIME until finish" {
         try std.testing.expectEqual(action.move.value, offer.selected_action);
         try std.testing.expectEqual(@as(?usize, 1), offer.accepted_mime);
         try std.testing.expect(offer.finished);
-        try std.testing.expectEqual(wayring.connection.Lifecycle.open, actor.lifecycle);
+        try std.testing.expectEqual(wayring.connection.Lifecycle.open, actor.lifecycle());
         const action_changed = initial_action != action.move.value;
         try std.testing.expectEqual(@as(usize, if (action_changed) 3 else 2), adapter.pendingOutbound());
         var output = wayring.tx.Queue.init(&blocks, 512, &descriptors, 0);
